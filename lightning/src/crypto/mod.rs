@@ -9,3 +9,6 @@ fn fixed_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 pub(crate) mod streams;
 pub(crate) mod utils;
+
+#[cfg(feature = "post-quantum")]
+pub(crate) mod pq_kem;

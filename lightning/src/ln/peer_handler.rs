@@ -3694,7 +3694,8 @@ impl<
 			| self.message_handler.onion_message_handler.provided_node_features()
 			| self.message_handler.custom_message_handler.provided_node_features()
 			| self.message_handler.send_only_message_handler.provided_node_features();
-		let announcement = msgs::UnsignedNodeAnnouncement {
+		#[allow(unused_mut)]
+		let mut announcement = msgs::UnsignedNodeAnnouncement {
 			features,
 			timestamp: self.last_node_announcement_serial.fetch_add(1, Ordering::AcqRel),
 			node_id: NodeId::from_pubkey(&self.node_signer.get_node_id(Recipient::Node).unwrap()),
@@ -3704,6 +3705,30 @@ impl<
 			excess_address_data: Vec::new(),
 			excess_data: Vec::new(),
 		};
+		// PQ: attach the ML-DSA public key, the ML-KEM encapsulation key, and the ML-DSA signature
+		// before producing the classical signature, so the classical signature commits to them too.
+		// The KEM key is written between the public key and the signature so the ML-DSA signature
+		// commits to it as well.
+		#[cfg(feature = "post-quantum")]
+		if let Some(pq_pubkey) = self.node_signer.get_pq_node_id() {
+			crate::sign::pq::append_public_key_record(&mut announcement.excess_data, &pq_pubkey);
+			if let Some(pq_kem_key) = self.node_signer.get_pq_kem_node_id() {
+				crate::sign::pq::append_kem_key_record(&mut announcement.excess_data, &pq_kem_key);
+			}
+			if let Some(pq_sig) = self
+				.node_signer
+				.sign_pq_gossip_message(msgs::UnsignedGossipMessage::NodeAnnouncement(&announcement))
+			{
+				crate::sign::pq::append_signature_record(&mut announcement.excess_data, &pq_sig);
+				log_debug!(
+					self.logger,
+					"PQ: signed node_announcement (ML-DSA pubkey {} B, ML-KEM key {} B, sig {} B)",
+					crate::sign::pq::PQ_PUBLIC_KEY_LEN,
+					crate::crypto::pq_kem::PQ_KEM_EK_LEN,
+					crate::sign::pq::PQ_SIGNATURE_LEN
+				);
+			}
+		}
 		let node_announce_sig = match self
 			.node_signer
 			.sign_gossip_message(msgs::UnsignedGossipMessage::NodeAnnouncement(&announcement))

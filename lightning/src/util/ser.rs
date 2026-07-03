@@ -683,6 +683,10 @@ impl_array!(32, u8); // for channel id & hmac
 impl_array!(PUBLIC_KEY_SIZE, u8); // for PublicKey
 impl_array!(64, u8); // for ecdsa::Signature and schnorr::Signature
 impl_array!(1300, u8); // for OnionPacket.hop_data
+#[cfg(feature = "post-quantum")]
+impl_array!(1312, u8); // for ML-DSA-44 public key pins in the network graph
+#[cfg(feature = "post-quantum")]
+impl_array!(1184, u8); // for ML-KEM-768 encapsulation key pins in the network graph
 
 impl_array!(8, u16);
 impl_array!(32, u16);

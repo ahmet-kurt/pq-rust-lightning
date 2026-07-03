@@ -2004,6 +2004,16 @@ impl NodeSigner for TestKeysInterface {
 	fn sign_message(&self, msg: &[u8]) -> Result<String, ()> {
 		self.backing.sign_message(msg)
 	}
+
+	#[cfg(feature = "post-quantum")]
+	fn get_pq_node_id(&self) -> Option<[u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]> {
+		self.backing.get_pq_node_id()
+	}
+
+	#[cfg(feature = "post-quantum")]
+	fn get_pq_kem_node_id(&self) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]> {
+		self.backing.get_pq_kem_node_id()
+	}
 }
 
 impl SignerProvider for TestKeysInterface {

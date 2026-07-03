@@ -69,7 +69,13 @@ const REMOVED_ENTRIES_TRACKING_AGE_LIMIT_SECS: u64 = 60 * 60 * 24 * 7;
 
 /// The maximum number of extra bytes which we do not understand in a gossip message before we will
 /// refuse to relay the message.
+#[cfg(not(feature = "post-quantum"))]
 const MAX_EXCESS_BYTES_FOR_RELAY: usize = 1024;
+/// Post-quantum gossip messages carry an ML-DSA public key and/or signature in their excess data,
+/// which is much larger than the classical cap. Raise the relay budget so post-quantum nodes relay
+/// and retain these messages. Vanilla nodes keep the smaller cap and will verify but not relay them.
+#[cfg(feature = "post-quantum")]
+const MAX_EXCESS_BYTES_FOR_RELAY: usize = 8192;
 
 /// Maximum number of short_channel_ids that will be encoded in one gossip reply message.
 /// This value ensures a reply fits within the 65k payload limit and is consistent with other implementations.
@@ -505,6 +511,46 @@ pub fn verify_node_announcement<C: Verification>(
 		&get_pubkey_from_node_id!(msg.contents.node_id, "node_announcement"),
 		"node_announcement"
 	);
+
+	// PQ: if the announcement carries an ML-DSA public key and signature, the signature must be
+	// self-consistent with that key. Continuity against the pinned key is enforced separately when
+	// the announcement is stored (see `update_node_from_announcement_intern`).
+	#[cfg(feature = "post-quantum")]
+	{
+		let records = crate::sign::pq::parse_records(&msg.contents.excess_data);
+		// PQ records must come as a matched pair. An announcement carrying exactly one of the
+		// public key or signature record is malformed and is rejected here, so a half-present
+		// message can never reach the pinning logic in `update_node_from_announcement_intern`. A
+		// KEM key record is only trustworthy when it is covered by the ML-DSA signature, so it must
+		// be accompanied by the public key and signature pair.
+		if records.pubkey.is_some() != records.signature.is_some()
+			|| (records.kem_key.is_some() && records.signature.is_none())
+		{
+			return Err(LightningError {
+				err: "PQ: rejecting node_announcement with a half-present record set".to_owned(),
+				action: ErrorAction::IgnoreAndLog(Level::Gossip),
+			});
+		}
+		if let (Some(pq_pubkey), Some(pq_sig)) = (records.pubkey, records.signature) {
+			let mut unsigned = msg.contents.clone();
+			let signed_len = unsigned.excess_data.len() - records.signature_record_len;
+			unsigned.excess_data.truncate(signed_len);
+			if !crate::sign::pq::verify(
+				&pq_pubkey, &unsigned.encode()[..], &pq_sig, crate::sign::pq::PQ_CONTEXT_GOSSIP,
+			) {
+				return Err(LightningError {
+					err: "PQ: invalid ML-DSA signature on node_announcement".to_owned(),
+					action: ErrorAction::SendWarningMessage {
+						msg: msgs::WarningMessage {
+							channel_id: ChannelId::new_zero(),
+							data: "PQ: invalid ML-DSA signature on node_announcement".to_owned(),
+						},
+						log_level: Level::Trace,
+					},
+				});
+			}
+		}
+	}
 
 	Ok(())
 }
@@ -1538,6 +1584,18 @@ pub struct NodeInfo {
 	/// Optional because we store a Node entry after learning about it from
 	/// a channel announcement, but before receiving a node announcement.
 	pub announcement_info: Option<NodeAnnouncementInfo>,
+	/// The node's pinned ML-DSA (FIPS 204) public key, learned the first time we saw a valid
+	/// post-quantum node_announcement from it. Once pinned, an announcement presenting a different
+	/// key is rejected, defeating a quantum attacker who forges the classical signature in order to
+	/// substitute their own post-quantum key.
+	#[cfg(feature = "post-quantum")]
+	pub(crate) pq_node_id: Option<[u8; 1312]>,
+	/// The node's pinned ML-KEM (FIPS 203) static encapsulation key, learned the same way as
+	/// [`Self::pq_node_id`] and pinned with the same continuity rules. Post-quantum peers
+	/// encapsulate to this key, so the resulting shared secret cannot be recovered by a quantum
+	/// attacker who breaks the classical ECDH.
+	#[cfg(feature = "post-quantum")]
+	pub(crate) pq_kem_node_id: Option<[u8; 1184]>,
 	/// In memory, each node is assigned a unique ID. They are eagerly reused, ensuring they remain
 	/// relatively dense.
 	///
@@ -1548,7 +1606,10 @@ pub struct NodeInfo {
 
 impl PartialEq for NodeInfo {
 	fn eq(&self, o: &NodeInfo) -> bool {
-		self.channels == o.channels && self.announcement_info == o.announcement_info
+		let eq = self.channels == o.channels && self.announcement_info == o.announcement_info;
+		#[cfg(feature = "post-quantum")]
+		let eq = eq && self.pq_node_id == o.pq_node_id && self.pq_kem_node_id == o.pq_kem_node_id;
+		eq
 	}
 }
 
@@ -1561,6 +1622,21 @@ impl NodeInfo {
 			.and_then(|addresses| (!addresses.is_empty()).then(|| addresses))
 			.map(|addresses| addresses.iter().all(|address| address.is_tor()))
 			.unwrap_or(false)
+	}
+
+	/// Returns this node's pinned ML-DSA (FIPS 204) public key, if one was learned from a
+	/// post-quantum `node_announcement`. This is the trusted key the node's `channel_update`
+	/// ML-DSA signatures are verified against.
+	#[cfg(feature = "post-quantum")]
+	pub fn pq_node_id(&self) -> Option<[u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]> {
+		self.pq_node_id
+	}
+
+	/// Returns this node's pinned ML-KEM (FIPS 203) static encapsulation key, if one was learned
+	/// from a post-quantum `node_announcement`. Post-quantum peers encapsulate to this key.
+	#[cfg(feature = "post-quantum")]
+	pub fn pq_kem_node_id(&self) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]> {
+		self.pq_kem_node_id
 	}
 }
 
@@ -1578,10 +1654,19 @@ impl fmt::Display for NodeInfo {
 
 impl Writeable for NodeInfo {
 	fn write<W: crate::util::ser::Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
+		#[cfg(not(feature = "post-quantum"))]
 		write_tlv_fields!(writer, {
 			// Note that older versions of LDK wrote the lowest inbound fees here at type 0
 			(2, self.announcement_info, option),
 			(4, self.channels, required_vec),
+		});
+		#[cfg(feature = "post-quantum")]
+		write_tlv_fields!(writer, {
+			// Note that older versions of LDK wrote the lowest inbound fees here at type 0
+			(2, self.announcement_info, option),
+			(4, self.channels, required_vec),
+			(7, self.pq_node_id, option),
+			(9, self.pq_kem_node_id, option),
 		});
 		Ok(())
 	}
@@ -1612,18 +1697,35 @@ impl Readable for NodeInfo {
 		// with zero inbound fees, causing that heuristic to provide little gain. Worse, because it
 		// requires additional complexity and lookups during routing, it ends up being a
 		// performance loss. Thus, we simply ignore the old field here and no longer track it.
+		#[cfg(not(feature = "post-quantum"))]
 		_init_and_read_len_prefixed_tlv_fields!(reader, {
 			(0, _lowest_inbound_channel_fees, option),
 			(2, announcement_info_wrap, upgradable_option),
 			(4, channels, required_vec),
 		});
+		#[cfg(feature = "post-quantum")]
+		_init_and_read_len_prefixed_tlv_fields!(reader, {
+			(0, _lowest_inbound_channel_fees, option),
+			(2, announcement_info_wrap, upgradable_option),
+			(4, channels, required_vec),
+			(7, pq_node_id, option),
+			(9, pq_kem_node_id, option),
+		});
 		let _: Option<RoutingFees> = _lowest_inbound_channel_fees;
 		let announcement_info_wrap: Option<NodeAnnouncementInfoDeserWrapper> =
 			announcement_info_wrap;
+		#[cfg(feature = "post-quantum")]
+		let pq_node_id: Option<[u8; 1312]> = pq_node_id;
+		#[cfg(feature = "post-quantum")]
+		let pq_kem_node_id: Option<[u8; 1184]> = pq_kem_node_id;
 
 		Ok(NodeInfo {
 			announcement_info: announcement_info_wrap.map(|w| w.0),
 			channels,
+			#[cfg(feature = "post-quantum")]
+			pq_node_id,
+			#[cfg(feature = "post-quantum")]
+			pq_kem_node_id,
 			node_counter: u32::max_value(),
 		})
 	}
@@ -1940,6 +2042,70 @@ impl<L: Logger> NetworkGraph<L> {
 					}
 				}
 
+				// PQ: enforce post-quantum key continuity on the signed path. The ML-DSA signature
+				// was already verified against the embedded key by `verify_node_announcement`; here
+				// we pin the key on first sight and reject any later key substitution or downgrade.
+				#[cfg(feature = "post-quantum")]
+				if full_msg.is_some() {
+					let records = crate::sign::pq::parse_records(&msg.excess_data);
+					// Validate fully before mutating the pin so a rejected announcement never changes
+					// pinned state. Reject any key substitution against the pinned key, and any node
+					// that is pinned but drops its ML-DSA key.
+					match (node.pq_node_id, records.pubkey) {
+						(Some(pinned), Some(new_key)) if pinned != new_key => {
+							return Err(LightningError {
+								err: "PQ: rejecting node_announcement, ML-DSA pubkey does not match pinned key".to_owned(),
+								action: ErrorAction::IgnoreAndLog(Level::Gossip),
+							});
+						},
+						(Some(_), None) => {
+							return Err(LightningError {
+								err: "PQ: rejecting node_announcement from post-quantum node missing ML-DSA key".to_owned(),
+								action: ErrorAction::IgnoreAndLog(Level::Gossip),
+							});
+						},
+						_ => {},
+					}
+					// The KEM key follows the same continuity rules: once pinned, it cannot be
+					// substituted or dropped. It is covered by the ML-DSA signature, so a quantum
+					// attacker cannot forge an announcement that would substitute it.
+					match (node.pq_kem_node_id, records.kem_key) {
+						(Some(pinned), Some(new_key)) if pinned != new_key => {
+							return Err(LightningError {
+								err: "PQ: rejecting node_announcement, ML-KEM key does not match pinned key".to_owned(),
+								action: ErrorAction::IgnoreAndLog(Level::Gossip),
+							});
+						},
+						(Some(_), None) => {
+							return Err(LightningError {
+								err: "PQ: rejecting node_announcement from post-quantum node missing ML-KEM key".to_owned(),
+								action: ErrorAction::IgnoreAndLog(Level::Gossip),
+							});
+						},
+						_ => {},
+					}
+					// A node that is pinned, or that this announcement would newly pin, must also carry
+					// a signature; dropping it is a downgrade attempt. Checked before pinning so a
+					// rejected announcement never poisons the pin.
+					if (node.pq_node_id.is_some() || records.pubkey.is_some()) && records.signature.is_none() {
+						return Err(LightningError {
+							err: "PQ: rejecting node_announcement from post-quantum node missing ML-DSA signature".to_owned(),
+							action: ErrorAction::IgnoreAndLog(Level::Gossip),
+						});
+					}
+					// All post-quantum checks passed; pin the keys on first sight. The ML-DSA
+					// signature was already verified against the ML-DSA key by
+					// `verify_node_announcement`, and it covers the KEM key record too.
+					if let (None, Some(new_key)) = (node.pq_node_id, records.pubkey) {
+						node.pq_node_id = Some(new_key);
+						log_info!(self.logger, "PQ: pinned ML-DSA pubkey for node {}", msg.node_id);
+					}
+					if let (None, Some(new_key)) = (node.pq_kem_node_id, records.kem_key) {
+						node.pq_kem_node_id = Some(new_key);
+						log_info!(self.logger, "PQ: pinned ML-KEM key for node {}", msg.node_id);
+					}
+				}
+
 				let should_relay = msg.excess_data.len() <= MAX_EXCESS_BYTES_FOR_RELAY
 					&& msg.excess_address_data.len() <= MAX_EXCESS_BYTES_FOR_RELAY
 					&& msg.excess_data.len() + msg.excess_address_data.len()
@@ -2101,6 +2267,10 @@ impl<L: Logger> NetworkGraph<L> {
 					node_entry.insert(NodeInfo {
 						channels: vec![short_channel_id],
 						announcement_info: None,
+						#[cfg(feature = "post-quantum")]
+						pq_node_id: None,
+						#[cfg(feature = "post-quantum")]
+						pq_kem_node_id: None,
 						node_counter: **chan_info_node_counter,
 					});
 				},
@@ -2611,6 +2781,46 @@ impl<L: Logger> NetworkGraph<L> {
 				return Err(LightningError { err, action });
 			};
 			secp_verify_sig!(self.secp_ctx, &msg_hash, &sig, &node_pubkey, "channel_update");
+
+			// PQ: if we have pinned an ML-DSA key for the signing node, the channel_update must
+			// carry a matching ML-DSA signature. We never learn (TOFU) a post-quantum key from a
+			// channel_update; pinning happens only via node_announcement.
+			#[cfg(feature = "post-quantum")]
+			{
+				let pinned = self
+					.nodes
+					.read()
+					.unwrap()
+					.get(&NodeId::from_pubkey(&node_pubkey))
+					.and_then(|n| n.pq_node_id);
+				if let Some(pinned_key) = pinned {
+					let records = crate::sign::pq::parse_records(&msg.excess_data);
+					match records.signature {
+						Some(pq_sig) => {
+							let mut unsigned = msg.clone();
+							let signed_len =
+								unsigned.excess_data.len() - records.signature_record_len;
+							unsigned.excess_data.truncate(signed_len);
+							if !crate::sign::pq::verify(
+								&pinned_key, &unsigned.encode()[..], &pq_sig,
+								crate::sign::pq::PQ_CONTEXT_GOSSIP,
+							) {
+								return Err(LightningError {
+									err: "PQ: invalid ML-DSA signature on channel_update".to_owned(),
+									action: ErrorAction::IgnoreAndLog(Level::Gossip),
+								});
+							}
+							log_trace!(self.logger, "PQ: verified channel_update ML-DSA signature");
+						},
+						None => {
+							return Err(LightningError {
+								err: "PQ: rejecting channel_update from post-quantum node missing ML-DSA signature".to_owned(),
+								action: ErrorAction::IgnoreAndLog(Level::Gossip),
+							});
+						},
+					}
+				}
+			}
 		}
 
 		if only_verify {
@@ -2984,6 +3194,373 @@ pub(crate) mod tests {
 			Ok(_) => panic!(),
 			Err(e) => assert_eq!(e.err, "Update older than last processed update"),
 		};
+	}
+
+	#[cfg(feature = "post-quantum")]
+	fn get_pq_signed_node_announcement<F: Fn(&mut UnsignedNodeAnnouncement)>(
+		f: F, node_key: &SecretKey, pq_seed: &[u8; 32], secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> NodeAnnouncement {
+		let (pq_sk, pq_pk) = crate::sign::pq::keypair_from_seed(pq_seed);
+		let node_id = NodeId::from_pubkey(&PublicKey::from_secret_key(secp_ctx, node_key));
+		let mut features = channelmanager::provided_node_features(&UserConfig::default());
+		features.set_pq_gossip_optional();
+		let mut unsigned = UnsignedNodeAnnouncement {
+			features,
+			timestamp: 100,
+			node_id,
+			rgb: [0; 3],
+			alias: NodeAlias([0; 32]),
+			addresses: Vec::new(),
+			excess_address_data: Vec::new(),
+			excess_data: Vec::new(),
+		};
+		f(&mut unsigned);
+		// Mirror the production signing order: append the ML-DSA public key, sign the message with
+		// the ML-DSA key (excluding the signature record), append the signature, then sign classically.
+		crate::sign::pq::append_public_key_record(&mut unsigned.excess_data, &pq_pk);
+		let pq_sig =
+			crate::sign::pq::sign(&pq_sk, &unsigned.encode()[..], crate::sign::pq::PQ_CONTEXT_GOSSIP);
+		crate::sign::pq::append_signature_record(&mut unsigned.excess_data, &pq_sig);
+		let msghash = hash_to_message!(&Sha256dHash::hash(&unsigned.encode()[..])[..]);
+		NodeAnnouncement { signature: secp_ctx.sign_ecdsa(&msghash, node_key), contents: unsigned }
+	}
+
+	#[cfg(feature = "post-quantum")]
+	fn get_pq_signed_channel_update<F: Fn(&mut UnsignedChannelUpdate)>(
+		f: F, node_key: &SecretKey, pq_seed: &[u8; 32], secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> ChannelUpdate {
+		let (pq_sk, _) = crate::sign::pq::keypair_from_seed(pq_seed);
+		let mut unsigned = UnsignedChannelUpdate {
+			chain_hash: ChainHash::using_genesis_block(Network::Testnet),
+			short_channel_id: 0,
+			timestamp: 100,
+			message_flags: 1,
+			channel_flags: 0,
+			cltv_expiry_delta: 144,
+			htlc_minimum_msat: 1_000_000,
+			htlc_maximum_msat: 1_000_000,
+			fee_base_msat: 10_000,
+			fee_proportional_millionths: 20,
+			excess_data: Vec::new(),
+		};
+		f(&mut unsigned);
+		let pq_sig =
+			crate::sign::pq::sign(&pq_sk, &unsigned.encode()[..], crate::sign::pq::PQ_CONTEXT_GOSSIP);
+		crate::sign::pq::append_signature_record(&mut unsigned.excess_data, &pq_sig);
+		let msghash = hash_to_message!(&Sha256dHash::hash(&unsigned.encode()[..])[..]);
+		ChannelUpdate { signature: secp_ctx.sign_ecdsa(&msghash, node_key), contents: unsigned }
+	}
+
+	#[test]
+	#[cfg(feature = "post-quantum")]
+	fn pq_node_announcement_pins_key_and_verifies() {
+		let network_graph = create_network_graph();
+		let (secp_ctx, gossip_sync) = create_gossip_sync(&network_graph);
+		let node_1_privkey = SecretKey::from_slice(&[42; 32]).unwrap();
+		let node_1_pubkey = PublicKey::from_secret_key(&secp_ctx, &node_1_privkey);
+		let node_2_privkey = SecretKey::from_slice(&[41; 32]).unwrap();
+		let pq_seed = [7u8; 32];
+
+		let chan_ann =
+			get_signed_channel_announcement(|_| {}, &node_1_privkey, &node_2_privkey, &secp_ctx);
+		gossip_sync.handle_channel_announcement(Some(node_1_pubkey), &chan_ann).unwrap();
+
+		let ann = get_pq_signed_node_announcement(|_| {}, &node_1_privkey, &pq_seed, &secp_ctx);
+		// The self-consistent ML-DSA signature verifies.
+		assert!(crate::routing::gossip::verify_node_announcement(&ann, &secp_ctx).is_ok());
+		// Storing it pins the node's ML-DSA public key.
+		assert!(gossip_sync.handle_node_announcement(Some(node_1_pubkey), &ann).is_ok());
+
+		let (_, expected_pk) = crate::sign::pq::keypair_from_seed(&pq_seed);
+		let node_id = NodeId::from_pubkey(&node_1_pubkey);
+		assert_eq!(network_graph.read_only().node(&node_id).unwrap().pq_node_id, Some(expected_pk));
+	}
+
+	#[test]
+	#[cfg(feature = "post-quantum")]
+	fn pq_node_announcement_tampered_signature_rejected() {
+		let secp_ctx = Secp256k1::new();
+		let node_1_privkey = SecretKey::from_slice(&[42; 32]).unwrap();
+		let mut ann = get_pq_signed_node_announcement(|_| {}, &node_1_privkey, &[7u8; 32], &secp_ctx);
+
+		// Flip a byte inside the ML-DSA signature (the tail of excess_data) and re-sign classically,
+		// so only the post-quantum check can catch it.
+		let len = ann.contents.excess_data.len();
+		ann.contents.excess_data[len - 1] ^= 0x01;
+		let msghash = hash_to_message!(&Sha256dHash::hash(&ann.contents.encode()[..])[..]);
+		ann.signature = secp_ctx.sign_ecdsa(&msghash, &node_1_privkey);
+
+		let res = crate::routing::gossip::verify_node_announcement(&ann, &secp_ctx);
+		assert!(res.is_err());
+		assert!(res.unwrap_err().err.contains("ML-DSA"));
+	}
+
+	#[test]
+	#[cfg(feature = "post-quantum")]
+	fn pq_node_announcement_key_substitution_rejected() {
+		let network_graph = create_network_graph();
+		let (secp_ctx, gossip_sync) = create_gossip_sync(&network_graph);
+		let node_1_privkey = SecretKey::from_slice(&[42; 32]).unwrap();
+		let node_1_pubkey = PublicKey::from_secret_key(&secp_ctx, &node_1_privkey);
+		let node_2_privkey = SecretKey::from_slice(&[41; 32]).unwrap();
+
+		let chan_ann =
+			get_signed_channel_announcement(|_| {}, &node_1_privkey, &node_2_privkey, &secp_ctx);
+		gossip_sync.handle_channel_announcement(Some(node_1_pubkey), &chan_ann).unwrap();
+
+		// Pin the node's real ML-DSA key.
+		let ann = get_pq_signed_node_announcement(|_| {}, &node_1_privkey, &[7u8; 32], &secp_ctx);
+		gossip_sync.handle_node_announcement(Some(node_1_pubkey), &ann).unwrap();
+
+		// A quantum attacker forges the classical signature but cannot forge the pinned ML-DSA key,
+		// so it substitutes its own ML-DSA key. This must be rejected.
+		let attacker = get_pq_signed_node_announcement(
+			|unsigned| unsigned.timestamp += 1,
+			&node_1_privkey,
+			&[8u8; 32],
+			&secp_ctx,
+		);
+		match gossip_sync.handle_node_announcement(Some(node_1_pubkey), &attacker) {
+			Ok(_) => panic!("substituted ML-DSA key must be rejected"),
+			Err(e) => assert!(e.err.contains("does not match pinned key")),
+		}
+	}
+
+	#[test]
+	#[cfg(feature = "post-quantum")]
+	fn pq_node_announcement_downgrade_rejected() {
+		let network_graph = create_network_graph();
+		let (secp_ctx, gossip_sync) = create_gossip_sync(&network_graph);
+		let node_1_privkey = SecretKey::from_slice(&[42; 32]).unwrap();
+		let node_1_pubkey = PublicKey::from_secret_key(&secp_ctx, &node_1_privkey);
+		let node_2_privkey = SecretKey::from_slice(&[41; 32]).unwrap();
+
+		let chan_ann =
+			get_signed_channel_announcement(|_| {}, &node_1_privkey, &node_2_privkey, &secp_ctx);
+		gossip_sync.handle_channel_announcement(Some(node_1_pubkey), &chan_ann).unwrap();
+
+		// Pin the node's ML-DSA key.
+		let ann = get_pq_signed_node_announcement(|_| {}, &node_1_privkey, &[7u8; 32], &secp_ctx);
+		gossip_sync.handle_node_announcement(Some(node_1_pubkey), &ann).unwrap();
+
+		// A later announcement that drops the ML-DSA data downgrades a known post-quantum node.
+		let downgrade = get_signed_node_announcement(
+			|unsigned| unsigned.timestamp += 1,
+			&node_1_privkey,
+			&secp_ctx,
+		);
+		match gossip_sync.handle_node_announcement(Some(node_1_pubkey), &downgrade) {
+			Ok(_) => panic!("downgrade of a pinned post-quantum node must be rejected"),
+			Err(e) => assert!(e.err.contains("ML-DSA")),
+		}
+	}
+
+	#[test]
+	#[cfg(feature = "post-quantum")]
+	fn pq_node_announcement_pubkey_without_signature_does_not_pin() {
+		// A node_announcement carrying an ML-DSA public key but no signature must be rejected and
+		// must NOT pin the node's key. Otherwise a quantum attacker who forges only the classical
+		// signature could poison an unpinned node's pin with a key it does not control, and then have
+		// its forged messages accepted against that pin.
+		let network_graph = create_network_graph();
+		let (secp_ctx, gossip_sync) = create_gossip_sync(&network_graph);
+		let node_1_privkey = SecretKey::from_slice(&[42; 32]).unwrap();
+		let node_1_pubkey = PublicKey::from_secret_key(&secp_ctx, &node_1_privkey);
+		let node_2_privkey = SecretKey::from_slice(&[41; 32]).unwrap();
+		let node_id = NodeId::from_pubkey(&node_1_pubkey);
+
+		let chan_ann =
+			get_signed_channel_announcement(|_| {}, &node_1_privkey, &node_2_privkey, &secp_ctx);
+		gossip_sync.handle_channel_announcement(Some(node_1_pubkey), &chan_ann).unwrap();
+		// The node exists in the graph but is not yet pinned.
+		assert_eq!(network_graph.read_only().node(&node_id).unwrap().pq_node_id, None);
+
+		// Build an announcement carrying the attacker's ML-DSA public key but no signature record,
+		// then sign it classically (modeling a quantum attacker who forges the classical signature).
+		let (_, attacker_pk) = crate::sign::pq::keypair_from_seed(&[8u8; 32]);
+		let mut features = channelmanager::provided_node_features(&UserConfig::default());
+		features.set_pq_gossip_optional();
+		let mut unsigned = UnsignedNodeAnnouncement {
+			features,
+			timestamp: 100,
+			node_id,
+			rgb: [0; 3],
+			alias: NodeAlias([0; 32]),
+			addresses: Vec::new(),
+			excess_address_data: Vec::new(),
+			excess_data: Vec::new(),
+		};
+		crate::sign::pq::append_public_key_record(&mut unsigned.excess_data, &attacker_pk);
+		let msghash = hash_to_message!(&Sha256dHash::hash(&unsigned.encode()[..])[..]);
+		let ann = NodeAnnouncement {
+			signature: secp_ctx.sign_ecdsa(&msghash, &node_1_privkey),
+			contents: unsigned,
+		};
+
+		// It is rejected, both at verification and when stored.
+		assert!(crate::routing::gossip::verify_node_announcement(&ann, &secp_ctx).is_err());
+		assert!(gossip_sync.handle_node_announcement(Some(node_1_pubkey), &ann).is_err());
+		// Crucially, the pin was not poisoned, so a later legitimate announcement can still pin the
+		// node's real key.
+		assert_eq!(network_graph.read_only().node(&node_id).unwrap().pq_node_id, None);
+
+		let legit = get_pq_signed_node_announcement(
+			|unsigned| unsigned.timestamp += 1,
+			&node_1_privkey,
+			&[7u8; 32],
+			&secp_ctx,
+		);
+		assert!(gossip_sync.handle_node_announcement(Some(node_1_pubkey), &legit).is_ok());
+		let (_, real_pk) = crate::sign::pq::keypair_from_seed(&[7u8; 32]);
+		assert_eq!(network_graph.read_only().node(&node_id).unwrap().pq_node_id, Some(real_pk));
+	}
+
+	#[test]
+	#[cfg(feature = "post-quantum")]
+	fn vanilla_node_announcement_accepted_in_pq_build() {
+		let network_graph = create_network_graph();
+		let (secp_ctx, gossip_sync) = create_gossip_sync(&network_graph);
+		let node_1_privkey = SecretKey::from_slice(&[42; 32]).unwrap();
+		let node_1_pubkey = PublicKey::from_secret_key(&secp_ctx, &node_1_privkey);
+		let node_2_privkey = SecretKey::from_slice(&[41; 32]).unwrap();
+
+		let chan_ann =
+			get_signed_channel_announcement(|_| {}, &node_1_privkey, &node_2_privkey, &secp_ctx);
+		gossip_sync.handle_channel_announcement(Some(node_1_pubkey), &chan_ann).unwrap();
+
+		// A vanilla node (no post-quantum feature bit, no ML-DSA records) is accepted on its
+		// classical signature alone, and no ML-DSA key is pinned for it.
+		let vanilla = get_signed_node_announcement(
+			|unsigned| unsigned.features.clear_pq_gossip(),
+			&node_1_privkey,
+			&secp_ctx,
+		);
+		assert!(gossip_sync.handle_node_announcement(Some(node_1_pubkey), &vanilla).is_ok());
+		let node_id = NodeId::from_pubkey(&node_1_pubkey);
+		assert!(network_graph.read_only().node(&node_id).unwrap().pq_node_id.is_none());
+	}
+
+	#[test]
+	#[cfg(feature = "post-quantum")]
+	fn pq_channel_update_verified_against_pin() {
+		let network_graph = create_network_graph();
+		let (secp_ctx, gossip_sync) = create_gossip_sync(&network_graph);
+		let node_1_privkey = SecretKey::from_slice(&[42; 32]).unwrap();
+		let node_2_privkey = SecretKey::from_slice(&[41; 32]).unwrap();
+		let node_1_id = NodeId::from_pubkey(&PublicKey::from_secret_key(&secp_ctx, &node_1_privkey));
+		let node_2_id = NodeId::from_pubkey(&PublicKey::from_secret_key(&secp_ctx, &node_2_privkey));
+
+		// channel_flags bit 0 == 0 means the update is signed by node_one, i.e. the lower node id.
+		let (one_key, one_seed) = if node_1_id < node_2_id {
+			(node_1_privkey, [7u8; 32])
+		} else {
+			(node_2_privkey, [9u8; 32])
+		};
+		let one_pubkey = PublicKey::from_secret_key(&secp_ctx, &one_key);
+
+		let chan_ann =
+			get_signed_channel_announcement(|_| {}, &node_1_privkey, &node_2_privkey, &secp_ctx);
+		gossip_sync.handle_channel_announcement(Some(one_pubkey), &chan_ann).unwrap();
+
+		// Pin node_one's ML-DSA key via its node_announcement.
+		let ann = get_pq_signed_node_announcement(|_| {}, &one_key, &one_seed, &secp_ctx);
+		gossip_sync.handle_node_announcement(Some(one_pubkey), &ann).unwrap();
+
+		// A channel_update from node_one with a matching ML-DSA signature is accepted.
+		let upd = get_pq_signed_channel_update(|_| {}, &one_key, &one_seed, &secp_ctx);
+		assert!(gossip_sync.handle_channel_update(Some(one_pubkey), &upd).is_ok());
+
+		// The same channel_update without an ML-DSA signature is rejected as a downgrade.
+		let no_pq = get_signed_channel_update(
+			|unsigned| unsigned.timestamp += 1,
+			&one_key,
+			&secp_ctx,
+		);
+		match gossip_sync.handle_channel_update(Some(one_pubkey), &no_pq) {
+			Ok(_) => panic!("channel_update from pinned post-quantum node without ML-DSA signature must be rejected"),
+			Err(e) => assert!(e.err.contains("missing ML-DSA signature")),
+		}
+	}
+
+	#[test]
+	#[cfg(feature = "post-quantum")]
+	fn pq_node_info_pin_round_trips() {
+		let (_, pk) = crate::sign::pq::keypair_from_seed(&[3u8; 32]);
+		let (kem_ek, _) = crate::crypto::pq_kem::keypair_from_seed(&[4u8; 32]);
+		let node_info = NodeInfo {
+			channels: Vec::new(),
+			announcement_info: None,
+			pq_node_id: Some(pk),
+			pq_kem_node_id: Some(kem_ek),
+			node_counter: 0,
+		};
+		let encoded = node_info.encode();
+		let decoded = NodeInfo::read(&mut &encoded[..]).unwrap();
+		assert_eq!(decoded.pq_node_id, Some(pk));
+		assert_eq!(decoded.pq_kem_node_id, Some(kem_ek));
+		assert_eq!(decoded, node_info);
+	}
+
+	// Prints the gossip size overhead and ML-DSA operation timings for the post-quantum scheme.
+	// Run with: cargo test -p lightning --lib --features post-quantum pq_measurements -- --nocapture
+	#[test]
+	#[cfg(feature = "post-quantum")]
+	fn pq_measurements() {
+		use std::time::Instant;
+		let secp_ctx = Secp256k1::new();
+		let node_key = SecretKey::from_slice(&[42; 32]).unwrap();
+
+		let vanilla_na =
+			get_signed_node_announcement(|u| u.features.clear_pq_gossip(), &node_key, &secp_ctx)
+				.encode()
+				.len();
+		let pq_na = get_pq_signed_node_announcement(|_| {}, &node_key, &[7u8; 32], &secp_ctx)
+			.encode()
+			.len();
+		let vanilla_cu = get_signed_channel_update(|_| {}, &node_key, &secp_ctx).encode().len();
+		let pq_cu = get_pq_signed_channel_update(|_| {}, &node_key, &[7u8; 32], &secp_ctx)
+			.encode()
+			.len();
+		println!(
+			"PQ: node_announcement size: vanilla {} B, PQ {} B (+{} B)",
+			vanilla_na,
+			pq_na,
+			pq_na - vanilla_na
+		);
+		println!(
+			"PQ: channel_update size: vanilla {} B, PQ {} B (+{} B)",
+			vanilla_cu,
+			pq_cu,
+			pq_cu - vanilla_cu
+		);
+
+		let n = 200u32;
+		let seed = [3u8; 32];
+		let start = Instant::now();
+		for _ in 0..n {
+			let _ = crate::sign::pq::keypair_from_seed(&seed);
+		}
+		let keygen_us = start.elapsed().as_micros() as f64 / n as f64;
+
+		let (sk, pk) = crate::sign::pq::keypair_from_seed(&seed);
+		let msg = [9u8; 32];
+		let start = Instant::now();
+		for _ in 0..n {
+			let _ = crate::sign::pq::sign(&sk, &msg, crate::sign::pq::PQ_CONTEXT_GOSSIP);
+		}
+		let sign_us = start.elapsed().as_micros() as f64 / n as f64;
+
+		let sig = crate::sign::pq::sign(&sk, &msg, crate::sign::pq::PQ_CONTEXT_GOSSIP);
+		let start = Instant::now();
+		for _ in 0..n {
+			assert!(crate::sign::pq::verify(&pk, &msg, &sig, crate::sign::pq::PQ_CONTEXT_GOSSIP));
+		}
+		let verify_us = start.elapsed().as_micros() as f64 / n as f64;
+
+		println!(
+			"PQ: ML-DSA-44 keygen {:.1} us, sign {:.1} us, verify {:.1} us (avg over {} iters)",
+			keygen_us, sign_us, verify_us, n
+		);
 	}
 
 	#[test]
@@ -4415,6 +4992,10 @@ pub(crate) mod tests {
 		let valid_node_info = NodeInfo {
 			channels: Vec::new(),
 			announcement_info: Some(valid_node_ann_info),
+			#[cfg(feature = "post-quantum")]
+			pq_node_id: None,
+			#[cfg(feature = "post-quantum")]
+			pq_kem_node_id: None,
 			node_counter: 0,
 		};
 

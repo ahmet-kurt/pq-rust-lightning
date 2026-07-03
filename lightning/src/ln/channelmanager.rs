@@ -5568,7 +5568,8 @@ impl<
 		let were_node_one = our_node_id < their_node_id;
 		let enabled = chan.context.is_enabled();
 
-		let unsigned = msgs::UnsignedChannelUpdate {
+		#[allow(unused_mut)]
+		let mut unsigned = msgs::UnsignedChannelUpdate {
 			chain_hash: self.chain_hash,
 			short_channel_id,
 			timestamp: chan.context.get_update_time_counter(),
@@ -5581,6 +5582,21 @@ impl<
 			fee_proportional_millionths: chan.context.get_fee_proportional_millionths(),
 			excess_data: Vec::new(),
 		};
+		// PQ: attach the ML-DSA signature before the classical signature so the classical signature
+		// commits to it too. The signing node's ML-DSA public key is learned from its
+		// node_announcement, so it is not repeated here.
+		#[cfg(feature = "post-quantum")]
+		if let Some(pq_sig) = self
+			.node_signer
+			.sign_pq_gossip_message(msgs::UnsignedGossipMessage::ChannelUpdate(&unsigned))
+		{
+			crate::sign::pq::append_signature_record(&mut unsigned.excess_data, &pq_sig);
+			log_trace!(
+				logger,
+				"PQ: signed channel_update (ML-DSA sig {} B)",
+				crate::sign::pq::PQ_SIGNATURE_LEN
+			);
+		}
 		// Panic on failure to signal LDK should be restarted to retry signing the `ChannelUpdate`.
 		// If we returned an error and the `node_signer` cannot provide a signature for whatever
 		// reason`, we wouldn't be able to receive inbound payments through the corresponding
@@ -18343,6 +18359,9 @@ pub fn provided_init_features(config: &UserConfig) -> InitFeatures {
 	if config.enable_htlc_hold {
 		features.set_htlc_hold_optional();
 	}
+
+	#[cfg(feature = "post-quantum")]
+	features.set_pq_gossip_optional();
 
 	features
 }

@@ -31,6 +31,10 @@ dnssec = ["dnssec-prover/validation"]
 # Generates low-r bitcoin signatures, which saves 1 byte in 50% of the cases
 grind_signatures = []
 
+# Adds post-quantum (ML-DSA / FIPS 204) hybrid signatures and (ML-KEM / FIPS 203) hybrid key
+# exchange to Shor-vulnerable surfaces
+post-quantum = ["dep:fips204", "dep:fips203"]
+
 default = ["std", "grind_signatures"]
 
 [dependencies]
@@ -51,6 +55,9 @@ backtrace = { version = "0.3", optional = true }
 
 libm = { version = "0.2", default-features = false }
 inventory = { version = "0.3", optional = true  }
+
+fips204 = { version = "0.4.6", default-features = false, features = ["ml-dsa-44"], optional = true }
+fips203 = { version = "0.4.3", default-features = false, features = ["ml-kem-768"], optional = true }
 
 [dev-dependencies]
 regex = "1.5.6"

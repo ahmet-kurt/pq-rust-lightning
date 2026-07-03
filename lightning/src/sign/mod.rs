@@ -72,6 +72,9 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 pub mod ecdsa;
 pub mod tx_builder;
 
+#[cfg(feature = "post-quantum")]
+pub mod pq;
+
 pub(crate) const COMPRESSED_PUBLIC_KEY_SIZE: usize = bitcoin::secp256k1::constants::PUBLIC_KEY_SIZE;
 
 pub(crate) const MAX_STANDARD_SIGNATURE_SIZE: usize =
@@ -1002,6 +1005,35 @@ pub trait NodeSigner {
 	/// An `Err` can be returned to signal that the signer is unavailable / cannot produce a valid
 	/// signature.
 	fn sign_message(&self, msg: &[u8]) -> Result<String, ()>;
+
+	/// Returns this node's ML-DSA (FIPS 204) public key used for post-quantum gossip
+	/// signatures, or `None` if this signer does not support post-quantum signing.
+	#[cfg(feature = "post-quantum")]
+	fn get_pq_node_id(&self) -> Option<[u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]> {
+		None
+	}
+
+	/// Signs a gossip message with this node's ML-DSA (FIPS 204) secret key, returning the
+	/// signature, or `None` if this signer does not support post-quantum signing. The message is
+	/// serialized exactly as in [`NodeSigner::sign_gossip_message`], but ML-DSA signs the
+	/// serialized bytes directly rather than a double-SHA256 pre-hash. The caller must append any
+	/// post-quantum key records to the message's excess data and leave the post-quantum signature
+	/// record unappended before signing (the signature record is excluded from the signed bytes).
+	#[cfg(feature = "post-quantum")]
+	fn sign_pq_gossip_message(
+		&self, _msg: UnsignedGossipMessage,
+	) -> Option<[u8; crate::sign::pq::PQ_SIGNATURE_LEN]> {
+		None
+	}
+
+	/// Returns this node's static ML-KEM (FIPS 203) encapsulation (public) key, or `None` if this
+	/// signer does not support post-quantum key exchange. The key is announced in our
+	/// node_announcement and pinned by post-quantum peers, which encapsulate to it to establish
+	/// hybrid shared secrets with us.
+	#[cfg(feature = "post-quantum")]
+	fn get_pq_kem_node_id(&self) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]> {
+		None
+	}
 }
 
 impl<T: NodeSigner + ?Sized, N: Deref<Target = T>> NodeSigner for N {
@@ -1037,6 +1069,20 @@ impl<T: NodeSigner + ?Sized, N: Deref<Target = T>> NodeSigner for N {
 	}
 	fn sign_message(&self, msg: &[u8]) -> Result<String, ()> {
 		self.deref().sign_message(msg)
+	}
+	#[cfg(feature = "post-quantum")]
+	fn get_pq_node_id(&self) -> Option<[u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]> {
+		self.deref().get_pq_node_id()
+	}
+	#[cfg(feature = "post-quantum")]
+	fn sign_pq_gossip_message(
+		&self, msg: UnsignedGossipMessage,
+	) -> Option<[u8; crate::sign::pq::PQ_SIGNATURE_LEN]> {
+		self.deref().sign_pq_gossip_message(msg)
+	}
+	#[cfg(feature = "post-quantum")]
+	fn get_pq_kem_node_id(&self) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]> {
+		self.deref().get_pq_kem_node_id()
 	}
 }
 
@@ -1994,6 +2040,13 @@ pub struct KeysManager {
 	peer_storage_key: PeerStorageKey,
 	receive_auth_key: ReceiveAuthKey,
 
+	#[cfg(feature = "post-quantum")]
+	pq_node_secret: pq::PqSecretKey,
+	#[cfg(feature = "post-quantum")]
+	pq_node_id: [u8; pq::PQ_PUBLIC_KEY_LEN],
+	#[cfg(feature = "post-quantum")]
+	pq_kem_node_id: [u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN],
+
 	#[cfg(test)]
 	pub(crate) entropy_source: RandomBytes,
 	#[cfg(not(test))]
@@ -2040,6 +2093,10 @@ impl KeysManager {
 		const PEER_STORAGE_KEY_INDEX: ChildNumber = ChildNumber::Hardened { index: 6 };
 		const RECEIVE_AUTH_KEY_INDEX: ChildNumber = ChildNumber::Hardened { index: 7 };
 		const STATIC_PAYMENT_KEY_INDEX: ChildNumber = ChildNumber::Hardened { index: 8 };
+		#[cfg(feature = "post-quantum")]
+		const PQ_NODE_SECRET_INDEX: ChildNumber = ChildNumber::Hardened { index: 9 };
+		#[cfg(feature = "post-quantum")]
+		const PQ_KEM_NODE_SECRET_INDEX: ChildNumber = ChildNumber::Hardened { index: 10 };
 
 		let secp_ctx = Secp256k1::new();
 		// Note that when we aren't serializing the key, network doesn't matter
@@ -2050,6 +2107,28 @@ impl KeysManager {
 					.expect("Your RNG is busted")
 					.private_key;
 				let node_id = PublicKey::from_secret_key(&secp_ctx, &node_secret);
+				// Derive the post-quantum (ML-DSA) identity from the same master key so it is
+				// recoverable from the existing seed backup.
+				#[cfg(feature = "post-quantum")]
+				let (pq_node_secret, pq_node_id) = {
+					let pq_seed = master_key
+						.derive_priv(&secp_ctx, &PQ_NODE_SECRET_INDEX)
+						.expect("Your RNG is busted")
+						.private_key
+						.secret_bytes();
+					pq::keypair_from_seed(&pq_seed)
+				};
+				// Derive the post-quantum (ML-KEM) static key-exchange identity from the same
+				// master key so it too is recoverable from the existing seed backup.
+				#[cfg(feature = "post-quantum")]
+				let (pq_kem_node_id, _) = {
+					let kem_seed = master_key
+						.derive_priv(&secp_ctx, &PQ_KEM_NODE_SECRET_INDEX)
+						.expect("Your RNG is busted")
+						.private_key
+						.secret_bytes();
+					crate::crypto::pq_kem::keypair_from_seed(&kem_seed)
+				};
 				let destination_script =
 					match master_key.derive_priv(&secp_ctx, &DESTINATION_SCRIPT_INDEX) {
 						Ok(destination_key) => {
@@ -2107,6 +2186,13 @@ impl KeysManager {
 
 					peer_storage_key: PeerStorageKey { inner: peer_storage_key.secret_bytes() },
 					receive_auth_key: ReceiveAuthKey(receive_auth_key.secret_bytes()),
+
+					#[cfg(feature = "post-quantum")]
+					pq_node_secret,
+					#[cfg(feature = "post-quantum")]
+					pq_node_id,
+					#[cfg(feature = "post-quantum")]
+					pq_kem_node_id,
 
 					destination_script,
 					shutdown_pubkey,
@@ -2430,6 +2516,23 @@ impl NodeSigner for KeysManager {
 	fn sign_message(&self, msg: &[u8]) -> Result<String, ()> {
 		Ok(crate::util::message_signing::sign(msg, &self.node_secret))
 	}
+
+	#[cfg(feature = "post-quantum")]
+	fn get_pq_node_id(&self) -> Option<[u8; pq::PQ_PUBLIC_KEY_LEN]> {
+		Some(self.pq_node_id)
+	}
+
+	#[cfg(feature = "post-quantum")]
+	fn sign_pq_gossip_message(
+		&self, msg: UnsignedGossipMessage,
+	) -> Option<[u8; pq::PQ_SIGNATURE_LEN]> {
+		Some(pq::sign(&self.pq_node_secret, &msg.encode()[..], pq::PQ_CONTEXT_GOSSIP))
+	}
+
+	#[cfg(feature = "post-quantum")]
+	fn get_pq_kem_node_id(&self) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]> {
+		Some(self.pq_kem_node_id)
+	}
 }
 
 impl OutputSpender for KeysManager {
@@ -2596,6 +2699,23 @@ impl NodeSigner for PhantomKeysManager {
 
 	fn sign_message(&self, msg: &[u8]) -> Result<String, ()> {
 		self.inner.sign_message(msg)
+	}
+
+	#[cfg(feature = "post-quantum")]
+	fn get_pq_node_id(&self) -> Option<[u8; pq::PQ_PUBLIC_KEY_LEN]> {
+		self.inner.get_pq_node_id()
+	}
+
+	#[cfg(feature = "post-quantum")]
+	fn sign_pq_gossip_message(
+		&self, msg: UnsignedGossipMessage,
+	) -> Option<[u8; pq::PQ_SIGNATURE_LEN]> {
+		self.inner.sign_pq_gossip_message(msg)
+	}
+
+	#[cfg(feature = "post-quantum")]
+	fn get_pq_kem_node_id(&self) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]> {
+		self.inner.get_pq_kem_node_id()
 	}
 }
 

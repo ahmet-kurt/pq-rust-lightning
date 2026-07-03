@@ -151,7 +151,11 @@ inner,
 	) -> Result<secp256k1::schnorr::Signature, ()>,
 	fn get_expanded_key(,) -> ExpandedKey,
 	fn get_peer_storage_key(,) -> PeerStorageKey,
-	fn get_receive_auth_key(,) -> ReceiveAuthKey
+	fn get_receive_auth_key(,) -> ReceiveAuthKey,
+	#[cfg(feature = "post-quantum")]
+	fn get_pq_node_id(,) -> Option<[u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]>,
+	#[cfg(feature = "post-quantum")]
+	fn get_pq_kem_node_id(,) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]>
 );
 
 delegate!(DynKeysInterface, SignerProvider,
@@ -203,7 +207,11 @@ delegate!(DynPhantomKeysInterface, NodeSigner,
 	) -> Result<secp256k1::schnorr::Signature, ()>,
 	fn get_expanded_key(,) -> ExpandedKey,
 	fn get_peer_storage_key(,) -> PeerStorageKey,
-	fn get_receive_auth_key(,) -> ReceiveAuthKey
+	fn get_receive_auth_key(,) -> ReceiveAuthKey,
+	#[cfg(feature = "post-quantum")]
+	fn get_pq_node_id(,) -> Option<[u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]>,
+	#[cfg(feature = "post-quantum")]
+	fn get_pq_kem_node_id(,) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]>
 );
 
 impl SignerProvider for DynPhantomKeysInterface {

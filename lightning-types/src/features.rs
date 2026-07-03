@@ -83,6 +83,8 @@
 //!   (see [BOLT PR #1160](https://github.com/lightning/bolts/pull/1160) for more information).
 //! - `HtlcHold` - requires/supports holding HTLCs and forwarding on receipt of an onion message
 //!   (see [BOLT-2](https://github.com/lightning/bolts/pull/989/files) for more information).
+//! - `PostQuantumGossip` - requires/supports post-quantum (ML-DSA / FIPS 204) signatures on
+//!   `node_announcement` and `channel_update` gossip messages (experimental; no assigned BOLT bit).
 //!
 //! LDK knows about the following features, but does not support them:
 //! - `AnchorsNonzeroFeeHtlcTx` - the initial version of anchor outputs, which was later found to be
@@ -167,8 +169,12 @@ mod sealed {
 			ZeroConf,
 			// Byte 7
 			Trampoline | SimpleClose | Splice,
-			// Byte 8 - 18
-			,,,,,,,,,,,
+			// Byte 8 - 16
+			,,,,,,,,,
+			// Byte 17
+			PostQuantumGossip,
+			// Byte 18
+			,
 			// Byte 19
 			HtlcHold,
 		]
@@ -192,8 +198,12 @@ mod sealed {
 			ZeroConf | Keysend,
 			// Byte 7
 			Trampoline | SimpleClose | Splice,
-			// Byte 8 - 18
-			,,,,,,,,,,,
+			// Byte 8 - 16
+			,,,,,,,,,
+			// Byte 17
+			PostQuantumGossip,
+			// Byte 18
+			,
 			// Byte 19
 			HtlcHold,
 			// Byte 20 - 31
@@ -727,6 +737,17 @@ mod sealed {
 		clear_dns_resolution,
 		supports_dns_resolution,
 		requires_dns_resolution
+	);
+	define_feature!(
+		139, // No assigned BOLT bit for post-quantum gossip yet; experimental odd bit (see the HtlcHold +100 convention)
+		PostQuantumGossip,
+		[InitContext, NodeContext],
+		"Feature flags for post-quantum (ML-DSA) gossip signatures",
+		set_pq_gossip_optional,
+		set_pq_gossip_required,
+		clear_pq_gossip,
+		supports_pq_gossip,
+		requires_pq_gossip
 	);
 
 	// Note: update the module-level docs when a new feature bit is added!
