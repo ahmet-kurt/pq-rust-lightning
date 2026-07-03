@@ -1886,11 +1886,24 @@ impl Logger for TestLogger {
 
 pub struct TestNodeSigner {
 	node_secret: SecretKey,
+	#[cfg(feature = "post-quantum")]
+	pq_kem_node_secret: [u8; crate::crypto::pq_kem::PQ_KEM_DK_LEN],
+	#[cfg(feature = "post-quantum")]
+	pq_kem_node_id: [u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN],
 }
 
 impl TestNodeSigner {
 	pub fn new(node_secret: SecretKey) -> Self {
-		Self { node_secret }
+		#[cfg(feature = "post-quantum")]
+		let (pq_kem_node_id, pq_kem_node_secret) =
+			crate::crypto::pq_kem::keypair_from_seed(&node_secret.secret_bytes());
+		Self {
+			node_secret,
+			#[cfg(feature = "post-quantum")]
+			pq_kem_node_secret,
+			#[cfg(feature = "post-quantum")]
+			pq_kem_node_id,
+		}
 	}
 }
 
@@ -1945,6 +1958,18 @@ impl NodeSigner for TestNodeSigner {
 
 	fn sign_message(&self, msg: &[u8]) -> Result<String, ()> {
 		Ok(crate::util::message_signing::sign(msg, &self.node_secret))
+	}
+
+	#[cfg(feature = "post-quantum")]
+	fn get_pq_kem_node_id(&self) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]> {
+		Some(self.pq_kem_node_id)
+	}
+
+	#[cfg(feature = "post-quantum")]
+	fn pq_kem_decapsulate(
+		&self, ciphertext: &[u8; crate::crypto::pq_kem::PQ_KEM_CT_LEN],
+	) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_SS_LEN]> {
+		crate::crypto::pq_kem::decapsulate(&self.pq_kem_node_secret, ciphertext)
 	}
 }
 

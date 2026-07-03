@@ -16,6 +16,10 @@ rust-version = "1.75"
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+[features]
+# Enables the hybrid post-quantum (ML-KEM) BOLT 8 transport setup helpers.
+post-quantum = ["lightning/post-quantum"]
+
 [dependencies]
 bitcoin = "0.32.2"
 lightning = { version = "0.3.0", path = "../lightning" }

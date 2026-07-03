@@ -157,7 +157,9 @@ inner,
 	#[cfg(feature = "post-quantum")]
 	fn sign_pq_bolt11_invoice(, msg: &[u8]) -> Option<[u8; crate::sign::pq::PQ_SIGNATURE_LEN]>,
 	#[cfg(feature = "post-quantum")]
-	fn get_pq_kem_node_id(,) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]>
+	fn get_pq_kem_node_id(,) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]>,
+	#[cfg(feature = "post-quantum")]
+	fn pq_kem_decapsulate(, ciphertext: &[u8; crate::crypto::pq_kem::PQ_KEM_CT_LEN]) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_SS_LEN]>
 );
 
 delegate!(DynKeysInterface, SignerProvider,
@@ -215,7 +217,9 @@ delegate!(DynPhantomKeysInterface, NodeSigner,
 	#[cfg(feature = "post-quantum")]
 	fn sign_pq_bolt11_invoice(, msg: &[u8]) -> Option<[u8; crate::sign::pq::PQ_SIGNATURE_LEN]>,
 	#[cfg(feature = "post-quantum")]
-	fn get_pq_kem_node_id(,) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]>
+	fn get_pq_kem_node_id(,) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]>,
+	#[cfg(feature = "post-quantum")]
+	fn pq_kem_decapsulate(, ciphertext: &[u8; crate::crypto::pq_kem::PQ_KEM_CT_LEN]) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_SS_LEN]>
 );
 
 impl SignerProvider for DynPhantomKeysInterface {

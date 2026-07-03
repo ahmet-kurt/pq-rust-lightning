@@ -30,6 +30,9 @@ use chacha20_poly1305::{ChaCha20Poly1305, Key, Nonce};
 use crate::crypto::utils::hkdf_extract_expand_twice;
 use crate::util::ser::VecWriter;
 
+#[cfg(feature = "post-quantum")]
+use crate::crypto::pq_kem::{PQ_KEM_CT_LEN, PQ_KEM_DK_LEN, PQ_KEM_EK_LEN};
+
 /// Maximum Lightning message data length according to
 /// [BOLT-8](https://github.com/lightning/bolts/blob/v1.0/08-transport.md#lightning-message-specification)
 /// and [BOLT-1](https://github.com/lightning/bolts/blob/master/01-messaging.md#lightning-message-format):
@@ -100,10 +103,35 @@ enum NoiseState {
 	},
 }
 
+// Per-connection state for the hybrid post-quantum (ML-KEM) BOLT 8 handshake. This rides alongside
+// the classical Noise state; the classical handshake is left byte-for-byte unchanged and this is
+// only populated for connections established on a post-quantum endpoint.
+#[cfg(feature = "post-quantum")]
+enum PqHandshakeState {
+	Outbound {
+		// The responder's pinned static ML-KEM encapsulation key, supplied out of band (e.g. from
+		// the gossip pin). We encapsulate to it in act one to authenticate the responder.
+		rs_kem_ek: [u8; PQ_KEM_EK_LEN],
+		// Per-connection randomness seed; expanded into the static-encapsulation and ephemeral-keygen
+		// sub-seeds. Fresh per connection in production (forward secrecy), fixed in tests.
+		pq_seed: [u8; 32],
+		// Our ephemeral ML-KEM decapsulation key, generated in act one and used to recover the
+		// forward-secret shared secret from the responder's ciphertext in act two.
+		eph_dk: Option<[u8; PQ_KEM_DK_LEN]>,
+	},
+	Inbound {
+		// Per-connection randomness seed for the ephemeral encapsulation we send in act two.
+		pq_seed: [u8; 32],
+	},
+}
+
 pub struct PeerChannelEncryptor {
 	their_node_id: Option<PublicKey>, // filled in for outbound, or inbound after noise_state is Finished
 
 	noise_state: NoiseState,
+
+	#[cfg(feature = "post-quantum")]
+	pq: Option<PqHandshakeState>,
 }
 
 impl PeerChannelEncryptor {
@@ -122,7 +150,23 @@ impl PeerChannelEncryptor {
 				directional_state: DirectionalNoiseState::Outbound { ie: ephemeral_key },
 				bidirectional_state: BidirectionalNoiseState { h, ck: NOISE_CK },
 			},
+			#[cfg(feature = "post-quantum")]
+			pq: None,
 		}
+	}
+
+	/// Builds an outbound encryptor for a hybrid post-quantum handshake. `responder_kem_key` is the
+	/// responder's pinned static ML-KEM encapsulation key (supplied out of band, e.g. the gossip
+	/// pin) and `pq_seed` is fresh per-connection randomness.
+	#[cfg(feature = "post-quantum")]
+	pub fn new_outbound_pq(
+		their_node_id: PublicKey, ephemeral_key: SecretKey,
+		responder_kem_key: [u8; PQ_KEM_EK_LEN], pq_seed: [u8; 32],
+	) -> PeerChannelEncryptor {
+		let mut res = PeerChannelEncryptor::new_outbound(their_node_id, ephemeral_key);
+		res.pq =
+			Some(PqHandshakeState::Outbound { rs_kem_ek: responder_kem_key, pq_seed, eph_dk: None });
+		res
 	}
 
 	pub fn new_inbound<NS: NodeSigner>(node_signer: &NS) -> PeerChannelEncryptor {
@@ -143,7 +187,20 @@ impl PeerChannelEncryptor {
 				},
 				bidirectional_state: BidirectionalNoiseState { h, ck: NOISE_CK },
 			},
+			#[cfg(feature = "post-quantum")]
+			pq: None,
 		}
+	}
+
+	/// Builds an inbound encryptor for a hybrid post-quantum handshake (a connection accepted on a
+	/// post-quantum endpoint). `pq_seed` is fresh per-connection randomness.
+	#[cfg(feature = "post-quantum")]
+	pub fn new_inbound_pq<NS: NodeSigner>(
+		node_signer: &NS, pq_seed: [u8; 32],
+	) -> PeerChannelEncryptor {
+		let mut res = PeerChannelEncryptor::new_inbound(node_signer);
+		res.pq = Some(PqHandshakeState::Inbound { pq_seed });
+		res
 	}
 
 	#[inline]
@@ -216,6 +273,26 @@ impl PeerChannelEncryptor {
 		let (t1, t2) = hkdf_extract_expand_twice(&state.ck, ss.as_ref());
 		state.ck = t1;
 		t2
+	}
+
+	// Mixes opaque handshake bytes (an ML-KEM ciphertext or ephemeral public key) into the
+	// transcript hash, exactly as the classical acts mix the ephemeral pubkeys and AEAD tags.
+	#[cfg(feature = "post-quantum")]
+	#[inline]
+	fn mix_hash(state: &mut BidirectionalNoiseState, data: &[u8]) {
+		let mut sha = Sha256::engine();
+		sha.input(&state.h);
+		sha.input(data);
+		state.h = Sha256::from_engine(sha).to_byte_array();
+	}
+
+	// Folds an ML-KEM shared secret into the chaining key, exactly as `hkdf` folds an ECDH shared
+	// secret. We advance the chaining key only; the next classical act derives its AEAD key from it.
+	#[cfg(feature = "post-quantum")]
+	#[inline]
+	fn mix_kem_secret(state: &mut BidirectionalNoiseState, ss: &[u8; 32]) {
+		let (t1, _) = hkdf_extract_expand_twice(&state.ck, ss);
+		state.ck = t1;
 	}
 
 	#[inline]
@@ -507,6 +584,266 @@ impl PeerChannelEncryptor {
 		Ok(self.their_node_id.unwrap().clone())
 	}
 
+	/// Returns whether this encryptor is performing a hybrid post-quantum handshake.
+	#[cfg(feature = "post-quantum")]
+	pub fn is_post_quantum(&self) -> bool {
+		self.pq.is_some()
+	}
+
+	// Derives a 32-byte sub-seed from the per-connection seed under a domain-separation tag, so the
+	// static-encapsulation, ephemeral-keygen, and ephemeral-encapsulation randomness are independent.
+	#[cfg(feature = "post-quantum")]
+	fn pq_subseed(seed: &[u8; 32], tag: &[u8]) -> [u8; 32] {
+		let mut sha = Sha256::engine();
+		sha.input(tag);
+		sha.input(seed);
+		Sha256::from_engine(sha).to_byte_array()
+	}
+
+	/// Builds the post-quantum act one: the classical 50-byte act one, followed by an ML-KEM
+	/// ciphertext encapsulated to the responder's pinned static key (authentication) and our fresh
+	/// ephemeral ML-KEM public key (forward secrecy). Both are bound into the transcript hash; the
+	/// static shared secret is folded into the chaining key now, the ephemeral one in act two.
+	#[cfg(feature = "post-quantum")]
+	pub fn get_act_one_pq<C: secp256k1::Signing>(&mut self, secp_ctx: &Secp256k1<C>) -> Vec<u8> {
+		let (rs_kem_ek, pq_seed) = match &self.pq {
+			Some(PqHandshakeState::Outbound { rs_kem_ek, pq_seed, .. }) => (*rs_kem_ek, *pq_seed),
+			_ => panic!("get_act_one_pq on a non-post-quantum-outbound encryptor"),
+		};
+
+		let (classical, ct_s, eph_ek, eph_dk) = match self.noise_state {
+			NoiseState::InProgress {
+				ref mut state,
+				ref directional_state,
+				ref mut bidirectional_state,
+			} => match directional_state {
+				&DirectionalNoiseState::Outbound { ref ie } => {
+					if *state != NoiseStep::PreActOne {
+						panic!("Requested act at wrong step");
+					}
+
+					let (classical, _) = PeerChannelEncryptor::outbound_noise_act(
+						secp_ctx,
+						bidirectional_state,
+						&ie,
+						&self.their_node_id.unwrap(),
+					);
+					*state = NoiseStep::PostActOne;
+
+					// Encapsulate to the responder's pinned static ML-KEM key (responder
+					// authentication): only the holder of the matching secret can recover this.
+					let encaps_seed =
+						PeerChannelEncryptor::pq_subseed(&pq_seed, b"LDK-PQ-XK-static-encaps");
+					let (ss_s, ct_s) = crate::crypto::pq_kem::encapsulate(&rs_kem_ek, &encaps_seed)
+						.expect("pinned responder ML-KEM key must be well-formed");
+					PeerChannelEncryptor::mix_hash(bidirectional_state, &ct_s);
+					PeerChannelEncryptor::mix_kem_secret(bidirectional_state, &ss_s);
+
+					// Attach a fresh ephemeral ML-KEM public key (forward secrecy); the responder
+					// encapsulates to it in act two.
+					let eph_seed = PeerChannelEncryptor::pq_subseed(&pq_seed, b"LDK-PQ-XK-ephemeral");
+					let (eph_ek, eph_dk) = crate::crypto::pq_kem::keypair_from_seed(&eph_seed);
+					PeerChannelEncryptor::mix_hash(bidirectional_state, &eph_ek);
+
+					(classical, ct_s, eph_ek, eph_dk)
+				},
+				_ => panic!("Wrong direction for act"),
+			},
+			_ => panic!("Cannot get act one after noise handshake completes"),
+		};
+
+		if let Some(PqHandshakeState::Outbound { eph_dk: slot, .. }) = &mut self.pq {
+			*slot = Some(eph_dk);
+		}
+
+		let mut res = Vec::with_capacity(50 + PQ_KEM_CT_LEN + PQ_KEM_EK_LEN);
+		res.extend_from_slice(&classical);
+		res.extend_from_slice(&ct_s);
+		res.extend_from_slice(&eph_ek);
+		res
+	}
+
+	/// Processes the post-quantum act one and returns the post-quantum act two. Decapsulates the
+	/// static ciphertext with our node's ML-KEM key (proving we are the pinned responder) and
+	/// encapsulates to the initiator's ephemeral key (forward secrecy).
+	#[cfg(feature = "post-quantum")]
+	pub fn process_act_one_with_keys_pq<C: secp256k1::Signing, NS: NodeSigner>(
+		&mut self, act_one: &[u8], node_signer: &NS, our_ephemeral: SecretKey,
+		secp_ctx: &Secp256k1<C>,
+	) -> Result<Vec<u8>, LightningError> {
+		assert_eq!(act_one.len(), 50 + PQ_KEM_CT_LEN + PQ_KEM_EK_LEN);
+
+		let pq_seed = match &self.pq {
+			Some(PqHandshakeState::Inbound { pq_seed }) => *pq_seed,
+			_ => panic!("process_act_one_with_keys_pq on a non-post-quantum-inbound encryptor"),
+		};
+
+		let mut ct_s = [0u8; PQ_KEM_CT_LEN];
+		ct_s.copy_from_slice(&act_one[50..50 + PQ_KEM_CT_LEN]);
+		let mut eph_ek = [0u8; PQ_KEM_EK_LEN];
+		eph_ek.copy_from_slice(&act_one[50 + PQ_KEM_CT_LEN..]);
+
+		match self.noise_state {
+			NoiseState::InProgress {
+				ref mut state,
+				ref mut directional_state,
+				ref mut bidirectional_state,
+			} => match directional_state {
+				&mut DirectionalNoiseState::Inbound { ref mut ie, ref mut re, ref mut temp_k2 } => {
+					if *state != NoiseStep::PreActOne {
+						panic!("Requested act at wrong step");
+					}
+
+					let (their_pub, _) = PeerChannelEncryptor::inbound_noise_act(
+						bidirectional_state,
+						&act_one[0..50],
+						NoiseSecretKey::NodeSigner(node_signer),
+					)?;
+					ie.get_or_insert(their_pub);
+
+					// Recover the static shared secret by decapsulating with our node's ML-KEM key. If
+					// the initiator pinned a key we do not hold, implicit rejection yields a mismatched
+					// secret and the initiator rejects our act two; None here means our signer cannot
+					// decapsulate at all.
+					PeerChannelEncryptor::mix_hash(bidirectional_state, &ct_s);
+					let ss_s = node_signer.pq_kem_decapsulate(&ct_s).ok_or(LightningError {
+						err: "Failed to decapsulate post-quantum static shared secret".to_owned(),
+						action: msgs::ErrorAction::DisconnectPeer { msg: None },
+					})?;
+					PeerChannelEncryptor::mix_kem_secret(bidirectional_state, &ss_s);
+					PeerChannelEncryptor::mix_hash(bidirectional_state, &eph_ek);
+
+					re.get_or_insert(our_ephemeral);
+					let (classical, temp_k) = PeerChannelEncryptor::outbound_noise_act(
+						secp_ctx,
+						bidirectional_state,
+						&re.unwrap(),
+						&ie.unwrap(),
+					);
+					*temp_k2 = Some(temp_k);
+
+					// Encapsulate to the initiator's ephemeral key (forward secrecy).
+					let encaps_seed =
+						PeerChannelEncryptor::pq_subseed(&pq_seed, b"LDK-PQ-XK-ephemeral-encaps");
+					let (ss_e, ct_e) = crate::crypto::pq_kem::encapsulate(&eph_ek, &encaps_seed)
+						.ok_or(LightningError {
+							err: "Invalid post-quantum ephemeral key in act one".to_owned(),
+							action: msgs::ErrorAction::DisconnectPeer { msg: None },
+						})?;
+					PeerChannelEncryptor::mix_hash(bidirectional_state, &ct_e);
+					PeerChannelEncryptor::mix_kem_secret(bidirectional_state, &ss_e);
+
+					*state = NoiseStep::PostActTwo;
+
+					let mut res = Vec::with_capacity(50 + PQ_KEM_CT_LEN);
+					res.extend_from_slice(&classical);
+					res.extend_from_slice(&ct_e);
+					Ok(res)
+				},
+				_ => panic!("Wrong direction for act"),
+			},
+			_ => panic!("Cannot get act one after noise handshake completes"),
+		}
+	}
+
+	/// Processes the post-quantum act two and returns the (classical, 66-byte) act three plus the
+	/// responder's node id. Decapsulates the responder's ephemeral ciphertext (forward secrecy);
+	/// act three itself carries no extra post-quantum data.
+	#[cfg(feature = "post-quantum")]
+	pub fn process_act_two_pq<NS: NodeSigner>(
+		&mut self, act_two: &[u8], node_signer: &NS,
+	) -> Result<([u8; 66], PublicKey), LightningError> {
+		assert_eq!(act_two.len(), 50 + PQ_KEM_CT_LEN);
+
+		let eph_dk = match &self.pq {
+			Some(PqHandshakeState::Outbound { eph_dk: Some(dk), .. }) => *dk,
+			_ => panic!("process_act_two_pq before get_act_one_pq, or on a non-PQ encryptor"),
+		};
+
+		let mut ct_e = [0u8; PQ_KEM_CT_LEN];
+		ct_e.copy_from_slice(&act_two[50..]);
+
+		let final_hkdf;
+		let ck;
+		let res: [u8; 66] = match self.noise_state {
+			NoiseState::InProgress {
+				ref state,
+				ref directional_state,
+				ref mut bidirectional_state,
+			} => match directional_state {
+				&DirectionalNoiseState::Outbound { ref ie } => {
+					if *state != NoiseStep::PostActOne {
+						panic!("Requested act at wrong step");
+					}
+
+					let (re, temp_k2) = PeerChannelEncryptor::inbound_noise_act(
+						bidirectional_state,
+						&act_two[0..50],
+						NoiseSecretKey::<NS>::InMemory(&ie),
+					)?;
+
+					// Recover the forward-secret shared secret from the responder's ciphertext.
+					PeerChannelEncryptor::mix_hash(bidirectional_state, &ct_e);
+					let ss_e = crate::crypto::pq_kem::decapsulate(&eph_dk, &ct_e).ok_or(
+						LightningError {
+							err: "Failed to decapsulate post-quantum ephemeral shared secret"
+								.to_owned(),
+							action: msgs::ErrorAction::DisconnectPeer { msg: None },
+						},
+					)?;
+					PeerChannelEncryptor::mix_kem_secret(bidirectional_state, &ss_e);
+
+					// Build the classical act three (encrypt our static key, then the `se` step).
+					let mut res = [0; 66];
+					let our_node_id =
+						node_signer.get_node_id(Recipient::Node).map_err(|_| LightningError {
+							err: "Failed to encrypt message".to_owned(),
+							action: msgs::ErrorAction::DisconnectPeer { msg: None },
+						})?;
+
+					PeerChannelEncryptor::encrypt_with_ad(
+						&mut res[1..50],
+						1,
+						&temp_k2,
+						&bidirectional_state.h,
+						&our_node_id.serialize()[..],
+					);
+
+					let mut sha = Sha256::engine();
+					sha.input(&bidirectional_state.h);
+					sha.input(&res[1..50]);
+					bidirectional_state.h = Sha256::from_engine(sha).to_byte_array();
+
+					let ss = node_signer.ecdh(Recipient::Node, &re, None).map_err(|_| {
+						LightningError {
+							err: "Failed to derive shared secret".to_owned(),
+							action: msgs::ErrorAction::DisconnectPeer { msg: None },
+						}
+					})?;
+					let temp_k = PeerChannelEncryptor::hkdf(bidirectional_state, ss);
+
+					PeerChannelEncryptor::encrypt_with_ad(
+						&mut res[50..],
+						0,
+						&temp_k,
+						&bidirectional_state.h,
+						&[0; 0],
+					);
+					final_hkdf = hkdf_extract_expand_twice(&bidirectional_state.ck, &[0; 0]);
+					ck = bidirectional_state.ck.clone();
+					res
+				},
+				_ => panic!("Wrong direction for act"),
+			},
+			_ => panic!("Cannot get act one after noise handshake completes"),
+		};
+
+		let (sk, rk) = final_hkdf;
+		self.noise_state = NoiseState::Finished { sk, sn: 0, sck: ck.clone(), rk, rn: 0, rck: ck };
+
+		Ok((res, self.their_node_id.unwrap().clone()))
+	}
+
 	/// Builds sendable bytes for a message.
 	///
 	/// `msgbuf` must begin with 16 + 2 dummy/0 bytes, which will be filled with the encrypted
@@ -687,6 +1024,11 @@ mod tests {
 
 	use crate::ln::peer_channel_encryptor::{NoiseState, PeerChannelEncryptor};
 	use crate::util::test_utils::TestNodeSigner;
+
+	#[cfg(feature = "post-quantum")]
+	use crate::crypto::pq_kem::{PQ_KEM_CT_LEN, PQ_KEM_EK_LEN};
+	#[cfg(feature = "post-quantum")]
+	use crate::sign::{KeysManager, NodeSigner, Recipient};
 
 	fn get_outbound_peer_for_initiator_test_vectors() -> PeerChannelEncryptor {
 		let hex = "028d7500dd4c12685d1f568b4c2b5048e8534b873319f3a8daa612b469132ec7f7";
@@ -1099,5 +1441,250 @@ mod tests {
 		// MSG should not exceed LN_MAX_MSG_LEN + 16
 		let mut msg = [4u8; LN_MAX_MSG_LEN + 17];
 		assert!(inbound_peer.decrypt_message(&mut msg).is_err());
+	}
+
+	// Sets up an initiator/responder keys pair plus the ephemeral keys for a hybrid post-quantum
+	// handshake. The responder's static ML-KEM key is taken from its `KeysManager` (the anchor the
+	// initiator pins out of band).
+	#[cfg(feature = "post-quantum")]
+	fn pq_test_setup(
+	) -> (KeysManager, KeysManager, PublicKey, [u8; PQ_KEM_EK_LEN], SecretKey, SecretKey) {
+		let initiator_ks = KeysManager::new(&[42u8; 32], 0, 0, false);
+		let responder_ks = KeysManager::new(&[43u8; 32], 0, 0, false);
+		let responder_node_id = responder_ks.get_node_id(Recipient::Node).unwrap();
+		let responder_kem = responder_ks.get_pq_kem_node_id().unwrap();
+		let initiator_eph = SecretKey::from_slice(&[2u8; 32]).unwrap();
+		let responder_eph = SecretKey::from_slice(&[4u8; 32]).unwrap();
+		(initiator_ks, responder_ks, responder_node_id, responder_kem, initiator_eph, responder_eph)
+	}
+
+	#[cfg(feature = "post-quantum")]
+	fn finished_keys(enc: &PeerChannelEncryptor) -> ([u8; 32], [u8; 32]) {
+		match enc.noise_state {
+			NoiseState::Finished { sk, rk, .. } => (sk, rk),
+			_ => panic!("handshake not finished"),
+		}
+	}
+
+	#[cfg(feature = "post-quantum")]
+	#[test]
+	fn pq_handshake_completes_and_message_round_trips() {
+		let secp = Secp256k1::new();
+		let (initiator_ks, responder_ks, responder_node_id, responder_kem, init_eph, resp_eph) =
+			pq_test_setup();
+
+		let mut outbound = PeerChannelEncryptor::new_outbound_pq(
+			responder_node_id,
+			init_eph,
+			responder_kem,
+			[7u8; 32],
+		);
+		let mut inbound = PeerChannelEncryptor::new_inbound_pq(&responder_ks, [9u8; 32]);
+		assert!(outbound.is_post_quantum());
+		assert!(inbound.is_post_quantum());
+
+		let act_one = outbound.get_act_one_pq(&secp);
+		assert_eq!(act_one.len(), 50 + PQ_KEM_CT_LEN + PQ_KEM_EK_LEN);
+		let act_two = inbound
+			.process_act_one_with_keys_pq(&act_one, &responder_ks, resp_eph, &secp)
+			.unwrap();
+		assert_eq!(act_two.len(), 50 + PQ_KEM_CT_LEN);
+		let (act_three, resp_id) = outbound.process_act_two_pq(&act_two, &initiator_ks).unwrap();
+		assert_eq!(act_three.len(), 66);
+		assert_eq!(resp_id, responder_node_id);
+		let init_id = inbound.process_act_three(&act_three).unwrap();
+		assert_eq!(init_id, initiator_ks.get_node_id(Recipient::Node).unwrap());
+
+		// Both sides must derive matching, swapped transport keys.
+		let (i_sk, i_rk) = finished_keys(&outbound);
+		let (r_sk, r_rk) = finished_keys(&inbound);
+		assert_eq!(i_sk, r_rk);
+		assert_eq!(i_rk, r_sk);
+
+		// A real message must round-trip over the established transport.
+		let msg = [0x68, 0x65, 0x6c, 0x6c, 0x6f];
+		let mut enc = outbound.encrypt_buffer(MessageBuf::from_encoded(&msg).unwrap());
+		let len = inbound.decrypt_length_header(&enc[..2 + 16]).unwrap();
+		assert_eq!(len as usize, msg.len());
+		inbound.decrypt_message(&mut enc[2 + 16..]).unwrap();
+		assert_eq!(enc[2 + 16..enc.len() - 16], msg[..]);
+	}
+
+	#[cfg(feature = "post-quantum")]
+	#[test]
+	fn pq_handshake_is_deterministic() {
+		let secp = Secp256k1::new();
+		let run = || {
+			let (initiator_ks, responder_ks, responder_node_id, responder_kem, init_eph, resp_eph) =
+				pq_test_setup();
+			let mut outbound = PeerChannelEncryptor::new_outbound_pq(
+				responder_node_id,
+				init_eph,
+				responder_kem,
+				[7u8; 32],
+			);
+			let mut inbound = PeerChannelEncryptor::new_inbound_pq(&responder_ks, [9u8; 32]);
+			let a1 = outbound.get_act_one_pq(&secp);
+			let a2 = inbound
+				.process_act_one_with_keys_pq(&a1, &responder_ks, resp_eph, &secp)
+				.unwrap();
+			let (a3, _) = outbound.process_act_two_pq(&a2, &initiator_ks).unwrap();
+			(a1, a2, a3.to_vec(), finished_keys(&outbound))
+		};
+		assert_eq!(run(), run());
+	}
+
+	#[cfg(feature = "post-quantum")]
+	#[test]
+	fn pq_responder_auth_rejects_key_substitution() {
+		// A quantum man-in-the-middle can forge the classical key but not the pinned ML-KEM key. We
+		// model this as the initiator binding to a static KEM key the responder does not hold: the
+		// session is bound to that key, so the handshake must fail rather than complete.
+		let secp = Secp256k1::new();
+		let (initiator_ks, responder_ks, responder_node_id, _real_kem, init_eph, resp_eph) =
+			pq_test_setup();
+		let wrong_kem = KeysManager::new(&[99u8; 32], 0, 0, false).get_pq_kem_node_id().unwrap();
+
+		let mut outbound =
+			PeerChannelEncryptor::new_outbound_pq(responder_node_id, init_eph, wrong_kem, [7u8; 32]);
+		let mut inbound = PeerChannelEncryptor::new_inbound_pq(&responder_ks, [9u8; 32]);
+
+		let act_one = outbound.get_act_one_pq(&secp);
+		let act_two = inbound
+			.process_act_one_with_keys_pq(&act_one, &responder_ks, resp_eph, &secp)
+			.unwrap();
+		// The responder decapsulated with its real key, diverging the chaining key, so the
+		// initiator rejects act two.
+		assert!(outbound.process_act_two_pq(&act_two, &initiator_ks).is_err());
+	}
+
+	#[cfg(feature = "post-quantum")]
+	#[test]
+	fn pq_rejects_tampered_static_ciphertext() {
+		let secp = Secp256k1::new();
+		let (initiator_ks, responder_ks, responder_node_id, responder_kem, init_eph, resp_eph) =
+			pq_test_setup();
+		let mut outbound = PeerChannelEncryptor::new_outbound_pq(
+			responder_node_id,
+			init_eph,
+			responder_kem,
+			[7u8; 32],
+		);
+		let mut inbound = PeerChannelEncryptor::new_inbound_pq(&responder_ks, [9u8; 32]);
+
+		let mut act_one = outbound.get_act_one_pq(&secp);
+		act_one[60] ^= 0x01; // flip a byte inside the static ciphertext (offset 50..50+CT_LEN)
+		let act_two = inbound
+			.process_act_one_with_keys_pq(&act_one, &responder_ks, resp_eph, &secp)
+			.unwrap();
+		assert!(outbound.process_act_two_pq(&act_two, &initiator_ks).is_err());
+	}
+
+	#[cfg(feature = "post-quantum")]
+	#[test]
+	fn pq_rejects_tampered_ephemeral_key() {
+		let secp = Secp256k1::new();
+		let (initiator_ks, responder_ks, responder_node_id, responder_kem, init_eph, resp_eph) =
+			pq_test_setup();
+		let mut outbound = PeerChannelEncryptor::new_outbound_pq(
+			responder_node_id,
+			init_eph,
+			responder_kem,
+			[7u8; 32],
+		);
+		let mut inbound = PeerChannelEncryptor::new_inbound_pq(&responder_ks, [9u8; 32]);
+
+		let mut act_one = outbound.get_act_one_pq(&secp);
+		let last = act_one.len() - 1; // flip a byte inside the ephemeral key (tail of act one)
+		act_one[last] ^= 0x01;
+		let act_two = inbound
+			.process_act_one_with_keys_pq(&act_one, &responder_ks, resp_eph, &secp)
+			.unwrap();
+		// The ephemeral key is bound into the transcript before the act-two tag, so the initiator
+		// rejects act two.
+		assert!(outbound.process_act_two_pq(&act_two, &initiator_ks).is_err());
+	}
+
+	#[cfg(feature = "post-quantum")]
+	#[test]
+	fn pq_rejects_tampered_ephemeral_ciphertext() {
+		let secp = Secp256k1::new();
+		let (initiator_ks, responder_ks, responder_node_id, responder_kem, init_eph, resp_eph) =
+			pq_test_setup();
+		let mut outbound = PeerChannelEncryptor::new_outbound_pq(
+			responder_node_id,
+			init_eph,
+			responder_kem,
+			[7u8; 32],
+		);
+		let mut inbound = PeerChannelEncryptor::new_inbound_pq(&responder_ks, [9u8; 32]);
+
+		let act_one = outbound.get_act_one_pq(&secp);
+		let mut act_two = inbound
+			.process_act_one_with_keys_pq(&act_one, &responder_ks, resp_eph, &secp)
+			.unwrap();
+		act_two[60] ^= 0x01; // flip a byte inside the ephemeral ciphertext (offset 50..50+CT_LEN)
+		// The ephemeral ciphertext is folded after the act-two tag, so the initiator cannot detect
+		// the tamper locally, but the transport keys diverge and the responder rejects act three.
+		let (act_three, _) = outbound.process_act_two_pq(&act_two, &initiator_ks).unwrap();
+		assert!(inbound.process_act_three(&act_three).is_err());
+	}
+
+	#[cfg(feature = "post-quantum")]
+	#[test]
+	fn pq_measurements_transport() {
+		let secp = Secp256k1::new();
+		let (initiator_ks, responder_ks, responder_node_id, responder_kem, init_eph, resp_eph) =
+			pq_test_setup();
+		let mut outbound = PeerChannelEncryptor::new_outbound_pq(
+			responder_node_id,
+			init_eph,
+			responder_kem,
+			[7u8; 32],
+		);
+		let mut inbound = PeerChannelEncryptor::new_inbound_pq(&responder_ks, [9u8; 32]);
+		let act_one = outbound.get_act_one_pq(&secp);
+		let act_two = inbound
+			.process_act_one_with_keys_pq(&act_one, &responder_ks, resp_eph, &secp)
+			.unwrap();
+		let (act_three, _) = outbound.process_act_two_pq(&act_two, &initiator_ks).unwrap();
+		println!(
+			"PQ: BOLT 8 hybrid (ML-KEM-768) handshake sizes: act_one 50 -> {} B, act_two 50 -> {} B, act_three {} B (unchanged)",
+			act_one.len(),
+			act_two.len(),
+			act_three.len(),
+		);
+		println!(
+			"PQ: ML-KEM-768 wire sizes: encapsulation key {} B, ciphertext {} B",
+			PQ_KEM_EK_LEN, PQ_KEM_CT_LEN,
+		);
+
+		// ML-KEM-768 operation timings (debug/test profile; use a release benchmark for
+		// publication-quality numbers).
+		use std::time::Instant;
+		let n = 200;
+		let start = Instant::now();
+		for i in 0..n {
+			let _ = crate::crypto::pq_kem::keypair_from_seed(&[i as u8; 32]);
+		}
+		let keygen_us = start.elapsed().as_micros() as f64 / n as f64;
+
+		let (ek, dk) = crate::crypto::pq_kem::keypair_from_seed(&[1u8; 32]);
+		let start = Instant::now();
+		for i in 0..n {
+			let _ = crate::crypto::pq_kem::encapsulate(&ek, &[i as u8; 32]);
+		}
+		let encaps_us = start.elapsed().as_micros() as f64 / n as f64;
+
+		let (_, ct) = crate::crypto::pq_kem::encapsulate(&ek, &[5u8; 32]).unwrap();
+		let start = Instant::now();
+		for _ in 0..n {
+			let _ = crate::crypto::pq_kem::decapsulate(&dk, &ct);
+		}
+		let decaps_us = start.elapsed().as_micros() as f64 / n as f64;
+		println!(
+			"PQ: ML-KEM-768 (test profile, avg/{}): keygen {:.0} us, encaps {:.0} us, decaps {:.0} us",
+			n, keygen_us, encaps_us, decaps_us,
+		);
 	}
 }

@@ -1026,6 +1026,12 @@ impl<
 	}
 }
 
+/// The length in bytes of a node's static ML-KEM (FIPS 203) encapsulation key (the key returned by
+/// [`NodeSigner::get_pq_kem_node_id`] and accepted by [`PeerManager::new_outbound_connection_pq`]).
+/// Re-exported so socket drivers such as `lightning-net-tokio` can name the key type.
+#[cfg(feature = "post-quantum")]
+pub use crate::crypto::pq_kem::PQ_KEM_EK_LEN;
+
 /// A PeerManager manages a set of peers, described by their [`SocketDescriptor`] and marshalls
 /// socket events into messages which it passes on to its [`MessageHandler`].
 ///
@@ -1381,6 +1387,17 @@ impl<
 			.expect("You broke SHA-256!")
 	}
 
+	/// Derives fresh per-connection randomness for the hybrid post-quantum handshake (the ephemeral
+	/// ML-KEM keypair and the encapsulation randomness), independent of the classical ephemeral key.
+	#[cfg(feature = "post-quantum")]
+	fn get_pq_seed(&self) -> [u8; 32] {
+		let mut hash = self.ephemeral_key_midstate.clone();
+		let counter = self.peer_counter.next();
+		hash.input(&counter.to_le_bytes());
+		hash.input(b"LDK PQ handshake seed");
+		Sha256::from_engine(hash).to_byte_array()
+	}
+
 	fn init_features(&self, their_node_id: PublicKey) -> InitFeatures {
 		self.message_handler.chan_handler.provided_init_features(their_node_id)
 			| self.message_handler.route_handler.provided_init_features(their_node_id)
@@ -1512,6 +1529,99 @@ impl<
 				Ok(())
 			},
 		}
+	}
+
+	// Builds and inserts a `Peer` for a hybrid post-quantum connection. Mirrors the inline `Peer`
+	// construction in the classical `new_{out,in}bound_connection`, which is left untouched.
+	#[cfg(feature = "post-quantum")]
+	fn insert_pq_peer(
+		&self, descriptor: Descriptor, peer_encryptor: PeerChannelEncryptor,
+		pending_read_buffer: Vec<u8>, remote_network_address: Option<SocketAddress>,
+		inbound_connection: bool,
+	) -> Result<(), PeerHandleError> {
+		let mut peers = self.peers.write().unwrap();
+		match peers.entry(descriptor) {
+			hash_map::Entry::Occupied(_) => {
+				debug_assert!(false, "PeerManager driver duplicated descriptors!");
+				Err(PeerHandleError {})
+			},
+			hash_map::Entry::Vacant(e) => {
+				e.insert(Mutex::new(Peer {
+					channel_encryptor: peer_encryptor,
+					their_node_id: None,
+					their_features: None,
+					their_socket_address: remote_network_address,
+
+					pending_outbound_buffer: VecDeque::new(),
+					pending_outbound_buffer_first_msg_offset: 0,
+					gossip_broadcast_buffer: VecDeque::new(),
+					awaiting_write_event: false,
+					sent_pause_read: false,
+
+					pending_read_buffer,
+					pending_read_buffer_pos: 0,
+					pending_read_is_header: false,
+
+					sync_status: InitSyncTracker::NoSyncRequested,
+
+					msgs_sent_since_pong: 0,
+					awaiting_pong_timer_tick_intervals: 0,
+					received_message_since_timer_tick: false,
+					sent_gossip_timestamp_filter: false,
+
+					received_channel_announce_since_backlogged: false,
+					inbound_connection,
+
+					message_batch: None,
+				}));
+				Ok(())
+			},
+		}
+	}
+
+	/// Indicates a new outbound connection to a post-quantum-capable peer, performing a hybrid
+	/// ML-KEM (FIPS 203) BOLT 8 handshake alongside the classical one. `responder_kem_key` is the
+	/// peer's pinned static ML-KEM encapsulation key (supplied out of band, e.g. from the gossip
+	/// pin). Like [`PeerManager::new_outbound_connection`] but for a post-quantum endpoint; the
+	/// returned act one is larger than the classical 50 bytes.
+	#[cfg(feature = "post-quantum")]
+	pub fn new_outbound_connection_pq(
+		&self, their_node_id: PublicKey, descriptor: Descriptor,
+		remote_network_address: Option<SocketAddress>,
+		responder_kem_key: [u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN],
+	) -> Result<Vec<u8>, PeerHandleError> {
+		let mut peer_encryptor = PeerChannelEncryptor::new_outbound_pq(
+			their_node_id.clone(),
+			self.get_ephemeral_key(),
+			responder_kem_key,
+			self.get_pq_seed(),
+		);
+		let res = peer_encryptor.get_act_one_pq(&self.secp_ctx);
+		let logger = WithContext::from(&self.logger, Some(their_node_id), None, None);
+		log_trace!(
+			logger,
+			"PQ: initiating hybrid ML-KEM-768 BOLT 8 handshake ({} byte act one)",
+			res.len()
+		);
+		let pending_read_buffer = [0; 50 + crate::crypto::pq_kem::PQ_KEM_CT_LEN].to_vec();
+		self.insert_pq_peer(descriptor, peer_encryptor, pending_read_buffer, remote_network_address, false)?;
+		Ok(res)
+	}
+
+	/// Indicates a new inbound connection on a post-quantum endpoint, performing a hybrid ML-KEM
+	/// (FIPS 203) BOLT 8 handshake. Like [`PeerManager::new_inbound_connection`] but for a
+	/// post-quantum endpoint.
+	#[cfg(feature = "post-quantum")]
+	pub fn new_inbound_connection_pq(
+		&self, descriptor: Descriptor, remote_network_address: Option<SocketAddress>,
+	) -> Result<(), PeerHandleError> {
+		let peer_encryptor =
+			PeerChannelEncryptor::new_inbound_pq(&self.node_signer, self.get_pq_seed());
+		let pending_read_buffer = [0;
+			50 + crate::crypto::pq_kem::PQ_KEM_CT_LEN + crate::crypto::pq_kem::PQ_KEM_EK_LEN]
+			.to_vec();
+		self.insert_pq_peer(descriptor, peer_encryptor, pending_read_buffer, remote_network_address, true)?;
+		Ok(())
 	}
 
 	fn should_read_from(&self, peer: &mut Peer) -> bool {
@@ -1856,21 +1966,66 @@ impl<
 					let next_step = peer.channel_encryptor.get_noise_step();
 					match next_step {
 						NextNoiseStep::ActOne => {
-							let res = peer.channel_encryptor.process_act_one_with_keys(
-								&peer.pending_read_buffer[..],
-								&self.node_signer,
-								self.get_ephemeral_key(),
-								&self.secp_ctx,
-							);
-							let act_two = try_potential_handleerror!(peer, res).to_vec();
-							peer.pending_outbound_buffer.push_back(act_two);
-							peer.pending_read_buffer = [0; 66].to_vec(); // act three is 66 bytes long
+							#[cfg(feature = "post-quantum")]
+							if peer.channel_encryptor.is_post_quantum() {
+								let res = peer.channel_encryptor.process_act_one_with_keys_pq(
+									&peer.pending_read_buffer[..],
+									&self.node_signer,
+									self.get_ephemeral_key(),
+									&self.secp_ctx,
+								);
+								let act_two = try_potential_handleerror!(peer, res);
+								peer.pending_outbound_buffer.push_back(act_two);
+								peer.pending_read_buffer = [0; 66].to_vec(); // act three is 66 bytes long
+								log_trace!(
+									self.logger,
+									"PQ: processed hybrid ML-KEM-768 BOLT 8 act one, replied with act two"
+								);
+							} else {
+								let res = peer.channel_encryptor.process_act_one_with_keys(
+									&peer.pending_read_buffer[..],
+									&self.node_signer,
+									self.get_ephemeral_key(),
+									&self.secp_ctx,
+								);
+								let act_two = try_potential_handleerror!(peer, res).to_vec();
+								peer.pending_outbound_buffer.push_back(act_two);
+								peer.pending_read_buffer = [0; 66].to_vec(); // act three is 66 bytes long
+							}
+							#[cfg(not(feature = "post-quantum"))]
+							{
+								let res = peer.channel_encryptor.process_act_one_with_keys(
+									&peer.pending_read_buffer[..],
+									&self.node_signer,
+									self.get_ephemeral_key(),
+									&self.secp_ctx,
+								);
+								let act_two = try_potential_handleerror!(peer, res).to_vec();
+								peer.pending_outbound_buffer.push_back(act_two);
+								peer.pending_read_buffer = [0; 66].to_vec(); // act three is 66 bytes long
+							}
 						},
 						NextNoiseStep::ActTwo => {
+							#[cfg(feature = "post-quantum")]
+							let res = if peer.channel_encryptor.is_post_quantum() {
+								peer.channel_encryptor
+									.process_act_two_pq(&peer.pending_read_buffer[..], &self.node_signer)
+							} else {
+								peer.channel_encryptor
+									.process_act_two(&peer.pending_read_buffer[..], &self.node_signer)
+							};
+							#[cfg(not(feature = "post-quantum"))]
 							let res = peer
 								.channel_encryptor
 								.process_act_two(&peer.pending_read_buffer[..], &self.node_signer);
 							let (act_three, their_node_id) = try_potential_handleerror!(peer, res);
+							#[cfg(feature = "post-quantum")]
+							if peer.channel_encryptor.is_post_quantum() {
+								log_trace!(
+									self.logger,
+									"PQ: completed hybrid ML-KEM-768 BOLT 8 handshake (initiator)"
+								);
+							}
 							peer.pending_outbound_buffer.push_back(act_three.to_vec());
 							peer.pending_read_buffer = [0; 18].to_vec(); // Message length header is 18 bytes
 							peer.pending_read_is_header = true;
@@ -1894,6 +2049,13 @@ impl<
 								.channel_encryptor
 								.process_act_three(&peer.pending_read_buffer[..]);
 							let their_node_id = try_potential_handleerror!(peer, res);
+							#[cfg(feature = "post-quantum")]
+							if peer.channel_encryptor.is_post_quantum() {
+								log_trace!(
+									self.logger,
+									"PQ: completed hybrid ML-KEM-768 BOLT 8 handshake (responder)"
+								);
+							}
 							peer.pending_read_buffer = [0; 18].to_vec(); // Message length header is 18 bytes
 							peer.pending_read_is_header = true;
 							peer.set_their_node_id(their_node_id);
@@ -4083,6 +4245,68 @@ mod tests {
 		assert_eq!(peer_b.peer_by_node_id(&id_a).unwrap().socket_address, Some(addr_a));
 		assert_eq!(peer_b.peer_by_node_id(&id_a).unwrap().init_features, features_a);
 		(fd_a.clone(), fd_b.clone())
+	}
+
+	#[cfg(feature = "post-quantum")]
+	fn try_establish_pq_connection<'a>(
+		peer_a: &TestPeer<'a>, peer_b: &TestPeer<'a>,
+	) -> (FileDescriptor, FileDescriptor, Result<(), PeerHandleError>, Result<(), PeerHandleError>)
+	{
+		let addr_a = SocketAddress::TcpIpV4 { addr: [127, 0, 0, 1], port: 1000 };
+		let addr_b = SocketAddress::TcpIpV4 { addr: [127, 0, 0, 1], port: 1001 };
+
+		static FD_COUNTER: AtomicUsize = AtomicUsize::new(0xff00);
+		let fd = FD_COUNTER.fetch_add(1, Ordering::Relaxed) as u16;
+
+		let id_a = peer_a.node_signer.get_node_id(Recipient::Node).unwrap();
+		// The initiator pins the responder's static ML-KEM key out of band (here, straight from the
+		// responder's signer).
+		let kem_a = peer_a.node_signer.get_pq_kem_node_id().unwrap();
+		let mut fd_a = FileDescriptor::new(fd);
+		let mut fd_b = FileDescriptor::new(fd);
+
+		let initial_data = peer_b
+			.new_outbound_connection_pq(id_a, fd_b.clone(), Some(addr_a.clone()), kem_a)
+			.unwrap();
+		assert_eq!(
+			initial_data.len(),
+			50 + crate::crypto::pq_kem::PQ_KEM_CT_LEN + crate::crypto::pq_kem::PQ_KEM_EK_LEN
+		);
+		peer_a.new_inbound_connection_pq(fd_a.clone(), Some(addr_b.clone())).unwrap();
+		peer_a.read_event(&mut fd_a, &initial_data).unwrap();
+		peer_a.process_events();
+
+		let a_data = fd_a.outbound_data.lock().unwrap().split_off(0);
+		peer_b.read_event(&mut fd_b, &a_data).unwrap();
+
+		peer_b.process_events();
+		let b_data = fd_b.outbound_data.lock().unwrap().split_off(0);
+		let a_refused = peer_a.read_event(&mut fd_a, &b_data);
+
+		peer_a.process_events();
+		let a_data = fd_a.outbound_data.lock().unwrap().split_off(0);
+		let b_refused = peer_b.read_event(&mut fd_b, &a_data);
+
+		(fd_a, fd_b, a_refused, b_refused)
+	}
+
+	#[cfg(feature = "post-quantum")]
+	#[test]
+	fn test_pq_handshake() {
+		// Drives a full hybrid ML-KEM-768 BOLT 8 handshake through the PeerManager (the
+		// separate-endpoint connection methods plus the act dispatch), establishing an
+		// authenticated transport between two post-quantum peers.
+		let cfgs = create_peermgr_cfgs(2);
+		let peers = create_network(2, &cfgs);
+		let (_fd_a, _fd_b, a_refused, b_refused) =
+			try_establish_pq_connection(&peers[0], &peers[1]);
+		a_refused.unwrap();
+		b_refused.unwrap();
+
+		let id_a = peers[0].node_signer.get_node_id(Recipient::Node).unwrap();
+		let id_b = peers[1].node_signer.get_node_id(Recipient::Node).unwrap();
+		assert_eq!(peers[1].peer_by_node_id(&id_a).unwrap().counterparty_node_id, id_a);
+		assert_eq!(peers[0].peer_by_node_id(&id_b).unwrap().counterparty_node_id, id_b);
 	}
 
 	#[test]

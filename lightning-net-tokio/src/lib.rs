@@ -485,6 +485,135 @@ where
 	}
 }
 
+/// Like [`setup_inbound`], but performs a hybrid post-quantum (ML-KEM) BOLT 8 handshake. Use this on
+/// a connection accepted on a dedicated post-quantum listening endpoint (a separate port); ordinary
+/// connections continue to use [`setup_inbound`].
+#[cfg(feature = "post-quantum")]
+pub fn setup_inbound_pq<PM: Deref + 'static + Send + Sync + Clone>(
+	peer_manager: PM, stream: StdTcpStream,
+) -> impl std::future::Future<Output = ()>
+where
+	PM::Target: APeerManager<Descriptor = SocketDescriptor>,
+{
+	let remote_addr = get_addr_from_stream(&stream);
+	let (reader, write_receiver, read_receiver, us) = Connection::new(stream);
+	#[cfg(test)]
+	let last_us = Arc::clone(&us);
+
+	let handle_opt = if peer_manager
+		.as_ref()
+		.new_inbound_connection_pq(SocketDescriptor::new(Arc::clone(&us)), remote_addr)
+		.is_ok()
+	{
+		let handle = tokio::spawn(Connection::schedule_read(
+			peer_manager,
+			us,
+			reader,
+			read_receiver,
+			write_receiver,
+		));
+		Some(handle)
+	} else {
+		None
+	};
+
+	async move {
+		if let Some(handle) = handle_opt {
+			if let Err(e) = handle.await {
+				assert!(e.is_cancelled());
+			} else {
+				#[cfg(test)]
+				debug_assert!(Arc::try_unwrap(last_us).is_ok());
+			}
+		}
+	}
+}
+
+/// Like [`setup_outbound`], but performs a hybrid post-quantum (ML-KEM) BOLT 8 handshake against a
+/// peer whose static ML-KEM encapsulation key (`responder_kem_key`, pinned out of band, e.g. from
+/// the gossip pin) is known. The peer must be listening on a post-quantum endpoint.
+#[cfg(feature = "post-quantum")]
+pub fn setup_outbound_pq<PM: Deref + 'static + Send + Sync + Clone>(
+	peer_manager: PM, their_node_id: PublicKey,
+	responder_kem_key: [u8; peer_handler::PQ_KEM_EK_LEN], stream: StdTcpStream,
+) -> impl std::future::Future<Output = ()>
+where
+	PM::Target: APeerManager<Descriptor = SocketDescriptor>,
+{
+	let remote_addr = get_addr_from_stream(&stream);
+	let (reader, mut write_receiver, read_receiver, us) = Connection::new(stream);
+	#[cfg(test)]
+	let last_us = Arc::clone(&us);
+	let handle_opt = if let Ok(initial_send) = peer_manager.as_ref().new_outbound_connection_pq(
+		their_node_id,
+		SocketDescriptor::new(Arc::clone(&us)),
+		remote_addr,
+		responder_kem_key,
+	) {
+		let handle = tokio::spawn(async move {
+			// As in `setup_outbound`, we expect to write the (here larger) initial handshake bytes
+			// in a single send, tolerating a single `Poll::Pending` from a single-threaded runtime.
+			let send_fut = async {
+				loop {
+					match SocketDescriptor::new(Arc::clone(&us)).send_data(&initial_send, true) {
+						v if v == initial_send.len() => break Ok(()),
+						0 => {
+							write_receiver.recv().await;
+						},
+						_ => {
+							eprintln!("Failed to write first full message to socket!");
+							peer_manager
+								.as_ref()
+								.socket_disconnected(&SocketDescriptor::new(Arc::clone(&us)));
+							break Err(());
+						},
+					}
+				}
+			};
+			let timeout_send_fut = tokio::time::timeout(Duration::from_millis(100), send_fut);
+			if let Ok(Ok(())) = timeout_send_fut.await {
+				Connection::schedule_read(peer_manager, us, reader, read_receiver, write_receiver)
+					.await;
+			}
+		});
+		Some(handle)
+	} else {
+		None
+	};
+
+	async move {
+		if let Some(handle) = handle_opt {
+			if let Err(e) = handle.await {
+				assert!(e.is_cancelled());
+			} else {
+				#[cfg(test)]
+				debug_assert!(Arc::try_unwrap(last_us).is_ok());
+			}
+		}
+	}
+}
+
+/// Like [`connect_outbound`], but performs a hybrid post-quantum (ML-KEM) BOLT 8 handshake against a
+/// peer whose static ML-KEM encapsulation key is known. Shorthand for `TcpStream::connect(addr)`
+/// with a timeout followed by [`setup_outbound_pq`].
+#[cfg(feature = "post-quantum")]
+pub async fn connect_outbound_pq<PM: Deref + 'static + Send + Sync + Clone>(
+	peer_manager: PM, their_node_id: PublicKey,
+	responder_kem_key: [u8; peer_handler::PQ_KEM_EK_LEN], addr: SocketAddr,
+) -> Option<impl std::future::Future<Output = ()>>
+where
+	PM::Target: APeerManager<Descriptor = SocketDescriptor>,
+{
+	let connect_fut = async { TcpStream::connect(&addr).await.map(|s| s.into_std().unwrap()) };
+	if let Ok(Ok(stream)) =
+		time::timeout(Duration::from_secs(CONNECT_OUTBOUND_TIMEOUT), connect_fut).await
+	{
+		Some(setup_outbound_pq(peer_manager, their_node_id, responder_kem_key, stream))
+	} else {
+		None
+	}
+}
+
 /// Routes [`connect_outbound`] through Tor. Implements stream isolation for each connection
 /// using a stream isolation parameter sourced from [`EntropySource::get_secure_random_bytes`].
 ///

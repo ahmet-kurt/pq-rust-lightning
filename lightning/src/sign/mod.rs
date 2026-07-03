@@ -1049,6 +1049,16 @@ pub trait NodeSigner {
 	fn get_pq_kem_node_id(&self) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]> {
 		None
 	}
+
+	/// Decapsulates `_ciphertext` with this node's static ML-KEM (FIPS 203) decapsulation key,
+	/// returning the shared secret, or `None` if this signer does not support post-quantum key
+	/// exchange or the ciphertext is malformed.
+	#[cfg(feature = "post-quantum")]
+	fn pq_kem_decapsulate(
+		&self, _ciphertext: &[u8; crate::crypto::pq_kem::PQ_KEM_CT_LEN],
+	) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_SS_LEN]> {
+		None
+	}
 }
 
 impl<T: NodeSigner + ?Sized, N: Deref<Target = T>> NodeSigner for N {
@@ -1104,6 +1114,12 @@ impl<T: NodeSigner + ?Sized, N: Deref<Target = T>> NodeSigner for N {
 	#[cfg(feature = "post-quantum")]
 	fn get_pq_kem_node_id(&self) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]> {
 		self.deref().get_pq_kem_node_id()
+	}
+	#[cfg(feature = "post-quantum")]
+	fn pq_kem_decapsulate(
+		&self, ciphertext: &[u8; crate::crypto::pq_kem::PQ_KEM_CT_LEN],
+	) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_SS_LEN]> {
+		self.deref().pq_kem_decapsulate(ciphertext)
 	}
 }
 
@@ -2066,6 +2082,8 @@ pub struct KeysManager {
 	#[cfg(feature = "post-quantum")]
 	pq_node_id: [u8; pq::PQ_PUBLIC_KEY_LEN],
 	#[cfg(feature = "post-quantum")]
+	pq_kem_node_secret: [u8; crate::crypto::pq_kem::PQ_KEM_DK_LEN],
+	#[cfg(feature = "post-quantum")]
 	pq_kem_node_id: [u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN],
 
 	#[cfg(test)]
@@ -2142,7 +2160,7 @@ impl KeysManager {
 				// Derive the post-quantum (ML-KEM) static key-exchange identity from the same
 				// master key so it too is recoverable from the existing seed backup.
 				#[cfg(feature = "post-quantum")]
-				let (pq_kem_node_id, _) = {
+				let (pq_kem_node_id, pq_kem_node_secret) = {
 					let kem_seed = master_key
 						.derive_priv(&secp_ctx, &PQ_KEM_NODE_SECRET_INDEX)
 						.expect("Your RNG is busted")
@@ -2212,6 +2230,8 @@ impl KeysManager {
 					pq_node_secret,
 					#[cfg(feature = "post-quantum")]
 					pq_node_id,
+					#[cfg(feature = "post-quantum")]
+					pq_kem_node_secret,
 					#[cfg(feature = "post-quantum")]
 					pq_kem_node_id,
 
@@ -2561,6 +2581,13 @@ impl NodeSigner for KeysManager {
 	fn get_pq_kem_node_id(&self) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]> {
 		Some(self.pq_kem_node_id)
 	}
+
+	#[cfg(feature = "post-quantum")]
+	fn pq_kem_decapsulate(
+		&self, ciphertext: &[u8; crate::crypto::pq_kem::PQ_KEM_CT_LEN],
+	) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_SS_LEN]> {
+		crate::crypto::pq_kem::decapsulate(&self.pq_kem_node_secret, ciphertext)
+	}
 }
 
 impl OutputSpender for KeysManager {
@@ -2751,6 +2778,13 @@ impl NodeSigner for PhantomKeysManager {
 	#[cfg(feature = "post-quantum")]
 	fn get_pq_kem_node_id(&self) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]> {
 		self.inner.get_pq_kem_node_id()
+	}
+
+	#[cfg(feature = "post-quantum")]
+	fn pq_kem_decapsulate(
+		&self, ciphertext: &[u8; crate::crypto::pq_kem::PQ_KEM_CT_LEN],
+	) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_SS_LEN]> {
+		self.inner.pq_kem_decapsulate(ciphertext)
 	}
 }
 
