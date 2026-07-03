@@ -23,7 +23,8 @@ pub const PQ_PUBLIC_KEY_LEN: usize = PK_LEN;
 /// The length, in bytes, of an ML-DSA-44 signature.
 pub const PQ_SIGNATURE_LEN: usize = SIG_LEN;
 
-/// An ML-DSA-44 secret key, used to produce post-quantum signatures over gossip messages.
+/// An ML-DSA-44 secret key, used to produce post-quantum signatures over gossip messages and
+/// BOLT 11 invoices.
 pub struct PqSecretKey(PrivateKey);
 
 /// Deterministically derives an ML-DSA-44 keypair from a 32-byte seed, returning the secret
@@ -34,10 +35,11 @@ pub(crate) fn keypair_from_seed(seed: &[u8; 32]) -> (PqSecretKey, [u8; PQ_PUBLIC
 	(PqSecretKey(sk), pk.into_bytes())
 }
 
+/// Domain-separation context for BOLT 11 invoice signatures. ML-DSA (FIPS 204) takes a context
+/// string that is bound into the signature; using a distinct context per surface means a signature
+/// produced for one surface can never verify on another, preventing cross-protocol replay.
+pub const PQ_CONTEXT_BOLT11: &[u8] = b"LDK-PQ-BOLT11-invoice";
 /// Domain-separation context for BOLT 7 gossip signatures (node_announcement, channel_update).
-/// ML-DSA (FIPS 204) takes a context string that is bound into the signature; using a distinct
-/// context per surface means a signature produced for one surface can never verify on another,
-/// preventing cross-protocol replay.
 pub const PQ_CONTEXT_GOSSIP: &[u8] = b"LDK-PQ-BOLT7-gossip";
 
 /// Signs the message `msg` with `sk` under domain-separation `context`, returning the ML-DSA-44
@@ -250,7 +252,7 @@ mod tests {
 		let msg = [5u8; 32];
 		let sig = sign(&sk, &msg, PQ_CONTEXT_GOSSIP);
 		assert!(verify(&pk, &msg, &sig, PQ_CONTEXT_GOSSIP));
-		assert!(!verify(&pk, &msg, &sig, CTX));
+		assert!(!verify(&pk, &msg, &sig, PQ_CONTEXT_BOLT11));
 	}
 
 	#[test]

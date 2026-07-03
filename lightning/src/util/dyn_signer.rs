@@ -155,6 +155,8 @@ inner,
 	#[cfg(feature = "post-quantum")]
 	fn get_pq_node_id(,) -> Option<[u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]>,
 	#[cfg(feature = "post-quantum")]
+	fn sign_pq_bolt11_invoice(, msg: &[u8]) -> Option<[u8; crate::sign::pq::PQ_SIGNATURE_LEN]>,
+	#[cfg(feature = "post-quantum")]
 	fn get_pq_kem_node_id(,) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]>
 );
 
@@ -210,6 +212,8 @@ delegate!(DynPhantomKeysInterface, NodeSigner,
 	fn get_receive_auth_key(,) -> ReceiveAuthKey,
 	#[cfg(feature = "post-quantum")]
 	fn get_pq_node_id(,) -> Option<[u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]>,
+	#[cfg(feature = "post-quantum")]
+	fn sign_pq_bolt11_invoice(, msg: &[u8]) -> Option<[u8; crate::sign::pq::PQ_SIGNATURE_LEN]>,
 	#[cfg(feature = "post-quantum")]
 	fn get_pq_kem_node_id(,) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]>
 );

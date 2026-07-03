@@ -1626,7 +1626,8 @@ impl NodeInfo {
 
 	/// Returns this node's pinned ML-DSA (FIPS 204) public key, if one was learned from a
 	/// post-quantum `node_announcement`. This is the trusted key the node's `channel_update`
-	/// ML-DSA signatures are verified against.
+	/// ML-DSA signatures are verified against, and the key a payer can bind a BOLT 11 invoice's
+	/// post-quantum signature to.
 	#[cfg(feature = "post-quantum")]
 	pub fn pq_node_id(&self) -> Option<[u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]> {
 		self.pq_node_id
@@ -3361,7 +3362,7 @@ pub(crate) mod tests {
 		// A node_announcement carrying an ML-DSA public key but no signature must be rejected and
 		// must NOT pin the node's key. Otherwise a quantum attacker who forges only the classical
 		// signature could poison an unpinned node's pin with a key it does not control, and then have
-		// its forged messages accepted against that pin.
+		// forged BOLT 11 invoices accepted against that pin.
 		let network_graph = create_network_graph();
 		let (secp_ctx, gossip_sync) = create_gossip_sync(&network_graph);
 		let node_1_privkey = SecretKey::from_slice(&[42; 32]).unwrap();

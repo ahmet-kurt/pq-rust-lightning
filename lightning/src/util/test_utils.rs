@@ -182,6 +182,11 @@ pub struct TestRouter<'a> {
 	pub next_blinded_payment_paths: Mutex<Vec<BlindedPaymentPath>>,
 	pub next_payment_context_metadata: Mutex<Option<BTreeMap<u64, Vec<u8>>>>,
 	pub scorer: &'a RwLock<TestScorer>,
+	// PQ: per-node ML-DSA public keys made available to a post-quantum payer as the trusted anchor
+	// for a BOLT 11 invoice signature. In a real deployment these come from the gossip-pinned key via
+	// the network graph; the test harness injects the payee's key directly.
+	#[cfg(feature = "post-quantum")]
+	pub pq_node_ids: Mutex<HashMap<PublicKey, [u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]>>,
 }
 
 impl<'a> TestRouter<'a> {
@@ -206,6 +211,8 @@ impl<'a> TestRouter<'a> {
 			next_blinded_payment_paths,
 			next_payment_context_metadata,
 			scorer,
+			#[cfg(feature = "post-quantum")]
+			pq_node_ids: Mutex::new(new_hash_map()),
 		}
 	}
 
@@ -351,6 +358,13 @@ impl<'a> Router for TestRouter<'a> {
 		} else {
 			Ok(core::mem::take(&mut *expected_paths))
 		}
+	}
+
+	#[cfg(feature = "post-quantum")]
+	fn pq_node_id_for_node(
+		&self, node_id: &PublicKey,
+	) -> Option<[u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]> {
+		self.pq_node_ids.lock().unwrap().get(node_id).copied()
 	}
 }
 
@@ -2008,6 +2022,13 @@ impl NodeSigner for TestKeysInterface {
 	#[cfg(feature = "post-quantum")]
 	fn get_pq_node_id(&self) -> Option<[u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]> {
 		self.backing.get_pq_node_id()
+	}
+
+	#[cfg(feature = "post-quantum")]
+	fn sign_pq_bolt11_invoice(
+		&self, msg: &[u8],
+	) -> Option<[u8; crate::sign::pq::PQ_SIGNATURE_LEN]> {
+		self.backing.sign_pq_bolt11_invoice(msg)
 	}
 
 	#[cfg(feature = "post-quantum")]

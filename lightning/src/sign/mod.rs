@@ -1006,8 +1006,8 @@ pub trait NodeSigner {
 	/// signature.
 	fn sign_message(&self, msg: &[u8]) -> Result<String, ()>;
 
-	/// Returns this node's ML-DSA (FIPS 204) public key used for post-quantum gossip
-	/// signatures, or `None` if this signer does not support post-quantum signing.
+	/// Returns this node's ML-DSA (FIPS 204) public key used for post-quantum gossip and BOLT 11
+	/// invoice signatures, or `None` if this signer does not support post-quantum signing.
 	#[cfg(feature = "post-quantum")]
 	fn get_pq_node_id(&self) -> Option<[u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]> {
 		None
@@ -1022,6 +1022,21 @@ pub trait NodeSigner {
 	#[cfg(feature = "post-quantum")]
 	fn sign_pq_gossip_message(
 		&self, _msg: UnsignedGossipMessage,
+	) -> Option<[u8; crate::sign::pq::PQ_SIGNATURE_LEN]> {
+		None
+	}
+
+	/// Signs the BOLT 11 invoice message `_msg` with this node's ML-DSA (FIPS 204) secret key,
+	/// returning the signature, or `None` if this signer does not support post-quantum signing.
+	/// `_msg` must be the invoice's post-quantum signable bytes (the HRP and data part, excluding
+	/// the post-quantum signature field); see [`RawBolt11Invoice::pq_signable_bytes`]. The
+	/// signature must be produced under the BOLT 11 domain-separation context,
+	/// [`pq::PQ_CONTEXT_BOLT11`], as [`KeysManager`] does.
+	///
+	/// [`RawBolt11Invoice::pq_signable_bytes`]: lightning_invoice::RawBolt11Invoice::pq_signable_bytes
+	#[cfg(feature = "post-quantum")]
+	fn sign_pq_bolt11_invoice(
+		&self, _msg: &[u8],
 	) -> Option<[u8; crate::sign::pq::PQ_SIGNATURE_LEN]> {
 		None
 	}
@@ -1079,6 +1094,12 @@ impl<T: NodeSigner + ?Sized, N: Deref<Target = T>> NodeSigner for N {
 		&self, msg: UnsignedGossipMessage,
 	) -> Option<[u8; crate::sign::pq::PQ_SIGNATURE_LEN]> {
 		self.deref().sign_pq_gossip_message(msg)
+	}
+	#[cfg(feature = "post-quantum")]
+	fn sign_pq_bolt11_invoice(
+		&self, msg: &[u8],
+	) -> Option<[u8; crate::sign::pq::PQ_SIGNATURE_LEN]> {
+		self.deref().sign_pq_bolt11_invoice(msg)
 	}
 	#[cfg(feature = "post-quantum")]
 	fn get_pq_kem_node_id(&self) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]> {
@@ -2530,6 +2551,13 @@ impl NodeSigner for KeysManager {
 	}
 
 	#[cfg(feature = "post-quantum")]
+	fn sign_pq_bolt11_invoice(
+		&self, msg: &[u8],
+	) -> Option<[u8; pq::PQ_SIGNATURE_LEN]> {
+		Some(pq::sign(&self.pq_node_secret, msg, pq::PQ_CONTEXT_BOLT11))
+	}
+
+	#[cfg(feature = "post-quantum")]
 	fn get_pq_kem_node_id(&self) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]> {
 		Some(self.pq_kem_node_id)
 	}
@@ -2704,6 +2732,13 @@ impl NodeSigner for PhantomKeysManager {
 	#[cfg(feature = "post-quantum")]
 	fn get_pq_node_id(&self) -> Option<[u8; pq::PQ_PUBLIC_KEY_LEN]> {
 		self.inner.get_pq_node_id()
+	}
+
+	#[cfg(feature = "post-quantum")]
+	fn sign_pq_bolt11_invoice(
+		&self, msg: &[u8],
+	) -> Option<[u8; pq::PQ_SIGNATURE_LEN]> {
+		self.inner.sign_pq_bolt11_invoice(msg)
 	}
 
 	#[cfg(feature = "post-quantum")]

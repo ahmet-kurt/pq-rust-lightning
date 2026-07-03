@@ -778,6 +778,22 @@ pub struct OptionalBolt11PaymentParams {
 	/// [`ChannelManager::pay_for_bolt11_invoice`] the call will fail with
 	/// [`Bolt11PaymentError::InvalidAmount`].
 	pub declared_total_mpp_value_msat_override: Option<u64>,
+	/// The payee's trusted ML-DSA (FIPS 204) public key, used to verify the invoice's hybrid
+	/// post-quantum signature. This is typically the key pinned for the payee via gossip (see
+	/// [`NodeInfo::pq_node_id`]) or one obtained out of band. If set,
+	/// [`ChannelManager::pay_for_bolt11_invoice`] fails with
+	/// [`Bolt11PaymentError::PqVerificationFailed`] unless the invoice carries a valid post-quantum
+	/// signature matching this key (which also rejects an invoice that dropped the signature). If
+	/// `None`, the payer falls back to the payee's gossip-pinned ML-DSA key (looked up by the payee
+	/// node id), so post-quantum verification is automatic for a pinned payee; if the payee is not
+	/// pinned either, the signature cannot be anchored and the payment relies on the classical
+	/// signature, though an invoice carrying malformed or self-inconsistent post-quantum fields is
+	/// still refused.
+	///
+	/// [`NodeInfo::pq_node_id`]: crate::routing::gossip::NodeInfo::pq_node_id
+	/// [`Bolt11PaymentError::PqVerificationFailed`]: crate::ln::outbound_payment::Bolt11PaymentError::PqVerificationFailed
+	#[cfg(feature = "post-quantum")]
+	pub trusted_pq_key: Option<[u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]>,
 }
 
 impl Default for OptionalBolt11PaymentParams {
@@ -790,6 +806,8 @@ impl Default for OptionalBolt11PaymentParams {
 			#[cfg(not(feature = "std"))]
 			retry_strategy: Retry::Attempts(3),
 			declared_total_mpp_value_msat_override: None,
+			#[cfg(feature = "post-quantum")]
+			trusted_pq_key: None,
 		}
 	}
 }
@@ -5986,6 +6004,35 @@ impl<
 		&self, invoice: &Bolt11Invoice, payment_id: PaymentId, amount_msats: Option<u64>,
 		optional_params: OptionalBolt11PaymentParams,
 	) -> Result<(), Bolt11PaymentError> {
+		// Before doing anything, enforce the hybrid post-quantum signature policy. The invoice's
+		// ML-DSA signature is anchored to the payee's key: the caller may supply it out of band via
+		// `trusted_pq_key`, otherwise we fall back to the payee's gossip-pinned ML-DSA key (looked up
+		// by the invoice's payee node id), so verification is automatic for a pinned payee, matching
+		// the gossip and BOLT 12 invoice enforcement. With an anchor the invoice must carry a valid
+		// matching signature; this also rejects an invoice that dropped the signature (a downgrade).
+		// With neither key a vanilla invoice is paid as before (interop), though malformed or
+		// self-inconsistent post-quantum fields are still refused.
+		#[cfg(feature = "post-quantum")]
+		{
+			use crate::ln::invoice_utils::{verify_bolt11_pq_signature, Bolt11PqVerification};
+			let trusted_pq_key = optional_params
+				.trusted_pq_key
+				.or_else(|| self.router.pq_node_id_for_node(&invoice.get_payee_pub_key()));
+			match verify_bolt11_pq_signature(invoice, trusted_pq_key.as_ref(), &self.logger) {
+				Bolt11PqVerification::Verified | Bolt11PqVerification::Unanchored => {},
+				Bolt11PqVerification::Absent => {
+					if trusted_pq_key.is_some() {
+						log_error!(self.logger, "PQ: refusing to pay BOLT 11 invoice that is missing the expected ML-DSA signature");
+						return Err(Bolt11PaymentError::PqVerificationFailed);
+					}
+				},
+				Bolt11PqVerification::Invalid => {
+					log_error!(self.logger, "PQ: refusing to pay BOLT 11 invoice with an invalid ML-DSA signature");
+					return Err(Bolt11PaymentError::PqVerificationFailed);
+				},
+			}
+		}
+
 		let best_block_height = self.best_block.read().unwrap().height;
 		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
 		let payment_hash = invoice.payment_hash();
@@ -14955,6 +15002,8 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 		let Bolt11InvoiceParameters {
 			amount_msats, description, invoice_expiry_delta_secs, min_final_cltv_expiry_delta,
 			payment_hash, payment_metadata,
+			#[cfg(feature = "post-quantum")]
+			pq_omit_pubkey,
 		} = params;
 
 		let currency =
@@ -15036,11 +15085,16 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 			invoice = invoice.private_route(hint);
 		}
 
-		let raw_invoice = if let Some(payment_metadata) = payment_metadata {
+		#[cfg_attr(not(feature = "post-quantum"), allow(unused_mut))]
+		let mut raw_invoice = if let Some(payment_metadata) = payment_metadata {
 			invoice.payment_metadata(payment_metadata).build_raw()
 		} else {
 			invoice.build_raw()
 		}.map_err(|e| SignOrCreationError::CreationError(e))?;
+		// Attach a hybrid post-quantum (ML-DSA) signature alongside the classical one so that
+		// post-quantum-aware payers can bind the invoice to the payee's pinned key.
+		#[cfg(feature = "post-quantum")]
+		super::invoice_utils::add_pq_bolt11_signature(&mut raw_invoice, &self.node_signer, !pq_omit_pubkey, &self.logger);
 		let signature = self.node_signer.sign_invoice(&raw_invoice, Recipient::Node);
 
 		raw_invoice
@@ -15126,6 +15180,14 @@ pub struct Bolt11InvoiceParameters {
 	///
 	/// The metadata itself is encrypted and HMAC'd before being stored in the BOLT 11 invoice.
 	pub payment_metadata: Option<Vec<u8>>,
+
+	/// If set, omit the payee's ML-DSA public key from the hybrid post-quantum signature, producing
+	/// a much smaller signature-only invoice that can still fit in a QR code. Use this only when
+	/// payers can obtain the payee's ML-DSA key independently (e.g. from the gossip pin); otherwise
+	/// leave it `false` so the invoice is self-contained. Has no effect unless the signer has a
+	/// post-quantum identity.
+	#[cfg(feature = "post-quantum")]
+	pub pq_omit_pubkey: bool,
 }
 
 impl Default for Bolt11InvoiceParameters {
@@ -15137,6 +15199,8 @@ impl Default for Bolt11InvoiceParameters {
 			min_final_cltv_expiry_delta: None,
 			payment_hash: None,
 			payment_metadata: None,
+			#[cfg(feature = "post-quantum")]
+			pq_omit_pubkey: false,
 		}
 	}
 }

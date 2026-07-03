@@ -17,6 +17,10 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 std = []
+# Adds the carrier for post-quantum (ML-DSA / FIPS 204) hybrid invoice signatures. The crypto
+# itself lives in the `lightning` crate; this only adds the tagged-field carrier and the
+# signable-bytes helper.
+post-quantum = []
 
 [dependencies]
 bech32 = { version = "0.11.0", default-features = false }

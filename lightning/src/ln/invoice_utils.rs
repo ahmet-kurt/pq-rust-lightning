@@ -15,8 +15,12 @@ use crate::ln::inbound_payment::{create, create_from_hash};
 use crate::routing::gossip::RoutingFees;
 use crate::routing::router::{RouteHint, RouteHintHop};
 use crate::sign::{EntropySource, NodeSigner, Recipient};
+#[cfg(feature = "post-quantum")]
+use crate::sign::pq;
 use crate::types::payment::PaymentHash;
 use crate::util::logger::{Logger, Record};
+#[cfg(feature = "post-quantum")]
+use lightning_invoice::RawBolt11Invoice;
 use alloc::collections::{btree_map, BTreeMap};
 use bitcoin::secp256k1::PublicKey;
 #[cfg(not(feature = "std"))]
@@ -586,6 +590,163 @@ impl<'a, 'b, L: Logger> WithChannelDetails<'a, 'b, L> {
 	}
 }
 
+/// Adds a hybrid post-quantum (ML-DSA / FIPS 204) signature to `raw_invoice` before it is signed
+/// with the classical recoverable ECDSA signature. The ML-DSA signature over the invoice's
+/// [`RawBolt11Invoice::pq_signable_bytes`] is appended as opaque tagged fields. When `include_pubkey`
+/// is set, the payee's ML-DSA public key is also embedded so the invoice is self-contained; when it
+/// is not, only the signature is carried (a much smaller invoice that can still fit in a QR code)
+/// and the payer must obtain the payee's key from the gossip pin or out of band. Vanilla nodes
+/// ignore both fields. This is a no-op if `node_signer` has no post-quantum identity.
+///
+/// [`RawBolt11Invoice::pq_signable_bytes`]: lightning_invoice::RawBolt11Invoice::pq_signable_bytes
+#[cfg(feature = "post-quantum")]
+pub(super) fn add_pq_bolt11_signature<NS: NodeSigner, L: Logger>(
+	raw_invoice: &mut RawBolt11Invoice, node_signer: &NS, include_pubkey: bool, logger: &L,
+) {
+	let pq_pubkey = match node_signer.get_pq_node_id() {
+		Some(pk) => pk,
+		None => return,
+	};
+	let fields_before = raw_invoice.data.tagged_fields.len();
+	if include_pubkey {
+		lightning_invoice::pq::append_chunks(
+			&mut raw_invoice.data.tagged_fields,
+			lightning_invoice::pq::TAG_PQ_PUBLIC_KEY,
+			&pq_pubkey,
+		);
+	}
+	let message = raw_invoice.pq_signable_bytes();
+	let signature = match node_signer.sign_pq_bolt11_invoice(&message) {
+		Some(sig) => sig,
+		None => {
+			// The signer advertised a post-quantum identity but could not sign; drop any field we
+			// added rather than emit a half-formed invoice.
+			raw_invoice.data.tagged_fields.truncate(fields_before);
+			return;
+		},
+	};
+	lightning_invoice::pq::append_chunks(
+		&mut raw_invoice.data.tagged_fields,
+		lightning_invoice::pq::TAG_PQ_SIGNATURE,
+		&signature,
+	);
+	log_debug!(
+		logger,
+		"PQ: attached ML-DSA signature to BOLT 11 invoice ({}, {}-byte signature)",
+		if include_pubkey { "self-contained" } else { "signature-only" },
+		signature.len()
+	);
+}
+
+/// The result of verifying the hybrid post-quantum (ML-DSA) signature on a BOLT 11 invoice.
+///
+/// Because the payee node id is recovered from the (quantum-forgeable) classical signature, a
+/// quantum attacker could substitute their own ML-DSA key and signature. The post-quantum signature
+/// therefore only protects the payer when it is bound to a payee ML-DSA key the payer trusts
+/// independently of the invoice (the key pinned via gossip, see [`NodeInfo`], or one obtained out of
+/// band). [`Verified`] is the only variant that represents real protection against a quantum
+/// attacker.
+///
+/// [`NodeInfo`]: crate::routing::gossip::NodeInfo
+/// [`Verified`]: Self::Verified
+#[cfg(feature = "post-quantum")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bolt11PqVerification {
+	/// The invoice carries no post-quantum signature. For a payee whose ML-DSA key the payer has
+	/// pinned, this should be treated as a downgrade attempt and rejected.
+	Absent,
+	/// The post-quantum signature is present, valid over the invoice under the trusted key, and any
+	/// carried ML-DSA key matches that key. This is real protection against a quantum attacker.
+	Verified,
+	/// The post-quantum signature is present but no trusted key was available to bind it to the
+	/// payee: it verified against the carried key alone or, with no carried key, was not checked at
+	/// all. Either way it does not protect against a quantum attacker.
+	Unanchored,
+	/// The post-quantum fields are malformed, the signature failed verification, or the carried key
+	/// did not match the trusted key (a possible key-substitution attack).
+	Invalid,
+}
+
+/// Verifies the hybrid post-quantum (ML-DSA / FIPS 204) signature on a BOLT 11 `invoice`.
+///
+/// `trusted_pq_key`, when provided, is the payee's ML-DSA public key the payer trusts independently
+/// of the invoice (e.g. the key pinned for the payee via gossip, see [`NodeInfo::pq_node_id`], or
+/// one obtained out of band). With a trusted key the signature must verify against it and any
+/// carried key must match it; without one the signature is checked against the carried key alone,
+/// or not at all if no key is carried. See [`Bolt11PqVerification`] for how to act on the result.
+///
+/// [`NodeInfo::pq_node_id`]: crate::routing::gossip::NodeInfo::pq_node_id
+#[cfg(feature = "post-quantum")]
+pub fn verify_bolt11_pq_signature<L: Logger>(
+	invoice: &Bolt11Invoice, trusted_pq_key: Option<&[u8; pq::PQ_PUBLIC_KEY_LEN]>, logger: &L,
+) -> Bolt11PqVerification {
+	let signed = invoice.clone().into_signed_raw();
+	let raw = signed.raw_invoice();
+	let fields = &raw.data.tagged_fields;
+	let pubkey_bytes =
+		lightning_invoice::pq::read_chunks(fields, lightning_invoice::pq::TAG_PQ_PUBLIC_KEY);
+	let sig_bytes =
+		lightning_invoice::pq::read_chunks(fields, lightning_invoice::pq::TAG_PQ_SIGNATURE);
+
+	if sig_bytes.is_empty() {
+		return Bolt11PqVerification::Absent;
+	}
+	let signature: [u8; pq::PQ_SIGNATURE_LEN] = match sig_bytes.try_into() {
+		Ok(sig) => sig,
+		Err(_) => {
+			log_debug!(logger, "PQ: rejecting BOLT 11 invoice with malformed ML-DSA signature");
+			return Bolt11PqVerification::Invalid;
+		},
+	};
+
+	// The carried public key, if the invoice is self-contained. A non-empty but wrong-length field
+	// is malformed.
+	let carried: Option<[u8; pq::PQ_PUBLIC_KEY_LEN]> = if pubkey_bytes.is_empty() {
+		None
+	} else {
+		match pubkey_bytes.try_into() {
+			Ok(pk) => Some(pk),
+			Err(_) => {
+				log_debug!(logger, "PQ: rejecting BOLT 11 invoice with malformed ML-DSA public key");
+				return Bolt11PqVerification::Invalid;
+			},
+		}
+	};
+
+	// Pick the verification key and whether the result is anchored in trust.
+	let (key, anchored) = match (carried, trusted_pq_key) {
+		(Some(c), Some(t)) => {
+			if &c != t {
+				log_debug!(logger, "PQ: BOLT 11 invoice ML-DSA key does not match the trusted key (possible key-substitution attack)");
+				return Bolt11PqVerification::Invalid;
+			}
+			(c, true)
+		},
+		// Signature-only invoice verified against the payee's trusted (e.g. gossip-pinned) key.
+		(None, Some(t)) => (*t, true),
+		// Self-contained invoice but no trusted key: self-consistency only, not protection.
+		(Some(c), None) => (c, false),
+		(None, None) => {
+			log_debug!(logger, "PQ: BOLT 11 invoice carries a signature but no key is available to verify it (unanchored)");
+			return Bolt11PqVerification::Unanchored;
+		},
+	};
+
+	let message = raw.pq_signable_bytes();
+	if !pq::verify(&key, &message, &signature, pq::PQ_CONTEXT_BOLT11) {
+		log_debug!(logger, "PQ: BOLT 11 invoice ML-DSA signature failed verification");
+		return Bolt11PqVerification::Invalid;
+	}
+
+	if anchored {
+		log_debug!(logger, "PQ: verified BOLT 11 invoice ML-DSA signature against trusted key");
+		Bolt11PqVerification::Verified
+	} else {
+		log_debug!(logger, "PQ: BOLT 11 invoice ML-DSA signature is self-consistent but unanchored (no trusted key)");
+		Bolt11PqVerification::Unanchored
+	}
+}
+
 #[cfg(test)]
 mod test {
 	use super::*;
@@ -698,6 +859,8 @@ mod test {
 			route_params_config: RouteParametersConfig::default(),
 			retry_strategy: Retry::Attempts(0),
 			declared_total_mpp_value_msat_override: None,
+			#[cfg(feature = "post-quantum")]
+			trusted_pq_key: None,
 		};
 
 		nodes[0]
@@ -2097,5 +2260,249 @@ mod test {
 
 		let expected = vec!["a0", "a1", "b1"];
 		assert_eq!(expected, result);
+	}
+}
+
+#[cfg(all(test, feature = "post-quantum"))]
+mod pq_tests {
+	use super::{add_pq_bolt11_signature, verify_bolt11_pq_signature, Bolt11PqVerification};
+	use crate::sign::{KeysManager, NodeSigner, Recipient};
+	use crate::util::test_utils::TestLogger;
+	use core::time::Duration;
+	use lightning_invoice::{
+		Bolt11Invoice, Currency, InvoiceBuilder, PaymentHash, PaymentSecret, PositiveTimestamp,
+		RawBolt11Invoice,
+	};
+
+	fn keys(seed: u8) -> KeysManager {
+		KeysManager::new(&[seed; 32], 0, 0, false)
+	}
+
+	// Builds a post-quantum-signed invoice, applying `tamper` to the raw invoice after the ML-DSA
+	// signature is attached but before the classical signature is produced.
+	fn build_pq_invoice<F: FnOnce(&mut RawBolt11Invoice)>(
+		keys: &KeysManager, logger: &TestLogger, tamper: F,
+	) -> Bolt11Invoice {
+		let mut raw = InvoiceBuilder::new(Currency::Bitcoin)
+			.description("pq invoice".into())
+			.payment_hash(PaymentHash([0; 32]))
+			.payment_secret(PaymentSecret([42; 32]))
+			.duration_since_epoch(Duration::from_secs(1234567))
+			.build_raw()
+			.unwrap();
+		add_pq_bolt11_signature(&mut raw, keys, true, logger);
+		tamper(&mut raw);
+		let signature = keys.sign_invoice(&raw, Recipient::Node);
+		let signed = raw.sign(|_| signature).unwrap();
+		Bolt11Invoice::from_signed(signed).unwrap()
+	}
+
+	#[test]
+	fn pq_invoice_round_trips_and_verifies() {
+		let keys = keys(42);
+		let logger = TestLogger::new();
+		let pin = keys.get_pq_node_id().unwrap();
+		let invoice = build_pq_invoice(&keys, &logger, |_| {});
+
+		// Verifies against the payee's trusted (pinned) key.
+		assert_eq!(
+			verify_bolt11_pq_signature(&invoice, Some(&pin), &logger),
+			Bolt11PqVerification::Verified
+		);
+
+		// The post-quantum fields survive a full bech32 string round-trip.
+		let reparsed: Bolt11Invoice = invoice.to_string().parse().unwrap();
+		assert_eq!(
+			verify_bolt11_pq_signature(&reparsed, Some(&pin), &logger),
+			Bolt11PqVerification::Verified
+		);
+
+		// Interop: the classical signature is still valid, so vanilla nodes accept the invoice.
+		assert!(reparsed.check_signature().is_ok());
+	}
+
+	#[test]
+	fn pq_invoice_is_unanchored_without_trusted_key() {
+		let keys = keys(42);
+		let logger = TestLogger::new();
+		let invoice = build_pq_invoice(&keys, &logger, |_| {});
+		assert_eq!(
+			verify_bolt11_pq_signature(&invoice, None, &logger),
+			Bolt11PqVerification::Unanchored
+		);
+	}
+
+	#[test]
+	fn vanilla_invoice_reports_absent() {
+		let keys = keys(42);
+		let logger = TestLogger::new();
+		let pin = keys.get_pq_node_id().unwrap();
+		// Build without attaching a post-quantum signature.
+		let raw = InvoiceBuilder::new(Currency::Bitcoin)
+			.description("vanilla".into())
+			.payment_hash(PaymentHash([0; 32]))
+			.payment_secret(PaymentSecret([42; 32]))
+			.duration_since_epoch(Duration::from_secs(1234567))
+			.build_raw()
+			.unwrap();
+		let signature = keys.sign_invoice(&raw, Recipient::Node);
+		let invoice = Bolt11Invoice::from_signed(raw.sign(|_| signature).unwrap()).unwrap();
+		// Even with a pin present this is reported as absent; the payer's policy must reject it as
+		// a downgrade for a known-pinned payee.
+		assert_eq!(
+			verify_bolt11_pq_signature(&invoice, Some(&pin), &logger),
+			Bolt11PqVerification::Absent
+		);
+	}
+
+	#[test]
+	fn key_substitution_is_rejected() {
+		let victim = keys(42);
+		let attacker = keys(7);
+		let logger = TestLogger::new();
+		let victim_pin = victim.get_pq_node_id().unwrap();
+		// The attacker builds a perfectly self-consistent invoice signed with their own ML-DSA key.
+		let invoice = build_pq_invoice(&attacker, &logger, |_| {});
+		// Binding to the victim's pinned key catches the substitution.
+		assert_eq!(
+			verify_bolt11_pq_signature(&invoice, Some(&victim_pin), &logger),
+			Bolt11PqVerification::Invalid
+		);
+		// Without a trusted key it only looks self-consistent (so unanchored, not protected).
+		assert_eq!(
+			verify_bolt11_pq_signature(&invoice, None, &logger),
+			Bolt11PqVerification::Unanchored
+		);
+	}
+
+	#[test]
+	fn tampered_body_is_rejected() {
+		let keys = keys(42);
+		let logger = TestLogger::new();
+		let pin = keys.get_pq_node_id().unwrap();
+		// Model a quantum attacker who alters the invoice and forges a fresh classical signature
+		// (here we re-sign classically honestly): the ML-DSA signature over the original body can
+		// no longer match.
+		let invoice = build_pq_invoice(&keys, &logger, |raw| {
+			raw.data.timestamp = PositiveTimestamp::from_unix_timestamp(7654321).unwrap();
+		});
+		assert_eq!(
+			verify_bolt11_pq_signature(&invoice, Some(&pin), &logger),
+			Bolt11PqVerification::Invalid
+		);
+	}
+
+	#[test]
+	fn tampered_signature_is_rejected() {
+		let keys = keys(42);
+		let logger = TestLogger::new();
+		let pin = keys.get_pq_node_id().unwrap();
+		// Build with a single bit flipped in the ML-DSA signature.
+		let mut raw = InvoiceBuilder::new(Currency::Bitcoin)
+			.description("pq invoice".into())
+			.payment_hash(PaymentHash([0; 32]))
+			.payment_secret(PaymentSecret([42; 32]))
+			.duration_since_epoch(Duration::from_secs(1234567))
+			.build_raw()
+			.unwrap();
+		let pubkey = keys.get_pq_node_id().unwrap();
+		lightning_invoice::pq::append_chunks(
+			&mut raw.data.tagged_fields,
+			lightning_invoice::pq::TAG_PQ_PUBLIC_KEY,
+			&pubkey,
+		);
+		let message = raw.pq_signable_bytes();
+		let mut sig = keys.sign_pq_bolt11_invoice(&message).unwrap();
+		sig[0] ^= 0x01;
+		lightning_invoice::pq::append_chunks(
+			&mut raw.data.tagged_fields,
+			lightning_invoice::pq::TAG_PQ_SIGNATURE,
+			&sig,
+		);
+		let signature = keys.sign_invoice(&raw, Recipient::Node);
+		let invoice = Bolt11Invoice::from_signed(raw.sign(|_| signature).unwrap()).unwrap();
+		assert_eq!(
+			verify_bolt11_pq_signature(&invoice, Some(&pin), &logger),
+			Bolt11PqVerification::Invalid
+		);
+	}
+
+	#[test]
+	fn pq_signature_only_invoice_verifies_against_trusted_key() {
+		// A signature-only invoice (pubkey omitted) cannot be self-verified, but a payer holding the
+		// payee's key (e.g. from the gossip pin) verifies it; it is much smaller than self-contained.
+		let keys = keys(42);
+		let logger = TestLogger::new();
+		let pin = keys.get_pq_node_id().unwrap();
+
+		let mut raw = InvoiceBuilder::new(Currency::Bitcoin)
+			.description("sig only".into())
+			.payment_hash(PaymentHash([0; 32]))
+			.payment_secret(PaymentSecret([42; 32]))
+			.duration_since_epoch(Duration::from_secs(1234567))
+			.build_raw()
+			.unwrap();
+		add_pq_bolt11_signature(&mut raw, &keys, false, &logger);
+		let signature = keys.sign_invoice(&raw, Recipient::Node);
+		let invoice = Bolt11Invoice::from_signed(raw.sign(|_| signature).unwrap()).unwrap();
+
+		// Survives a string round-trip and verifies against the payee's key.
+		let reparsed: Bolt11Invoice = invoice.to_string().parse().unwrap();
+		assert_eq!(
+			verify_bolt11_pq_signature(&reparsed, Some(&pin), &logger),
+			Bolt11PqVerification::Verified
+		);
+		// Without any key it cannot be verified at all (no carried key to self-check).
+		assert_eq!(
+			verify_bolt11_pq_signature(&reparsed, None, &logger),
+			Bolt11PqVerification::Unanchored
+		);
+		// A wrong trusted key is rejected.
+		assert_eq!(
+			verify_bolt11_pq_signature(&reparsed, Some(&[7u8; 1312]), &logger),
+			Bolt11PqVerification::Invalid
+		);
+	}
+
+	#[test]
+	fn pq_measurements() {
+		let keys = keys(42);
+		let logger = TestLogger::new();
+		// Vanilla invoice length.
+		let raw = InvoiceBuilder::new(Currency::Bitcoin)
+			.description("measurement".into())
+			.payment_hash(PaymentHash([0; 32]))
+			.payment_secret(PaymentSecret([42; 32]))
+			.duration_since_epoch(Duration::from_secs(1234567))
+			.build_raw()
+			.unwrap();
+		let signature = keys.sign_invoice(&raw, Recipient::Node);
+		let vanilla = Bolt11Invoice::from_signed(raw.sign(|_| signature).unwrap()).unwrap();
+		let vanilla_len = vanilla.to_string().len();
+
+		// Self-contained PQ invoice (carries the public key and the signature).
+		let pq_invoice = build_pq_invoice(&keys, &logger, |_| {});
+		let pq_len = pq_invoice.to_string().len();
+
+		// Signature-only PQ invoice (pubkey omitted; payer anchors the key via gossip).
+		let mut raw_sig_only = InvoiceBuilder::new(Currency::Bitcoin)
+			.description("measurement".into())
+			.payment_hash(PaymentHash([0; 32]))
+			.payment_secret(PaymentSecret([42; 32]))
+			.duration_since_epoch(Duration::from_secs(1234567))
+			.build_raw()
+			.unwrap();
+		add_pq_bolt11_signature(&mut raw_sig_only, &keys, false, &logger);
+		let sig = keys.sign_invoice(&raw_sig_only, Recipient::Node);
+		let sig_only = Bolt11Invoice::from_signed(raw_sig_only.sign(|_| sig).unwrap()).unwrap();
+		let sig_only_len = sig_only.to_string().len();
+
+		println!(
+			"PQ: BOLT 11 invoice length vanilla={} chars, self-contained={} chars, signature-only={} chars; QR alphanumeric cap=4296, LDK cap={}",
+			vanilla_len, pq_len, sig_only_len, lightning_invoice::MAX_LENGTH
+		);
+		assert!(pq_len > sig_only_len);
+		assert!(sig_only_len > vanilla_len);
+		assert!(pq_len < lightning_invoice::MAX_LENGTH);
 	}
 }

@@ -677,6 +677,14 @@ pub enum Bolt11PaymentError {
 	/// [`Bolt11Invoice`]: lightning_invoice::Bolt11Invoice
 	/// [`ChannelManager::pay_for_bolt11_invoice`]: crate::ln::channelmanager::ChannelManager::pay_for_bolt11_invoice
 	InvalidAmount,
+	/// The invoice's hybrid post-quantum (ML-DSA) signature failed verification: it is missing or
+	/// does not verify against the payer's anchor for the payee (the trusted key supplied in
+	/// [`OptionalBolt11PaymentParams::trusted_pq_key`] or, failing that, the payee's gossip-pinned
+	/// ML-DSA key), or the invoice's post-quantum fields are malformed. The payment was not sent.
+	///
+	/// [`OptionalBolt11PaymentParams::trusted_pq_key`]: crate::ln::channelmanager::OptionalBolt11PaymentParams::trusted_pq_key
+	#[cfg(feature = "post-quantum")]
+	PqVerificationFailed,
 	/// The invoice was valid for the corresponding [`PaymentId`], but sending the payment failed.
 	SendingFailed(RetryableSendFailure),
 }

@@ -63,6 +63,9 @@ mod de;
 mod ser;
 mod tb;
 
+#[cfg(feature = "post-quantum")]
+pub mod pq;
+
 #[cfg(test)]
 mod test_ser_de;
 
@@ -1239,6 +1242,39 @@ impl RawBolt11Invoice {
 		let data_part = RawDataPart::from_base32(data)?;
 
 		Ok(Self { hrp: raw_hrp, data: data_part })
+	}
+}
+
+#[cfg(feature = "post-quantum")]
+impl RawBolt11Invoice {
+	/// Returns the exact message bytes that the post-quantum (ML-DSA) signature commits to: the HRP
+	/// (which carries the amount and currency) followed by the data part, with the post-quantum
+	/// signature fields excluded since a signature cannot commit to itself. The post-quantum public
+	/// key field, when present, is included. ML-DSA signs these bytes directly, hashing them with
+	/// its internal SHAKE-256, so the message binding is at the scheme's strength rather than that
+	/// of a 256-bit pre-hash. The classical signature still covers the whole invoice.
+	pub fn pq_signable_bytes(&self) -> Vec<u8> {
+		use crate::bech32::Fe32IterExt;
+		let tagged_fields: Vec<RawTaggedField> = self
+			.data
+			.tagged_fields
+			.iter()
+			.filter(|f| !crate::pq::field_has_tag(f, crate::pq::TAG_PQ_SIGNATURE))
+			.cloned()
+			.collect();
+		let data = RawDataPart { timestamp: self.data.timestamp.clone(), tagged_fields };
+		let mut data_part = data.fe_iter().collect::<Vec<Fe32>>();
+		// Pad to a byte boundary exactly as `hash_from_parts` does, so the byte string is stable.
+		let overhang = (data_part.len() * 5) % 8;
+		if overhang > 0 {
+			data_part.push(Fe32::try_from(0).unwrap());
+			if overhang < 3 {
+				data_part.push(Fe32::try_from(0).unwrap());
+			}
+		}
+		let mut out = self.hrp.to_string().into_bytes();
+		out.extend(data_part.into_iter().fes_to_bytes());
+		out
 	}
 }
 

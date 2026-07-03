@@ -123,6 +123,17 @@ where
 		)
 	}
 
+	#[cfg(feature = "post-quantum")]
+	fn pq_node_id_for_node(
+		&self, node_id: &PublicKey,
+	) -> Option<[u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]> {
+		self.network_graph
+			.deref()
+			.read_only()
+			.node(&NodeId::from_pubkey(node_id))
+			.and_then(|node| node.pq_node_id())
+	}
+
 	#[rustfmt::skip]
 	fn create_blinded_payment_paths<
 		T: secp256k1::Signing + secp256k1::Verification
@@ -294,6 +305,16 @@ pub trait Router {
 		first_hops: Vec<ChannelDetails>, tlvs: ReceiveTlvs, amount_msats: Option<u64>,
 		secp_ctx: &Secp256k1<T>,
 	) -> Result<Vec<BlindedPaymentPath>, ()>;
+
+	/// PQ: returns the gossip-pinned ML-DSA public key for `node_id`, used by a post-quantum payer to
+	/// anchor a BOLT 11 invoice's signature to the payee's pinned key when the caller did not supply a
+	/// trusted key out of band. Returns `None` if the node has no pinned key. The default returns `None`.
+	#[cfg(feature = "post-quantum")]
+	fn pq_node_id_for_node(
+		&self, _node_id: &PublicKey,
+	) -> Option<[u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]> {
+		None
+	}
 }
 
 impl<T: Router + ?Sized, R: Deref<Target = T>> Router for R {
@@ -332,6 +353,13 @@ impl<T: Router + ?Sized, R: Deref<Target = T>> Router for R {
 			amount_msats,
 			secp_ctx,
 		)
+	}
+
+	#[cfg(feature = "post-quantum")]
+	fn pq_node_id_for_node(
+		&self, node_id: &PublicKey,
+	) -> Option<[u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]> {
+		self.deref().pq_node_id_for_node(node_id)
 	}
 }
 
