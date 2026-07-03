@@ -27,6 +27,8 @@ use crate::blinded_path::message::{
 	MessageForwardNode, NextMessageHop, OffersContext, MESSAGE_PADDING_ROUND_OFF,
 };
 use crate::blinded_path::utils::is_padded;
+#[cfg(feature = "post-quantum")]
+use crate::blinded_path::EmptyNodeIdLookUp;
 use crate::blinded_path::NodeIdLookUp;
 use crate::events::{Event, EventsProvider};
 use crate::ln::msgs::{self, BaseMessageHandler, DecodeError, OnionMessageHandler};
@@ -556,6 +558,301 @@ fn three_blinded_hops() {
 	nodes[0].messenger.send_onion_message(test_msg, instructions).unwrap();
 	nodes[3].custom_message_handler.expect_message(TestCustomMessage::Pong);
 	pass_along_path(&nodes);
+}
+
+#[test]
+#[cfg(feature = "post-quantum")]
+fn pq_blinded_path_message_round_trips() {
+	// A message sent over a multi-hop post-quantum blinded path is forwarded by each hop and
+	// received by the recipient. Each hop folds its ML-KEM secret into its per-hop secret, so the
+	// route and the message content are hidden from a quantum attacker who breaks the per-hop ECDH.
+	let nodes = create_nodes(4);
+	let test_msg = TestCustomMessage::Pong;
+	let secp_ctx = Secp256k1::new();
+
+	// Path: introduction node 1, intermediate node 2, recipient node 3. Sender is node 0.
+	let intermediate_nodes = [
+		MessageForwardNode { node_id: nodes[1].node_id, short_channel_id: None },
+		MessageForwardNode { node_id: nodes[2].node_id, short_channel_id: None },
+	];
+	let intermediate_kem_keys = [
+		nodes[1].messenger.node_signer.get_pq_kem_node_id().unwrap(),
+		nodes[2].messenger.node_signer.get_pq_kem_node_id().unwrap(),
+	];
+	let recipient_kem_key = nodes[3].messenger.node_signer.get_pq_kem_node_id().unwrap();
+	let blinded_path = BlindedMessagePath::new_pq(
+		&intermediate_nodes,
+		&intermediate_kem_keys,
+		nodes[3].node_id,
+		&recipient_kem_key,
+		nodes[3].messenger.node_signer.get_receive_auth_key(),
+		MessageContext::Custom(Vec::new()),
+		&*nodes[3].entropy_source,
+		&secp_ctx,
+	)
+	.unwrap();
+	let path = OnionMessagePath {
+		intermediate_nodes: vec![],
+		destination: Destination::BlindedPath(blinded_path),
+		first_node_addresses: Vec::new(),
+	};
+
+	nodes[0].messenger.send_onion_message_using_path(path, test_msg, None).unwrap();
+	nodes[3].custom_message_handler.expect_message(TestCustomMessage::Pong);
+	pass_along_path(&nodes);
+}
+
+#[cfg(feature = "post-quantum")]
+fn build_pq_path_message(
+	nodes: &[MessengerNode], recipient_kem_key: &[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN],
+) -> (PublicKey, msgs::OnionMessage) {
+	// A two-hop path: introduction node 1, recipient node 2, sender node 0. `recipient_kem_key`
+	// lets a test substitute a wrong key for the recipient.
+	let secp_ctx = Secp256k1::new();
+	let intermediate_nodes =
+		[MessageForwardNode { node_id: nodes[1].node_id, short_channel_id: None }];
+	let intermediate_kem_keys = [nodes[1].messenger.node_signer.get_pq_kem_node_id().unwrap()];
+	let blinded_path = BlindedMessagePath::new_pq(
+		&intermediate_nodes,
+		&intermediate_kem_keys,
+		nodes[2].node_id,
+		recipient_kem_key,
+		nodes[2].messenger.node_signer.get_receive_auth_key(),
+		MessageContext::Custom(Vec::new()),
+		&*nodes[2].entropy_source,
+		&secp_ctx,
+	)
+	.unwrap();
+	let path = OnionMessagePath {
+		intermediate_nodes: vec![],
+		destination: Destination::BlindedPath(blinded_path),
+		first_node_addresses: Vec::new(),
+	};
+	let (first_node_id, om, _) = super::messenger::create_onion_message(
+		&*nodes[0].entropy_source,
+		&nodes[0].messenger.node_signer,
+		&EmptyNodeIdLookUp {},
+		&secp_ctx,
+		path,
+		TestCustomMessage::Pong,
+		None,
+	)
+	.unwrap();
+	(first_node_id, om)
+}
+
+#[test]
+#[cfg(feature = "post-quantum")]
+fn pq_blinded_path_rejects_tampered_or_dropped_ciphertext() {
+	let nodes = create_nodes(3);
+	let recipient_kem_key = nodes[2].messenger.node_signer.get_pq_kem_node_id().unwrap();
+	let (first_node_id, om) = build_pq_path_message(&nodes, &recipient_kem_key);
+	assert_eq!(first_node_id, nodes[1].node_id);
+	// The introduction node peels the untouched message and forwards it.
+	assert!(nodes[1].messenger.peel_onion_message(&om).is_ok());
+
+	// Tampering the header ciphertext changes the decapsulated secret, so the hybrid per-hop secret
+	// no longer matches the one the path was built with and the encrypted data fails to authenticate.
+	let mut tampered = om.clone();
+	let mut ct = tampered.kem_ciphertext.unwrap();
+	ct[0] ^= 0x01;
+	tampered.kem_ciphertext = Some(ct);
+	assert!(nodes[1].messenger.peel_onion_message(&tampered).is_err());
+
+	// Dropping the ciphertext (a quantum downgrade attempt) also fails closed: with no ML-KEM secret
+	// to fold in, the introduction node derives only the classical secret, which cannot decrypt the
+	// hybrid-keyed encrypted recipient data.
+	let mut dropped = om.clone();
+	dropped.kem_ciphertext = None;
+	assert!(nodes[1].messenger.peel_onion_message(&dropped).is_err());
+}
+
+#[test]
+#[cfg(feature = "post-quantum")]
+fn pq_blinded_path_wrong_recipient_kem_key_rejected() {
+	// If the path is built against a KEM key the recipient does not hold (e.g. a quantum attacker
+	// who forged the classical key but cannot bind the pinned ML-KEM key), the recipient cannot
+	// reconstruct the hybrid secret and rejects the message, while the introduction node (bound to
+	// its own real key) still forwards.
+	let nodes = create_nodes(3);
+	let wrong_key = nodes[1].messenger.node_signer.get_pq_kem_node_id().unwrap();
+	let (first_node_id, om) = build_pq_path_message(&nodes, &wrong_key);
+	assert_eq!(first_node_id, nodes[1].node_id);
+
+	let forwarded = match nodes[1].messenger.peel_onion_message(&om) {
+		Ok(super::messenger::PeeledOnion::Forward(_, forwarded)) => forwarded,
+		_ => panic!("introduction node should forward"),
+	};
+	assert!(nodes[2].messenger.peel_onion_message(&forwarded).is_err());
+}
+
+#[test]
+#[cfg(feature = "post-quantum")]
+fn pq_blinded_path_measurements() {
+	// Reports the onion message size overhead of a post-quantum blinded path versus a classical one,
+	// and the per-hop ML-KEM operation timings. Run with `--nocapture` to see the output.
+	use crate::crypto::pq_kem::{decapsulate, encapsulate, keypair_from_seed, PQ_KEM_CT_LEN};
+
+	let nodes = create_nodes(4);
+	let secp_ctx = Secp256k1::new();
+	let intermediate_nodes = [
+		MessageForwardNode { node_id: nodes[1].node_id, short_channel_id: None },
+		MessageForwardNode { node_id: nodes[2].node_id, short_channel_id: None },
+	];
+
+	let classical_path = BlindedMessagePath::new(
+		&intermediate_nodes,
+		nodes[3].node_id,
+		nodes[3].messenger.node_signer.get_receive_auth_key(),
+		MessageContext::Custom(Vec::new()),
+		false,
+		&*nodes[3].entropy_source,
+		&secp_ctx,
+	);
+	let classical = OnionMessagePath {
+		intermediate_nodes: vec![],
+		destination: Destination::BlindedPath(classical_path),
+		first_node_addresses: Vec::new(),
+	};
+	let (_, classical_om, _) = super::messenger::create_onion_message(
+		&*nodes[0].entropy_source,
+		&nodes[0].messenger.node_signer,
+		&EmptyNodeIdLookUp {},
+		&secp_ctx,
+		classical,
+		TestCustomMessage::Pong,
+		None,
+	)
+	.unwrap();
+
+	let intermediate_kem_keys = [
+		nodes[1].messenger.node_signer.get_pq_kem_node_id().unwrap(),
+		nodes[2].messenger.node_signer.get_pq_kem_node_id().unwrap(),
+	];
+	let recipient_kem_key = nodes[3].messenger.node_signer.get_pq_kem_node_id().unwrap();
+	let pq_path = BlindedMessagePath::new_pq(
+		&intermediate_nodes,
+		&intermediate_kem_keys,
+		nodes[3].node_id,
+		&recipient_kem_key,
+		nodes[3].messenger.node_signer.get_receive_auth_key(),
+		MessageContext::Custom(Vec::new()),
+		&*nodes[3].entropy_source,
+		&secp_ctx,
+	)
+	.unwrap();
+	let pq = OnionMessagePath {
+		intermediate_nodes: vec![],
+		destination: Destination::BlindedPath(pq_path),
+		first_node_addresses: Vec::new(),
+	};
+	let (_, pq_om, _) = super::messenger::create_onion_message(
+		&*nodes[0].entropy_source,
+		&nodes[0].messenger.node_signer,
+		&EmptyNodeIdLookUp {},
+		&secp_ctx,
+		pq,
+		TestCustomMessage::Pong,
+		None,
+	)
+	.unwrap();
+
+	let classical_len = classical_om.serialized_length();
+	let pq_len = pq_om.serialized_length();
+	println!(
+		"PQ: 3-hop onion message size: classical {} B, post-quantum {} B (+{} B); ML-KEM ciphertext {} B/hop",
+		classical_len,
+		pq_len,
+		pq_len - classical_len,
+		PQ_KEM_CT_LEN,
+	);
+
+	let (ek, dk) = keypair_from_seed(&[9u8; 32]);
+	let iters = 200;
+	let mut encaps_ns = 0u128;
+	let mut decaps_ns = 0u128;
+	for i in 0..iters {
+		let seed = [i as u8; 32];
+		let start = std::time::Instant::now();
+		let (_, ct) = encapsulate(&ek, &seed).unwrap();
+		encaps_ns += start.elapsed().as_nanos();
+		let start = std::time::Instant::now();
+		let _ = decapsulate(&dk, &ct).unwrap();
+		decaps_ns += start.elapsed().as_nanos();
+	}
+	println!(
+		"PQ: ML-KEM-768 encaps {:.1} us, decaps {:.1} us (avg over {} iters)",
+		encaps_ns as f64 / iters as f64 / 1000.0,
+		decaps_ns as f64 / iters as f64 / 1000.0,
+		iters,
+	);
+}
+
+#[test]
+#[cfg(feature = "post-quantum")]
+fn pq_reply_path_ciphertext_round_trips() {
+	// A post-quantum reply path's introduction-node ciphertext is carried in the onion-message
+	// payload (type 3) alongside the reply path, and re-attached on receipt, so the recipient can
+	// reply over a post-quantum path. Here the sender (node 0) sends to the recipient (node 2) over a
+	// post-quantum path and includes a post-quantum reply path back to itself; we check the recipient
+	// recovers the reply path with its ciphertext intact.
+	let nodes = create_nodes(3);
+	let secp_ctx = Secp256k1::new();
+	let intro = [MessageForwardNode { node_id: nodes[1].node_id, short_channel_id: None }];
+	let intro_kem = [nodes[1].messenger.node_signer.get_pq_kem_node_id().unwrap()];
+
+	let to_recipient = BlindedMessagePath::new_pq(
+		&intro,
+		&intro_kem,
+		nodes[2].node_id,
+		&nodes[2].messenger.node_signer.get_pq_kem_node_id().unwrap(),
+		nodes[2].messenger.node_signer.get_receive_auth_key(),
+		MessageContext::Custom(Vec::new()),
+		&*nodes[2].entropy_source,
+		&secp_ctx,
+	)
+	.unwrap();
+	let reply_path = BlindedMessagePath::new_pq(
+		&intro,
+		&intro_kem,
+		nodes[0].node_id,
+		&nodes[0].messenger.node_signer.get_pq_kem_node_id().unwrap(),
+		nodes[0].messenger.node_signer.get_receive_auth_key(),
+		MessageContext::Custom(Vec::new()),
+		&*nodes[0].entropy_source,
+		&secp_ctx,
+	)
+	.unwrap();
+	let expected_reply_ct = reply_path.kem_ct();
+	assert!(expected_reply_ct.is_some());
+
+	let path = OnionMessagePath {
+		intermediate_nodes: vec![],
+		destination: Destination::BlindedPath(to_recipient),
+		first_node_addresses: Vec::new(),
+	};
+	let (first_node_id, om, _) = super::messenger::create_onion_message(
+		&*nodes[0].entropy_source,
+		&nodes[0].messenger.node_signer,
+		&EmptyNodeIdLookUp {},
+		&secp_ctx,
+		path,
+		TestCustomMessage::Ping,
+		Some(reply_path),
+	)
+	.unwrap();
+	assert_eq!(first_node_id, nodes[1].node_id);
+
+	let forwarded = match nodes[1].messenger.peel_onion_message(&om) {
+		Ok(super::messenger::PeeledOnion::Forward(_, forwarded)) => forwarded,
+		_ => panic!("introduction node should forward"),
+	};
+	match nodes[2].messenger.peel_onion_message(&forwarded) {
+		Ok(super::messenger::PeeledOnion::Custom(_, _, Some(received_reply_path))) => {
+			assert_eq!(received_reply_path.kem_ct(), expected_reply_ct);
+		},
+		_ => panic!("recipient should receive a custom message carrying the reply path"),
+	}
 }
 
 #[test]
@@ -1400,6 +1697,8 @@ fn spec_test_vector() {
 	let sender_to_alice_om = msgs::OnionMessage {
 		blinding_point: PublicKey::from_secret_key(&secp_ctx, &blinding_key),
 		onion_routing_packet: sender_to_alice_packet,
+		#[cfg(feature = "post-quantum")]
+		kem_ciphertext: None,
 	};
 	// The spec test vectors prepend the OM message type (513) to the encoded onion message strings,
 	// which is why the asserted strings differ slightly from the spec.

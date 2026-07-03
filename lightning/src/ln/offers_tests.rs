@@ -779,6 +779,373 @@ fn creates_and_pays_for_offer_using_one_hop_blinded_path() {
 	expect_recent_payment!(bob, RecentPaymentDetails::Fulfilled, payment_id);
 }
 
+/// PQ: with `build_post_quantum_blinded_paths` set, an offer responder builds post-quantum
+/// onion-message blinded paths (carrying the `invoice_request`/`invoice`) and post-quantum blinded
+/// payment-path tails by default through the real `ChannelManager`/`OffersMessageFlow`, and a
+/// post-quantum-capable payer pays end to end over them. This exercises the post-quantum onion-message
+/// blinded paths and blinded payment-path tails, composed with the BOLT 12 invoice signature.
+#[cfg(feature = "post-quantum")]
+#[test]
+fn pq_offer_builds_and_pays_post_quantum_blinded_paths() {
+	use crate::offers::invoice::Bolt12PqVerification;
+	use crate::sign::NodeSigner;
+
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	// Alice (the offer responder) is configured to build post-quantum blinded paths.
+	let mut alice_cfg = test_default_channel_config();
+	alice_cfg.build_post_quantum_blinded_paths = true;
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(alice_cfg), None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 10_000_000, 1_000_000_000);
+
+	let alice = &nodes[0];
+	let alice_id = alice.node.get_our_node_id();
+	let bob = &nodes[1];
+	let bob_id = bob.node.get_our_node_id();
+
+	// Bob (the payer) needs Alice's static ML-KEM key to build the hybrid payment onion to the
+	// introduction node. In production this comes from the gossip pin; the test injects it directly.
+	let alice_kem = alice.keys_manager.get_pq_kem_node_id().unwrap();
+	bob.router.pq_kem_keys.lock().unwrap().insert(alice_id, alice_kem);
+
+	let offer = alice.node.create_offer_builder().unwrap().amount_msats(10_000_000).build().unwrap();
+	assert!(!offer.paths().is_empty());
+	// The offer's blinded message paths are post-quantum (each carries its introduction-node
+	// ML-KEM ciphertext).
+	for path in offer.paths() {
+		assert!(path.kem_ct().is_some(), "PQ: offer message path must be post-quantum");
+	}
+
+	let payment_id = PaymentId([1; 32]);
+	bob.node.pay_for_offer(&offer, None, payment_id, Default::default()).unwrap();
+	expect_recent_payment!(bob, RecentPaymentDetails::AwaitingInvoice, payment_id);
+
+	let onion_message = bob.onion_messenger.next_onion_message_for_peer(alice_id).unwrap();
+	alice.onion_messenger.handle_onion_message(bob_id, &onion_message);
+
+	let (invoice_request, _reply_path) = extract_invoice_request(alice, &onion_message);
+	let payment_context = PaymentContext::Bolt12Offer(Bolt12OfferContext {
+		offer_id: offer.id(),
+		invoice_request: InvoiceRequestFields {
+			payer_signing_pubkey: invoice_request.payer_signing_pubkey(),
+			quantity: None,
+			payer_note_truncated: None,
+			human_readable_name: None,
+		},
+		payment_metadata: None,
+	});
+
+	let onion_message = alice.onion_messenger.next_onion_message_for_peer(bob_id).unwrap();
+	bob.onion_messenger.handle_onion_message(alice_id, &onion_message);
+
+	let (invoice, _reply_path) = extract_invoice(bob, &onion_message);
+	// The invoice's blinded payment paths are post-quantum (each carries its per-hop ciphertext
+	// list), conveyed to Bob through the invoice-local record and re-attached on parse.
+	for path in invoice.payment_paths() {
+		assert!(path.kem_ct().is_some(), "PQ: invoice payment path must be post-quantum");
+	}
+	// The invoice carries a valid ML-DSA signature anchored to the offer's committed issuer key.
+	assert_eq!(
+		invoice.verify_pq_signature(offer.issuer_pq_id().as_ref(), &alice.logger),
+		Bolt12PqVerification::Verified,
+	);
+
+	// Bob automatically sent the payment when it received and verified the invoice; pass it along the
+	// post-quantum blinded path. Unlike a classical path, a post-quantum path carries no dummy hops.
+	// (The payment can only complete if the hybrid-keyed blinded tail is decrypted, which requires the
+	// introduction-node ciphertext to have ridden alongside the HTLC, so a successful claim proves it.)
+	check_added_monitors(bob, 1);
+	let mut events = bob.node.get_and_clear_pending_msg_events();
+	assert_eq!(events.len(), 1);
+	let ev = remove_first_msg_event_to_node(&alice_id, &mut events);
+	let payment_path = [alice];
+	let args = PassAlongPathArgs::new(bob, &payment_path, invoice.amount_msats(), invoice.payment_hash(), ev)
+		.without_clearing_recipient_events()
+		.with_dummy_tlvs(&[]);
+	do_pass_along_path(args);
+	expect_recent_payment!(bob, RecentPaymentDetails::Pending, payment_id);
+
+	claim_bolt12_payment(bob, &[alice], payment_context, &invoice);
+	expect_recent_payment!(bob, RecentPaymentDetails::Fulfilled, payment_id);
+}
+
+/// PQ: with `build_post_quantum_blinded_paths` set, a refund responder (the payee) builds a
+/// post-quantum blinded payment-path tail for its response invoice. Because a refund commits no offer
+/// key to anchor a signature to, the invoice signature stays classical, but the per-hop ML-KEM
+/// ciphertexts are conveyed on their own so a post-quantum-capable payer can pay end to end over the
+/// hybrid tail. Without the conveyance the payer could not reconstruct the hybrid secret, so a
+/// successful claim proves the ciphertexts rode alongside the HTLC.
+#[cfg(feature = "post-quantum")]
+#[test]
+fn pq_refund_builds_and_pays_post_quantum_blinded_paths() {
+	use crate::sign::NodeSigner;
+
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	// Alice (the refund responder, i.e. the payee) is configured to build post-quantum blinded paths.
+	let mut alice_cfg = test_default_channel_config();
+	alice_cfg.build_post_quantum_blinded_paths = true;
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(alice_cfg), None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 10_000_000, 1_000_000_000);
+
+	let alice = &nodes[0];
+	let alice_id = alice.node.get_our_node_id();
+	let bob = &nodes[1];
+	let bob_id = bob.node.get_our_node_id();
+
+	// Bob (the refund creator, i.e. the payer) needs Alice's static ML-KEM key to build the hybrid
+	// payment onion to the introduction node. In production this comes from the gossip pin; the test
+	// injects it directly.
+	let alice_kem = alice.keys_manager.get_pq_kem_node_id().unwrap();
+	bob.router.pq_kem_keys.lock().unwrap().insert(alice_id, alice_kem);
+
+	let absolute_expiry = Duration::from_secs(u64::MAX);
+	let payment_id = PaymentId([1; 32]);
+	let refund = bob.node
+		.create_refund_builder(10_000_000, absolute_expiry, payment_id, Retry::Attempts(0), RouteParametersConfig::default())
+		.unwrap()
+		.build().unwrap();
+	expect_recent_payment!(bob, RecentPaymentDetails::AwaitingInvoice, payment_id);
+
+	let payment_context = PaymentContext::Bolt12Refund(Bolt12RefundContext { payment_metadata: None });
+	let expected_invoice = alice.node.request_refund_payment(&refund).unwrap();
+
+	let onion_message = alice.onion_messenger.next_onion_message_for_peer(bob_id).unwrap();
+	bob.onion_messenger.handle_onion_message(alice_id, &onion_message);
+
+	let (invoice, _reply_path) = extract_invoice(bob, &onion_message);
+	assert_eq!(invoice, expected_invoice);
+	// The response invoice's blinded payment paths are post-quantum (each carries its per-hop
+	// ciphertext list), conveyed to Bob through the invoice-local record and re-attached on parse.
+	assert!(!invoice.payment_paths().is_empty());
+	for path in invoice.payment_paths() {
+		assert!(path.kem_ct().is_some(), "PQ: refund invoice payment path must be post-quantum");
+	}
+
+	// Bob automatically sent the payment when it received the invoice; pass it along the post-quantum
+	// blinded path. Unlike a classical path, a post-quantum path carries no dummy hops. The payment can
+	// only complete if the hybrid-keyed blinded tail is decrypted, which requires the introduction-node
+	// ciphertext to have ridden alongside the HTLC, so a successful claim proves the conveyance worked.
+	check_added_monitors(bob, 1);
+	let mut events = bob.node.get_and_clear_pending_msg_events();
+	assert_eq!(events.len(), 1);
+	let ev = remove_first_msg_event_to_node(&alice_id, &mut events);
+	let payment_path = [alice];
+	let args = PassAlongPathArgs::new(bob, &payment_path, invoice.amount_msats(), invoice.payment_hash(), ev)
+		.without_clearing_recipient_events()
+		.with_dummy_tlvs(&[]);
+	do_pass_along_path(args);
+	expect_recent_payment!(bob, RecentPaymentDetails::Pending, payment_id);
+
+	claim_bolt12_payment(bob, &[alice], payment_context, &invoice);
+	expect_recent_payment!(bob, RecentPaymentDetails::Fulfilled, payment_id);
+}
+
+/// Strips the TLV record of the given `record_type` from a serialized BOLT 12 invoice, returning the
+/// remaining bytes. Used to model a man-in-the-middle dropping the post-quantum ciphertext record.
+#[cfg(feature = "post-quantum")]
+fn strip_bolt12_invoice_tlv_record(bytes: &[u8], record_type: u64) -> Vec<u8> {
+	use crate::io::Cursor;
+	use crate::util::ser::{BigSize, Readable};
+	let mut out = Vec::with_capacity(bytes.len());
+	let mut cursor = Cursor::new(bytes);
+	while (cursor.position() as usize) < bytes.len() {
+		let start = cursor.position() as usize;
+		let typ = <BigSize as Readable>::read(&mut cursor).unwrap().0;
+		let len = <BigSize as Readable>::read(&mut cursor).unwrap().0 as usize;
+		let end = cursor.position() as usize + len;
+		if typ != record_type {
+			out.extend_from_slice(&bytes[start..end]);
+		}
+		cursor.set_position(end as u64);
+	}
+	out
+}
+
+/// PQ adversarial (downgrade): the per-hop ML-KEM ciphertexts a refund responder folds into its
+/// hybrid blinded payment paths reach the payer only through the invoice-local ciphertext record.
+/// The record sits in the signed experimental range, so a bare strip breaks the classical signature
+/// and is rejected outright at parse. A man-in-the-middle who re-signs the stripped invoice (which
+/// for a refund response even a classical attacker can, since the responder's signing key is
+/// unauthenticated) leaves the payer with classical-looking paths and no ciphertexts, so it cannot
+/// reconstruct the hybrid blinded-path secret; the payment then fails closed (the live HTLC-level
+/// fail-closed is covered by `pq_blinded_payment_strip_intro_ct_fails`).
+#[cfg(feature = "post-quantum")]
+#[test]
+fn pq_refund_invoice_kem_ct_strip_is_a_downgrade() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let mut alice_cfg = test_default_channel_config();
+	alice_cfg.build_post_quantum_blinded_paths = true;
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(alice_cfg), None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 10_000_000, 1_000_000_000);
+
+	let alice = &nodes[0];
+	let bob = &nodes[1];
+
+	let absolute_expiry = Duration::from_secs(u64::MAX);
+	let payment_id = PaymentId([2; 32]);
+	let refund = bob.node
+		.create_refund_builder(10_000_000, absolute_expiry, payment_id, Retry::Attempts(0), RouteParametersConfig::default())
+		.unwrap()
+		.build().unwrap();
+
+	let invoice = alice.node.request_refund_payment(&refund).unwrap();
+	// The responder conveyed the post-quantum blinded payment paths' ciphertexts in the invoice.
+	assert!(!invoice.payment_paths().is_empty());
+	for path in invoice.payment_paths() {
+		assert!(path.kem_ct().is_some(), "PQ: refund responder must convey blinded-path ciphertexts");
+	}
+
+	// Strip the invoice-local ML-KEM ciphertext record (type 3000000243, INVOICE_PQ_KEM_CT_TYPE),
+	// as a downgrading man-in-the-middle would. The record is covered by the classical signature,
+	// so the bare strip is rejected outright at parse.
+	let stripped_bytes = strip_bolt12_invoice_tlv_record(&invoice.encode(), 3_000_000_243);
+	assert!(matches!(
+		Bolt12Invoice::try_from(stripped_bytes.clone()),
+		Err(crate::offers::parse::Bolt12ParseError::InvalidSignature(_))
+	));
+	// A man-in-the-middle who re-signs the stripped invoice (for a refund response even a
+	// classical attacker can, since the responder's signing key is unauthenticated) leaves the
+	// payer with no ciphertexts: the downgrade yields classical-looking paths, which fail closed
+	// at the hops and which a post-quantum-required sender refuses to use.
+	let stripped = Bolt12Invoice::test_parse_without_signature_check(stripped_bytes).unwrap();
+	assert!(!stripped.payment_paths().is_empty());
+	for path in stripped.payment_paths() {
+		assert!(path.kem_ct().is_none(), "PQ: stripping the record must drop the payer's ciphertexts");
+	}
+}
+
+/// PQ: a refund creator with `build_post_quantum_blinded_paths` set builds post-quantum blinded
+/// message paths whose introduction-node ML-KEM ciphertexts ride in a typed experimental record,
+/// so a responder that parses the refund from its encoded form (as a real node does) can reply
+/// with the invoice over the hybrid path. Covers the full encode/parse round trip, the hybrid
+/// onion-message delivery of the invoice, and the payment.
+#[cfg(feature = "post-quantum")]
+#[test]
+fn pq_refund_message_path_cts_survive_encoding() {
+	use crate::sign::NodeSigner;
+
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	// Bob (the refund creator, i.e. the payer) is configured to build post-quantum blinded paths.
+	let mut bob_cfg = test_default_channel_config();
+	bob_cfg.build_post_quantum_blinded_paths = true;
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, Some(bob_cfg)]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 10_000_000, 1_000_000_000);
+
+	let alice = &nodes[0];
+	let alice_id = alice.node.get_our_node_id();
+	let bob = &nodes[1];
+	let bob_id = bob.node.get_our_node_id();
+
+	// Bob needs Alice's static ML-KEM key to build a post-quantum path through her. In production
+	// this comes from the gossip pin; the test injects it directly.
+	let alice_kem = alice.keys_manager.get_pq_kem_node_id().unwrap();
+	bob.router.pq_kem_keys.lock().unwrap().insert(alice_id, alice_kem);
+
+	let absolute_expiry = Duration::from_secs(u64::MAX);
+	let payment_id = PaymentId([3; 32]);
+	let refund = bob.node
+		.create_refund_builder(10_000_000, absolute_expiry, payment_id, Retry::Attempts(0), RouteParametersConfig::default())
+		.unwrap()
+		.build().unwrap();
+	expect_recent_payment!(bob, RecentPaymentDetails::AwaitingInvoice, payment_id);
+	assert!(!refund.paths().is_empty());
+	for path in refund.paths() {
+		assert!(path.kem_ct().is_some(), "PQ: refund message path must be post-quantum");
+	}
+
+	// Round-trip the refund through its encoded form, as a responder on another node parses it.
+	let refund = crate::offers::refund::Refund::try_from(refund.encode()).unwrap();
+	for path in refund.paths() {
+		assert!(path.kem_ct().is_some(), "PQ: the record must re-attach the path ciphertexts on parse");
+	}
+
+	let expected_invoice = alice.node.request_refund_payment(&refund).unwrap();
+
+	// The responder replied with the invoice over the refund's hybrid blinded message path. The
+	// onion message's per-hop keys are hybrid, so it decrypts at Bob only if the introduction-node
+	// ML-KEM ciphertext conveyed in the refund record rode in the message header; a successful
+	// extract proves the round-tripped ciphertexts were used. (The live payment leg is exercised
+	// end to end by the evaluation script.)
+	let onion_message = alice.onion_messenger.next_onion_message_for_peer(bob_id).unwrap();
+	bob.onion_messenger.handle_onion_message(alice_id, &onion_message);
+
+	let (invoice, _reply_path) = extract_invoice(bob, &onion_message);
+	assert_eq!(invoice, expected_invoice);
+	check_added_monitors(bob, 1);
+	expect_recent_payment!(bob, RecentPaymentDetails::Pending, payment_id);
+
+	// Bob auto-dispatched the payment on receiving the invoice; drain and abandon it so the test
+	// node's drop-time event check stays clean (the live payment is covered by the eval script).
+	let _ = bob.node.get_and_clear_pending_msg_events();
+	bob.node.abandon_payment(payment_id);
+	let _ = bob.node.get_and_clear_pending_events();
+}
+
+/// PQ adversarial (downgrade): the typed record carrying a refund's blinded-path ciphertexts is
+/// covered by the refund's payer metadata HMAC, so a man-in-the-middle who strips it leaves the
+/// responder with classical-looking paths and also breaks the payer's stateless verification of
+/// the responding invoice: the payment is refused rather than silently downgraded.
+#[cfg(feature = "post-quantum")]
+#[test]
+fn pq_refund_kem_ct_record_strip_fails_verification() {
+	use crate::sign::NodeSigner;
+
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let mut bob_cfg = test_default_channel_config();
+	bob_cfg.build_post_quantum_blinded_paths = true;
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, Some(bob_cfg)]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 10_000_000, 1_000_000_000);
+
+	let alice = &nodes[0];
+	let alice_id = alice.node.get_our_node_id();
+	let bob = &nodes[1];
+	let bob_id = bob.node.get_our_node_id();
+
+	let alice_kem = alice.keys_manager.get_pq_kem_node_id().unwrap();
+	bob.router.pq_kem_keys.lock().unwrap().insert(alice_id, alice_kem);
+
+	let absolute_expiry = Duration::from_secs(u64::MAX);
+	let payment_id = PaymentId([4; 32]);
+	let refund = bob.node
+		.create_refund_builder(10_000_000, absolute_expiry, payment_id, Retry::Attempts(0), RouteParametersConfig::default())
+		.unwrap()
+		.build().unwrap();
+	for path in refund.paths() {
+		assert!(path.kem_ct().is_some(), "PQ: refund message path must be post-quantum");
+	}
+
+	// Strip the typed ciphertext record (type 2000000243, REFUND_PQ_KEM_CT_TYPE), as a downgrading
+	// man-in-the-middle would. The stripped refund still parses, but its paths lose their
+	// ciphertexts.
+	let stripped_bytes = strip_bolt12_invoice_tlv_record(&refund.encode(), 2_000_000_243);
+	let stripped = crate::offers::refund::Refund::try_from(stripped_bytes).unwrap();
+	for path in stripped.paths() {
+		assert!(path.kem_ct().is_none(), "PQ: stripping the record must drop the path ciphertexts");
+	}
+
+	// The responder answers the stripped refund, but the payer's metadata HMAC covered the record,
+	// so the responding invoice fails stateless verification and no payment goes out.
+	alice.node.request_refund_payment(&stripped).unwrap();
+	let onion_message = alice.onion_messenger.next_onion_message_for_peer(bob_id).unwrap();
+	bob.onion_messenger.handle_onion_message(alice_id, &onion_message);
+	assert!(bob.node.get_and_clear_pending_msg_events().is_empty());
+	check_added_monitors(bob, 0);
+}
+
 /// Checks that a `Router` can attach `payment_metadata` to the [`PaymentContext`] of a blinded
 /// payment path while building it in response to an invoice request, and that the metadata is
 /// surfaced back via [`Event::PaymentClaimable`] when the payment is received.
@@ -1585,6 +1952,10 @@ fn fails_authentication_when_handling_invoice_request() {
 		.unwrap()
 		.amount_msats(10_000_000)
 		.build().unwrap();
+	// The offer's post-quantum records ride in the metadata record.
+	#[cfg(feature = "post-quantum")]
+	assert!(offer.metadata().is_some());
+	#[cfg(not(feature = "post-quantum"))]
 	assert_eq!(offer.metadata(), None);
 	assert_ne!(offer.issuer_signing_pubkey(), Some(alice_id));
 	assert!(!offer.paths().is_empty());
@@ -2415,9 +2786,18 @@ fn fails_paying_invoice_with_unknown_required_features() {
 
 	let invoice = match verified_invoice_request {
 		InvoiceRequestVerifiedFromOffer::DerivedKeys(request) => {
-			request.respond_using_derived_keys_no_std(payment_paths, payment_hash, created_at).unwrap()
-				.features_unchecked(Bolt12InvoiceFeatures::unknown())
-				.build_and_sign(&secp_ctx).unwrap()
+			// PQ: attach the ML-DSA signature the legitimate responder would, so this hand-built
+			// invoice passes the payer's post-quantum check and we exercise the unknown-features
+			// failure rather than a post-quantum rejection.
+			#[cfg(feature = "post-quantum")]
+			let pq_seed = request.pq_seed;
+			let builder = request.respond_using_derived_keys_no_std(payment_paths, payment_hash, created_at).unwrap()
+				.features_unchecked(Bolt12InvoiceFeatures::unknown());
+			#[cfg(feature = "post-quantum")]
+			let invoice = builder.build_and_sign_pq(&secp_ctx, pq_seed.as_ref()).unwrap();
+			#[cfg(not(feature = "post-quantum"))]
+			let invoice = builder.build_and_sign(&secp_ctx).unwrap();
+			invoice
 		},
 		InvoiceRequestVerifiedFromOffer::ExplicitKeys(_) => {
 			panic!("Expected invoice request with keys");

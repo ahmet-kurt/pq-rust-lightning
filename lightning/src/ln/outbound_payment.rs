@@ -92,6 +92,12 @@ pub(crate) enum PendingOutboundPayment {
 		retry_strategy: Retry,
 		route_params_config: RouteParametersConfig,
 		retryable_invoice_request: Option<RetryableInvoiceRequest>,
+		// PQ: the issuer's per-offer ML-DSA public key committed in the offer we are paying, if it was
+		// a post-quantum offer. The responding `Bolt12Invoice` must carry a valid ML-DSA signature
+		// anchored to this key, else we refuse to pay (downgrade/substitution defense). Carried as the
+		// raw serialized key (1312 bytes) in a non-gated `Option` so vanilla serialization is
+		// byte-identical (the field is `None` and writes an absent TLV).
+		offer_pq_id: Option<Vec<u8>>,
 	},
 	// Represents the state after the invoice has been received, transitioning from the corresponding
 	// `AwaitingInvoice` state.
@@ -723,6 +729,12 @@ pub enum Bolt12PaymentError {
 	/// [`StaticInvoice`]: crate::offers::static_invoice::StaticInvoice
 	/// [`HeldHtlcAvailable`]: crate::onion_message::async_payments::HeldHtlcAvailable
 	BlindedPathCreationFailed,
+	/// We scanned a post-quantum offer (one committing an ML-DSA issuer key), but the responding
+	/// invoice's ML-DSA signature was absent, did not verify against that key, or could not be
+	/// anchored, so paying it would forgo the offer's post-quantum protection. The payment was not
+	/// sent.
+	#[cfg(feature = "post-quantum")]
+	PqVerificationFailed,
 }
 
 /// Indicates that we failed to send a payment probe. Further errors may be surfaced later via
@@ -1176,7 +1188,7 @@ impl OutboundPayments {
 	{
 
 		let (payment_hash, retry_strategy, params_config, _) = self
-			.mark_invoice_received_and_get_details(invoice, payment_id)?;
+			.mark_invoice_received_and_get_details(invoice, payment_id, logger)?;
 
 		if invoice.invoice_features().requires_unknown_bits_from(&features) {
 			self.abandon_payment(
@@ -1387,10 +1399,10 @@ impl OutboundPayments {
 		Ok(())
 	}
 
-	pub(super) fn static_invoice_received<ES: EntropySource>(
+	pub(super) fn static_invoice_received<ES: EntropySource, L: Logger>(
 		&self, invoice: &StaticInvoice, payment_id: PaymentId, features: Bolt12InvoiceFeatures,
 		best_block_height: u32, duration_since_epoch: Duration, entropy_source: ES,
-		pending_events: &Mutex<VecDeque<(events::Event, Option<EventCompletionAction>)>>,
+		pending_events: &Mutex<VecDeque<(events::Event, Option<EventCompletionAction>)>>, logger: &L,
 	) -> Result<(), Bolt12PaymentError> {
 		macro_rules! abandon_with_entry {
 			($payment: expr, $reason: expr) => {
@@ -1413,6 +1425,7 @@ impl OutboundPayments {
 					retry_strategy,
 					retryable_invoice_request,
 					route_params_config,
+					offer_pq_id,
 					..
 				} => {
 					let invreq = &retryable_invoice_request
@@ -1422,6 +1435,25 @@ impl OutboundPayments {
 					if !invoice.is_from_same_offer(invreq) {
 						return Err(Bolt12PaymentError::UnexpectedInvoice);
 					}
+					// PQ: if we paid a post-quantum offer (one committing an ML-DSA issuer key), the
+					// static invoice served on the recipient's behalf must carry a valid ML-DSA
+					// signature anchored to that key, else a quantum attacker could downgrade the
+					// payment from the (verified) `Bolt12Invoice` path to this otherwise-unverified
+					// static-invoice path to redirect it. Reject before paying, leaving the payment in
+					// AwaitingInvoice.
+					#[cfg(feature = "post-quantum")]
+					if let Some(anchor_bytes) = offer_pq_id {
+						let anchor: Option<[u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]> =
+							(&anchor_bytes[..]).try_into().ok();
+						let result = invoice.verify_pq_signature(anchor.as_ref(), logger);
+						if result != crate::offers::invoice::Bolt12PqVerification::Verified {
+							log_error!(logger, "PQ: refusing to pay BOLT 12 static invoice: ML-DSA verification returned {:?} against the offer's committed key", result);
+							return Err(Bolt12PaymentError::PqVerificationFailed);
+						}
+						log_info!(logger, "PQ: verified BOLT 12 static invoice ML-DSA signature against the offer's committed key before paying");
+					}
+					#[cfg(not(feature = "post-quantum"))]
+					let _ = (offer_pq_id, logger);
 					if invoice.invoice_features().requires_unknown_bits_from(&features) {
 						abandon_with_entry!(entry, PaymentFailureReason::UnknownRequiredFeatures);
 						return Err(Bolt12PaymentError::UnknownRequiredFeatures);
@@ -2216,7 +2248,7 @@ impl OutboundPayments {
 	pub(super) fn add_new_awaiting_invoice(
 		&self, payment_id: PaymentId, expiration: StaleExpiration, retry_strategy: Retry,
 		route_params_config: RouteParametersConfig,
-		retryable_invoice_request: Option<RetryableInvoiceRequest>,
+		retryable_invoice_request: Option<RetryableInvoiceRequest>, offer_pq_id: Option<Vec<u8>>,
 	) -> Result<(), ()> {
 		let mut pending_outbounds = self.pending_outbound_payments.lock().unwrap();
 		match pending_outbounds.entry(payment_id) {
@@ -2230,6 +2262,7 @@ impl OutboundPayments {
 					retry_strategy,
 					route_params_config,
 					retryable_invoice_request,
+					offer_pq_id,
 				});
 
 				Ok(())
@@ -2238,10 +2271,10 @@ impl OutboundPayments {
 	}
 
 	#[rustfmt::skip]
-	pub(super) fn mark_invoice_received(
-		&self, invoice: &Bolt12Invoice, payment_id: PaymentId
+	pub(super) fn mark_invoice_received<L: Logger>(
+		&self, invoice: &Bolt12Invoice, payment_id: PaymentId, logger: &L,
 	) -> Result<(), Bolt12PaymentError> {
-		self.mark_invoice_received_and_get_details(invoice, payment_id)
+		self.mark_invoice_received_and_get_details(invoice, payment_id, logger)
 			.and_then(|(_, _, _, is_newly_marked)| {
 				is_newly_marked
 					.then_some(())
@@ -2250,14 +2283,34 @@ impl OutboundPayments {
 	}
 
 	#[rustfmt::skip]
-	fn mark_invoice_received_and_get_details(
-		&self, invoice: &Bolt12Invoice, payment_id: PaymentId
+	fn mark_invoice_received_and_get_details<L: Logger>(
+		&self, invoice: &Bolt12Invoice, payment_id: PaymentId, logger: &L,
 	) -> Result<(PaymentHash, Retry, RouteParametersConfig, bool), Bolt12PaymentError> {
 		match self.pending_outbound_payments.lock().unwrap().entry(payment_id) {
 			hash_map::Entry::Occupied(entry) => match entry.get() {
 				PendingOutboundPayment::AwaitingInvoice {
-					retry_strategy: retry, route_params_config, ..
+					retry_strategy: retry, route_params_config, offer_pq_id, ..
 				} => {
+					// PQ: if we paid a post-quantum offer (one committing an ML-DSA issuer key), the
+					// responding invoice must carry a valid ML-DSA signature anchored to that key before we
+					// pay, so a quantum attacker cannot substitute, tamper with, or downgrade (strip the
+					// signature from) the invoice to redirect the payment. Checked once at the
+					// AwaitingInvoice -> InvoiceReceived transition (both the automatic and manual-handling
+					// paths pass through here), leaving the payment in AwaitingInvoice on failure.
+					#[cfg(feature = "post-quantum")]
+					if let Some(anchor_bytes) = offer_pq_id {
+						let anchor: Option<[u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]> =
+							(&anchor_bytes[..]).try_into().ok();
+						let result = invoice.verify_pq_signature(anchor.as_ref(), logger);
+						if result != crate::offers::invoice::Bolt12PqVerification::Verified {
+							log_error!(logger, "PQ: refusing to pay BOLT 12 invoice: ML-DSA verification returned {:?} against the offer's committed key", result);
+							return Err(Bolt12PaymentError::PqVerificationFailed);
+						}
+						log_info!(logger, "PQ: verified BOLT 12 invoice ML-DSA signature against the offer's committed key before paying");
+					}
+					#[cfg(not(feature = "post-quantum"))]
+					let _ = (offer_pq_id, logger);
+
 					let payment_hash = invoice.payment_hash();
 					let retry = *retry;
 					let config = *route_params_config;
@@ -2975,6 +3028,8 @@ impl_writeable_tlv_based_enum_upgradable!(PendingOutboundPayment,
 				|fee_msat| RouteParametersConfig::default().with_max_total_routing_fee_msat(fee_msat)
 			)
 		))),
+		// PQ: the post-quantum offer's committed ML-DSA issuer key (absent for a classical offer).
+		(9, offer_pq_id, option),
 	},
 	(7, InvoiceReceived) => {
 		(0, payment_hash, required),
@@ -3285,7 +3340,7 @@ mod tests {
 		assert!(!outbound_payments.has_pending_payments());
 		assert!(
 			outbound_payments.add_new_awaiting_invoice(
-				payment_id, expiration, Retry::Attempts(0), RouteParametersConfig::default(), None,
+				payment_id, expiration, Retry::Attempts(0), RouteParametersConfig::default(), None, None,
 			).is_ok()
 		);
 		assert!(outbound_payments.has_pending_payments());
@@ -3315,14 +3370,14 @@ mod tests {
 
 		assert!(
 			outbound_payments.add_new_awaiting_invoice(
-				payment_id, expiration, Retry::Attempts(0), RouteParametersConfig::default(), None,
+				payment_id, expiration, Retry::Attempts(0), RouteParametersConfig::default(), None, None,
 			).is_ok()
 		);
 		assert!(outbound_payments.has_pending_payments());
 
 		assert!(
 			outbound_payments.add_new_awaiting_invoice(
-				payment_id, expiration, Retry::Attempts(0), RouteParametersConfig::default(), None,
+				payment_id, expiration, Retry::Attempts(0), RouteParametersConfig::default(), None, None,
 			).is_err()
 		);
 	}
@@ -3339,7 +3394,7 @@ mod tests {
 		assert!(!outbound_payments.has_pending_payments());
 		assert!(
 			outbound_payments.add_new_awaiting_invoice(
-				payment_id, expiration, Retry::Attempts(0), RouteParametersConfig::default(), None,
+				payment_id, expiration, Retry::Attempts(0), RouteParametersConfig::default(), None, None,
 			).is_ok()
 		);
 		assert!(outbound_payments.has_pending_payments());
@@ -3369,14 +3424,14 @@ mod tests {
 
 		assert!(
 			outbound_payments.add_new_awaiting_invoice(
-				payment_id, expiration, Retry::Attempts(0), RouteParametersConfig::default(), None,
+				payment_id, expiration, Retry::Attempts(0), RouteParametersConfig::default(), None, None,
 			).is_ok()
 		);
 		assert!(outbound_payments.has_pending_payments());
 
 		assert!(
 			outbound_payments.add_new_awaiting_invoice(
-				payment_id, expiration, Retry::Attempts(0), RouteParametersConfig::default(), None,
+				payment_id, expiration, Retry::Attempts(0), RouteParametersConfig::default(), None, None,
 			).is_err()
 		);
 	}
@@ -3392,7 +3447,7 @@ mod tests {
 		assert!(!outbound_payments.has_pending_payments());
 		assert!(
 			outbound_payments.add_new_awaiting_invoice(
-				payment_id, expiration, Retry::Attempts(0), RouteParametersConfig::default(), None,
+				payment_id, expiration, Retry::Attempts(0), RouteParametersConfig::default(), None, None,
 			).is_ok()
 		);
 		assert!(outbound_payments.has_pending_payments());
@@ -3433,7 +3488,7 @@ mod tests {
 
 		assert!(
 			outbound_payments.add_new_awaiting_invoice(
-				payment_id, expiration, Retry::Attempts(0), RouteParametersConfig::default(), None,
+				payment_id, expiration, Retry::Attempts(0), RouteParametersConfig::default(), None, None,
 			).is_ok()
 		);
 		assert!(outbound_payments.has_pending_payments());
@@ -3470,6 +3525,94 @@ mod tests {
 	}
 
 	#[test]
+	#[cfg(all(feature = "post-quantum", feature = "std"))]
+	#[rustfmt::skip]
+	fn pq_pay_path_enforces_bolt12_invoice_signature() {
+		// A payer that scanned a post-quantum offer (one committing an ML-DSA issuer key)
+		// must refuse to pay the responding invoice unless it carries a valid ML-DSA signature
+		// anchored to that key. Drive the real pay path (`send_payment_for_bolt12_invoice`) with the
+		// offer's key stored as the pending-payment anchor and assert: (a) a correctly signed invoice
+		// passes the post-quantum check and only fails later on its (deliberately) expired timestamp,
+		// (b) an invoice with no ML-DSA signature is rejected as a downgrade, and (c) a correctly
+		// signed invoice is rejected when the payer is anchored to the wrong key (a substitution).
+		use crate::offers::invoice::Bolt12Invoice;
+		use crate::offers::invoice_request::InvoiceRequestVerifiedFromOffer;
+
+		let logger = test_utils::TestLogger::new();
+		let logger_ref = &logger;
+		let log = WithContext::from(&logger_ref, None, None, Some(PaymentHash([0; 32])));
+		let network_graph = Arc::new(NetworkGraph::new(Network::Testnet, &logger));
+		let scorer = RwLock::new(test_utils::TestScorer::new());
+		let router = test_utils::TestRouter::new(network_graph, &logger, &scorer);
+		let secp_ctx = Secp256k1::new();
+		let keys_manager = test_utils::TestKeysInterface::new(&[0; 32], Network::Testnet);
+		let expanded_key = ExpandedKey::new([42; 32]);
+		let nonce = Nonce::from_entropy_source(&FixedEntropy {});
+		let node_id = recipient_pubkey();
+		let payment_id = PaymentId([0; 32]);
+
+		// A post-quantum offer (derived signing pubkey + blinded path) commits an ML-DSA issuer key.
+		let offer = OfferBuilder::deriving_signing_pubkey(node_id, &expanded_key, nonce, &secp_ctx)
+			.amount_msats(1000)
+			.path(blinded_path())
+			.build().unwrap();
+		let anchor = offer.issuer_pq_id().expect("a post-quantum offer commits an ML-DSA issuer key");
+
+		// Build the responding invoice, optionally attaching the ML-DSA signature (as the recipient's
+		// `ChannelManager` does). The timestamp is expired so a post-quantum-verified invoice still
+		// fails afterwards, letting us distinguish "passed verification" from "rejected".
+		let created_at = now() - DEFAULT_RELATIVE_EXPIRY;
+		let build_invoice = |attach_pq_sig: bool| {
+			let verified = offer
+				.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id).unwrap()
+				.build_and_sign().unwrap()
+				.verify_using_recipient_data(nonce, &expanded_key, &secp_ctx).unwrap();
+			match verified {
+				InvoiceRequestVerifiedFromOffer::DerivedKeys(req) => {
+					let pq_seed = req.pq_seed.expect("a verified derived request carries a PQ seed");
+					req.respond_using_derived_keys_no_std(payment_paths(), payment_hash(), created_at).unwrap()
+						.build_and_sign_pq(&secp_ctx, if attach_pq_sig { Some(&pq_seed) } else { None })
+						.unwrap()
+				},
+				_ => panic!("expected an invoice request verified with derived keys"),
+			}
+		};
+
+		let pay = |invoice: &Bolt12Invoice, anchor_bytes: Option<Vec<u8>>| {
+			let outbound_payments = OutboundPayments::new(new_hash_map());
+			let expiration = StaleExpiration::AbsoluteTimeout(Duration::from_secs(u64::MAX / 2));
+			assert!(outbound_payments.add_new_awaiting_invoice(
+				payment_id, expiration, Retry::Attempts(0), RouteParametersConfig::default(), None, anchor_bytes,
+			).is_ok());
+			let pending_events = Mutex::new(VecDeque::new());
+			outbound_payments.send_payment_for_bolt12_invoice(
+				invoice, payment_id, &&router, vec![], Bolt12InvoiceFeatures::empty(),
+				|| InFlightHtlcs::new(), &&keys_manager, &&keys_manager, &EmptyNodeIdLookUp {},
+				&secp_ctx, 0, &pending_events, |_| panic!("should not send"), &log,
+			)
+		};
+
+		// (a) Correctly signed: passes the ML-DSA check, so it only fails on the expired timestamp.
+		assert_eq!(
+			pay(&build_invoice(true), Some(anchor.to_vec())),
+			Err(Bolt12PaymentError::SendingFailed(RetryableSendFailure::PaymentExpired)),
+		);
+
+		// (b) No ML-DSA signature (a quantum downgrade): rejected before paying.
+		assert_eq!(
+			pay(&build_invoice(false), Some(anchor.to_vec())),
+			Err(Bolt12PaymentError::PqVerificationFailed),
+		);
+
+		// (c) Correctly signed but anchored to the wrong key (a substitution): rejected.
+		let (_wrong_sk, wrong_pk) = crate::sign::pq::keypair_from_seed(&[7u8; 32]);
+		assert_eq!(
+			pay(&build_invoice(true), Some(wrong_pk.to_vec())),
+			Err(Bolt12PaymentError::PqVerificationFailed),
+		);
+	}
+
+	#[test]
 	#[rustfmt::skip]
 	fn fails_finding_route_for_bolt12_invoice() {
 		let logger = test_utils::TestLogger::new();
@@ -3502,7 +3645,7 @@ mod tests {
 		assert!(
 			outbound_payments.add_new_awaiting_invoice(
 				payment_id, expiration, Retry::Attempts(0),
-				route_params_config, None,
+				route_params_config, None, None,
 			).is_ok()
 		);
 		assert!(outbound_payments.has_pending_payments());
@@ -3606,7 +3749,7 @@ mod tests {
 
 		assert!(
 			outbound_payments.add_new_awaiting_invoice(
-				payment_id, expiration, Retry::Attempts(0), route_params_config, None,
+				payment_id, expiration, Retry::Attempts(0), route_params_config, None, None,
 			).is_ok()
 		);
 		assert!(outbound_payments.has_pending_payments());

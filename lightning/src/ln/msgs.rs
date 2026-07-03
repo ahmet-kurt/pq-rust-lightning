@@ -815,6 +815,11 @@ pub struct OnionMessage {
 	pub blinding_point: PublicKey,
 	/// The full onion packet including hop data, pubkey, and hmac
 	pub onion_routing_packet: onion_message::packet::Packet,
+	/// On a post-quantum blinded path, the ML-KEM ciphertext this hop decapsulates to reconstruct
+	/// its hybrid per-hop secret. Travels after the onion packet; absent (and unserialized) on a
+	/// classical path, so a classical onion message stays byte-identical to vanilla.
+	#[cfg(feature = "post-quantum")]
+	pub kem_ciphertext: Option<[u8; crate::crypto::pq_kem::PQ_KEM_CT_LEN]>,
 }
 
 /// An [`update_fulfill_htlc`] message to be sent to or received from a peer.
@@ -3583,6 +3588,19 @@ impl LengthReadable for OnionMessage {
 			<onion_message::packet::Packet as LengthReadable>::read_from_fixed_length_buffer(
 				&mut packet_reader,
 			)?;
+		#[cfg(feature = "post-quantum")]
+		{
+			// A post-quantum onion message carries the receiving hop's ML-KEM ciphertext after
+			// the onion packet; a classical message leaves no trailing bytes.
+			let kem_ciphertext =
+				if r.remaining_bytes() >= crate::crypto::pq_kem::PQ_KEM_CT_LEN as u64 {
+					Some(Readable::read(r)?)
+				} else {
+					None
+				};
+			return Ok(Self { blinding_point, onion_routing_packet, kem_ciphertext });
+		}
+		#[cfg(not(feature = "post-quantum"))]
 		Ok(Self { blinding_point, onion_routing_packet })
 	}
 }
@@ -3593,6 +3611,10 @@ impl Writeable for OnionMessage {
 		let onion_packet_len = self.onion_routing_packet.serialized_length();
 		(onion_packet_len as u16).write(w)?;
 		self.onion_routing_packet.write(w)?;
+		#[cfg(feature = "post-quantum")]
+		if let Some(ref kem_ciphertext) = self.kem_ciphertext {
+			kem_ciphertext.write(w)?;
+		}
 		Ok(())
 	}
 }

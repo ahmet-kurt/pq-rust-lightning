@@ -24,12 +24,13 @@ pub const PQ_PUBLIC_KEY_LEN: usize = PK_LEN;
 pub const PQ_SIGNATURE_LEN: usize = SIG_LEN;
 
 /// An ML-DSA-44 secret key, used to produce post-quantum signatures over gossip messages and
-/// BOLT 11 invoices.
+/// BOLT 11 and BOLT 12 invoices.
 pub struct PqSecretKey(PrivateKey);
 
 /// Deterministically derives an ML-DSA-44 keypair from a 32-byte seed, returning the secret
-/// key and the serialized public key. Used for the node's ML-DSA identity, seeded from the
-/// node's entropy so it is recoverable from the same backup as the node's secret key.
+/// key and the serialized public key. Used both for the node's ML-DSA identity (seeded from the
+/// node's entropy, so it is recoverable from the same backup as the node's secret key) and for
+/// per-offer keys (seeded from an HMAC of the node's offer key and the offer's nonce).
 pub(crate) fn keypair_from_seed(seed: &[u8; 32]) -> (PqSecretKey, [u8; PQ_PUBLIC_KEY_LEN]) {
 	let (pk, sk) = ml_dsa_44::KG::keygen_from_seed(seed);
 	(PqSecretKey(sk), pk.into_bytes())
@@ -41,6 +42,12 @@ pub(crate) fn keypair_from_seed(seed: &[u8; 32]) -> (PqSecretKey, [u8; PQ_PUBLIC
 pub const PQ_CONTEXT_BOLT11: &[u8] = b"LDK-PQ-BOLT11-invoice";
 /// Domain-separation context for BOLT 7 gossip signatures (node_announcement, channel_update).
 pub const PQ_CONTEXT_GOSSIP: &[u8] = b"LDK-PQ-BOLT7-gossip";
+/// Domain-separation context for BOLT 12 `invoice` signatures.
+pub const PQ_CONTEXT_BOLT12: &[u8] = b"LDK-PQ-BOLT12-invoice";
+/// Domain-separation context for BOLT 12 `static_invoice` signatures (async payments). Distinct from
+/// the `invoice` context so a signature for one cannot verify as the other even though both are
+/// anchored to the same per-offer ML-DSA key.
+pub const PQ_CONTEXT_BOLT12_STATIC: &[u8] = b"LDK-PQ-BOLT12-static-invoice";
 
 /// Signs the message `msg` with `sk` under domain-separation `context`, returning the ML-DSA-44
 /// signature. We sign the full message rather than a pre-hash so the only hash binding the message
@@ -69,10 +76,10 @@ pub fn verify(
 // of a gossip message's `excess_data`. Odd types are ignored by nodes which do not understand them,
 // so vanilla nodes treat these as opaque excess data and still verify the classical signature. A
 // node_announcement may also carry the node's static ML-KEM (FIPS 203) encapsulation key, which
-// post-quantum peers discover and pin via the network graph so they can later encapsulate to the
-// node. That record is written between the public key and the signature, keeping the records
-// ascending in type and, like the public key, covered by both the ML-DSA and the classical
-// signatures.
+// post-quantum senders discover and pin via the network graph so they can encapsulate to the node
+// when building blinded paths and payment onions through it. That record is written between the
+// public key and the signature, keeping the records ascending in type
+// and, like the public key, covered by both the ML-DSA and the classical signatures.
 const PQ_PUBLIC_KEY_RECORD_TYPE: u64 = 27;
 const PQ_KEM_KEY_RECORD_TYPE: u64 = 29;
 const PQ_SIGNATURE_RECORD_TYPE: u64 = 31;
@@ -293,5 +300,134 @@ mod tests {
 		assert_eq!(records.pubkey, Some(pubkey));
 		assert_eq!(records.kem_key, None);
 		assert_eq!(records.signature, Some(signature));
+	}
+}
+
+#[cfg(test)]
+mod timing_tests {
+	use super::*;
+	use crate::crypto::pq_kem;
+
+	use bitcoin::secp256k1::{
+		ecdh, Keypair, Message, PublicKey as SecpPublicKey, Secp256k1, SecretKey,
+	};
+
+	use core::hint::black_box;
+	use std::time::Instant;
+
+	const ITERS: usize = 1000;
+	const MSG_LEN: usize = 300;
+
+	fn seed(i: usize) -> [u8; 32] {
+		let mut seed = [0x5au8; 32];
+		seed[..8].copy_from_slice(&(i as u64).to_le_bytes());
+		seed
+	}
+
+	fn message(i: usize) -> Vec<u8> {
+		let mut msg = vec![0x33u8; MSG_LEN];
+		msg[..8].copy_from_slice(&(i as u64).to_le_bytes());
+		msg
+	}
+
+	/// Runs `op` once per prepared input, after a short untimed warmup, and returns the per-call
+	/// wall times in microseconds.
+	fn time_each<T, F: FnMut(usize) -> T>(mut op: F) -> Vec<f64> {
+		for _ in 0..10 {
+			black_box(op(0));
+		}
+		let mut samples = Vec::with_capacity(ITERS);
+		for i in 0..ITERS {
+			let start = Instant::now();
+			black_box(op(i));
+			samples.push(start.elapsed().as_secs_f64() * 1_000_000.0);
+		}
+		samples
+	}
+
+	fn report(name: &str, samples: &[f64]) {
+		let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+		let var = samples.iter().map(|s| (s - mean) * (s - mean)).sum::<f64>()
+			/ (samples.len() - 1) as f64;
+		println!("{: <24} mean {: >9.2} us   std {: >8.2} us", name, mean, var.sqrt());
+	}
+
+	/// Measures the post-quantum primitives through the same entry points the production code
+	/// calls, next to the classical secp256k1 operations used on the same surfaces, so the
+	/// per-operation computational overhead can be reported. Ignored by default; run manually in
+	/// release mode with
+	/// `cargo test -p lightning --lib --features post-quantum --release -- timing_tests --ignored --nocapture`.
+	#[test]
+	#[ignore]
+	fn measure_primitive_timings() {
+		println!("{} iterations per operation, {} byte messages", ITERS, MSG_LEN);
+
+		let seeds: Vec<[u8; 32]> = (0..ITERS).map(seed).collect();
+		let msgs: Vec<Vec<u8>> = (0..ITERS).map(message).collect();
+
+		report("ML-DSA-44 keygen", &time_each(|i| keypair_from_seed(&seeds[i])));
+		let dsa_keys: Vec<_> = seeds.iter().map(keypair_from_seed).collect();
+		report("ML-DSA-44 sign", &time_each(|i| sign(&dsa_keys[i].0, &msgs[i], PQ_CONTEXT_GOSSIP)));
+		let sigs: Vec<_> =
+			(0..ITERS).map(|i| sign(&dsa_keys[i].0, &msgs[i], PQ_CONTEXT_GOSSIP)).collect();
+		report(
+			"ML-DSA-44 verify",
+			&time_each(|i| verify(&dsa_keys[i].1, &msgs[i], &sigs[i], PQ_CONTEXT_GOSSIP)),
+		);
+
+		report("ML-KEM-768 keygen", &time_each(|i| pq_kem::keypair_from_seed(&seeds[i])));
+		let kem_keys: Vec<_> = seeds.iter().map(|s| pq_kem::keypair_from_seed(s)).collect();
+		report(
+			"ML-KEM-768 encapsulate",
+			&time_each(|i| pq_kem::encapsulate(&kem_keys[i].0, &seeds[i]).unwrap()),
+		);
+		let cts: Vec<_> =
+			(0..ITERS).map(|i| pq_kem::encapsulate(&kem_keys[i].0, &seeds[i]).unwrap().1).collect();
+		report(
+			"ML-KEM-768 decapsulate",
+			&time_each(|i| pq_kem::decapsulate(&kem_keys[i].1, &cts[i]).unwrap()),
+		);
+
+		let secp = Secp256k1::new();
+		report(
+			"secp256k1 keygen",
+			&time_each(|i| {
+				let sk = SecretKey::from_slice(&seeds[i]).unwrap();
+				SecpPublicKey::from_secret_key(&secp, &sk)
+			}),
+		);
+		let sks: Vec<_> = seeds.iter().map(|s| SecretKey::from_slice(s).unwrap()).collect();
+		let pks: Vec<_> = sks.iter().map(|sk| SecpPublicKey::from_secret_key(&secp, sk)).collect();
+		let digests: Vec<_> = (0..ITERS).map(|i| Message::from_digest(seed(i))).collect();
+		report("ECDSA sign", &time_each(|i| secp.sign_ecdsa(&digests[i], &sks[i])));
+		let ecdsa_sigs: Vec<_> = (0..ITERS).map(|i| secp.sign_ecdsa(&digests[i], &sks[i])).collect();
+		report(
+			"ECDSA verify",
+			&time_each(|i| secp.verify_ecdsa(&digests[i], &ecdsa_sigs[i], &pks[i]).unwrap()),
+		);
+		let keypairs: Vec<_> = sks.iter().map(|sk| Keypair::from_secret_key(&secp, sk)).collect();
+		report(
+			"Schnorr sign",
+			&time_each(|i| secp.sign_schnorr_no_aux_rand(&digests[i], &keypairs[i])),
+		);
+		let schnorr_sigs: Vec<_> =
+			(0..ITERS).map(|i| secp.sign_schnorr_no_aux_rand(&digests[i], &keypairs[i])).collect();
+		let xonly: Vec<_> = keypairs.iter().map(|kp| kp.x_only_public_key().0).collect();
+		report(
+			"Schnorr verify",
+			&time_each(|i| secp.verify_schnorr(&schnorr_sigs[i], &digests[i], &xonly[i]).unwrap()),
+		);
+		report("ECDH", &time_each(|i| ecdh::SharedSecret::new(&pks[(i + 1) % ITERS], &sks[i])));
+
+		let kem_secrets: Vec<_> =
+			(0..ITERS).map(|i| pq_kem::decapsulate(&kem_keys[i].1, &cts[i]).unwrap()).collect();
+		let classical_secrets: Vec<_> =
+			(0..ITERS).map(|i| ecdh::SharedSecret::new(&pks[(i + 1) % ITERS], &sks[i])).collect();
+		report(
+			"hybrid secret fold",
+			&time_each(|i| {
+				pq_kem::mix_payment_onion_secret(classical_secrets[i].as_ref(), &kem_secrets[i])
+			}),
+		);
 	}
 }

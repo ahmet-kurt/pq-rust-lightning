@@ -113,6 +113,11 @@ pub struct StaticInvoiceBuilder<'a> {
 	offer_bytes: &'a Vec<u8>,
 	invoice: InvoiceContents,
 	keys: Keypair,
+	// PQ: the per-offer ML-DSA seed re-derived from the recipient's symmetric offer key and the offer
+	// nonce (`Some` only when the offer committed an issuer key), used to sign the static invoice with
+	// an ML-DSA signature anchored to the offer's committed key, mirroring a `Bolt12Invoice`.
+	#[cfg(feature = "post-quantum")]
+	pq_seed: Option<[u8; 32]>,
 }
 
 impl<'a> StaticInvoiceBuilder<'a> {
@@ -158,7 +163,20 @@ impl<'a> StaticInvoiceBuilder<'a> {
 			signing_pubkey,
 		);
 
-		Ok(Self { offer_bytes: &offer.bytes, invoice, keys })
+		// PQ: re-derive the per-offer ML-DSA seed (the recipient controls the offer's symmetric key
+		// and nonce), so `build_and_sign` can anchor an ML-DSA signature to the key the offer committed.
+		#[cfg(feature = "post-quantum")]
+		let pq_seed = offer
+			.issuer_pq_id()
+			.map(|_| crate::offers::signer::recover_offer_pq_seed(expanded_key, nonce));
+
+		Ok(Self {
+			offer_bytes: &offer.bytes,
+			invoice,
+			keys,
+			#[cfg(feature = "post-quantum")]
+			pq_seed,
+		})
 	}
 
 	/// Builds an [`UnsignedStaticInvoice`] after checking for valid semantics, returning it along with
@@ -178,7 +196,7 @@ impl<'a> StaticInvoiceBuilder<'a> {
 			}
 		}
 
-		let Self { offer_bytes, invoice, keys } = self;
+		let Self { offer_bytes, invoice, keys, .. } = self;
 		Ok((UnsignedStaticInvoice::new(&offer_bytes, invoice), keys))
 	}
 
@@ -186,7 +204,16 @@ impl<'a> StaticInvoiceBuilder<'a> {
 	pub fn build_and_sign<T: secp256k1::Signing>(
 		self, secp_ctx: &Secp256k1<T>,
 	) -> Result<StaticInvoice, Bolt12SemanticError> {
-		let (unsigned_invoice, keys) = self.build()?;
+		#[cfg(feature = "post-quantum")]
+		let pq_seed = self.pq_seed;
+		#[allow(unused_mut)]
+		let (mut unsigned_invoice, keys) = self.build()?;
+		// PQ: attach the hybrid ML-DSA signature anchored to the offer's committed key (and convey the
+		// post-quantum blinded payment paths' ciphertext lists) before the classical signing, so the
+		// classical signature covers the records and a payer verifies the static invoice the same way
+		// it verifies a `Bolt12Invoice`.
+		#[cfg(feature = "post-quantum")]
+		unsigned_invoice.append_pq_records(pq_seed.as_ref());
 		let invoice = unsigned_invoice
 			.sign(|message: &UnsignedStaticInvoice| {
 				Ok(secp_ctx.sign_schnorr_no_aux_rand(message.tagged_hash.as_digest(), &keys))
@@ -340,6 +367,40 @@ impl UnsignedStaticInvoice {
 		let tagged_hash = TaggedHash::from_tlv_stream(SIGNATURE_TAG, tlv_stream);
 
 		Self { bytes, experimental_bytes, contents, tagged_hash }
+	}
+
+	/// PQ: derives the issuer's per-offer ML-DSA key from `pq_seed` (when present) and inserts an
+	/// ML-DSA signature record over the static invoice's signable bytes, plus the post-quantum
+	/// blinded payment paths' per-hop ML-KEM ciphertext record, into the experimental TLV bytes,
+	/// then recomputes the tagged hash so the classical signature covers the new records; the
+	/// static-invoice counterpart of [`UnsignedBolt12Invoice::append_pq_records`]. The payer
+	/// verifies the signature via [`StaticInvoice::verify_pq_signature`]; the seed is the one the
+	/// recipient re-derives from its symmetric offer key and the offer nonce.
+	///
+	/// [`UnsignedBolt12Invoice::append_pq_records`]: crate::offers::invoice::UnsignedBolt12Invoice
+	#[cfg(feature = "post-quantum")]
+	pub(crate) fn append_pq_records(&mut self, pq_seed: Option<&[u8; 32]>) {
+		let signature = pq_seed.map(|pq_seed| {
+			let (pq_secret, _pq_pubkey) = crate::sign::pq::keypair_from_seed(pq_seed);
+			let mut signable = crate::offers::pq::pq_signable_bytes(&self.bytes);
+			signable
+				.extend_from_slice(&crate::offers::pq::pq_signable_bytes(&self.experimental_bytes));
+			crate::sign::pq::sign(&pq_secret, &signable, crate::sign::pq::PQ_CONTEXT_BOLT12_STATIC)
+		});
+		let kem_cts: Vec<(usize, Vec<u8>)> = self
+			.contents
+			.payment_paths
+			.iter()
+			.enumerate()
+			.filter_map(|(idx, path)| path.kem_ct().map(|ct| (idx, ct)))
+			.collect();
+		crate::offers::pq::insert_invoice_pq_records(
+			&mut self.experimental_bytes,
+			signature.as_ref(),
+			&kem_cts,
+		);
+		let tlv_stream = TlvStream::new(&self.bytes).chain(TlvStream::new(&self.experimental_bytes));
+		self.tagged_hash = TaggedHash::from_tlv_stream(SIGNATURE_TAG, tlv_stream);
 	}
 
 	/// Signs the [`TaggedHash`] of the invoice using the given function.
@@ -590,6 +651,76 @@ impl LengthReadable for StaticInvoice {
 	}
 }
 
+#[cfg(feature = "post-quantum")]
+impl StaticInvoice {
+	/// Verifies the static invoice's post-quantum (ML-DSA) signature against the issuer's per-offer key
+	/// committed in the offer the payer holds, which the caller passes as `trusted_offer_pq_id` (see
+	/// [`Offer::issuer_pq_id`]). The echoed offer key is never trusted as the anchor.
+	///
+	/// A payer that scanned a post-quantum offer must require [`Bolt12PqVerification::Verified`] and
+	/// reject [`Bolt12PqVerification::Absent`] (a downgrade) before paying. This is the static-invoice
+	/// counterpart of [`Bolt12Invoice::verify_pq_signature`].
+	///
+	/// [`Offer::issuer_pq_id`]: crate::offers::offer::Offer::issuer_pq_id
+	/// [`Bolt12Invoice::verify_pq_signature`]: crate::offers::invoice::Bolt12Invoice::verify_pq_signature
+	pub fn verify_pq_signature<L: crate::util::logger::Logger>(
+		&self, trusted_offer_pq_id: Option<&[u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]>, logger: &L,
+	) -> crate::offers::invoice::Bolt12PqVerification {
+		use crate::offers::invoice::Bolt12PqVerification;
+		let signature = match crate::offers::pq::parse_invoice_pq_signature(&self.bytes) {
+			Some(sig) => sig,
+			None => {
+				log_debug!(logger, "PQ: BOLT 12 static invoice carries no ML-DSA signature");
+				return Bolt12PqVerification::Absent;
+			},
+		};
+		let anchor = match trusted_offer_pq_id {
+			Some(pk) => pk,
+			None => {
+				log_debug!(logger, "PQ: BOLT 12 static invoice carries an ML-DSA signature but no offer key is available to verify it (unanchored)");
+				return Bolt12PqVerification::Unanchored;
+			},
+		};
+		let signable = crate::offers::pq::pq_signable_bytes(&self.bytes);
+		if crate::sign::pq::verify(anchor, &signable, &signature, crate::sign::pq::PQ_CONTEXT_BOLT12_STATIC)
+		{
+			log_debug!(logger, "PQ: verified BOLT 12 static invoice ML-DSA signature against the offer's committed key");
+			Bolt12PqVerification::Verified
+		} else {
+			log_debug!(logger, "PQ: BOLT 12 static invoice ML-DSA signature failed verification against the offer's committed key (substituted key, tampered body, or tampered signature)");
+			Bolt12PqVerification::Invalid
+		}
+	}
+}
+
+#[cfg(all(test, feature = "post-quantum"))]
+impl StaticInvoice {
+	/// Test-only: returns a copy of this static invoice with its ML-DSA signature record removed,
+	/// simulating the downgraded static invoice a quantum attacker would serve to a payer that
+	/// scanned a post-quantum offer. The record now sits inside the classically signed experimental
+	/// range, so stripping it also breaks the classical Schnorr signature; the copy is built
+	/// field-wise (a quantum attacker would instead re-sign with the Shor-recovered signing key).
+	pub(crate) fn test_strip_pq_signature(&self) -> StaticInvoice {
+		use crate::util::ser::{BigSize, Readable};
+		let mut out = Vec::with_capacity(self.bytes.len());
+		let mut cursor = crate::io::Cursor::new(&self.bytes[..]);
+		let total = self.bytes.len() as u64;
+		while cursor.position() < total {
+			let start = cursor.position() as usize;
+			let typ = BigSize::read(&mut cursor).unwrap().0;
+			let len = BigSize::read(&mut cursor).unwrap().0;
+			let end = cursor.position() as usize + len as usize;
+			if typ != crate::offers::pq::INVOICE_PQ_SIGNATURE_TYPE {
+				out.extend_from_slice(&self.bytes[start..end]);
+			}
+			cursor.set_position(end as u64);
+		}
+		let mut stripped = self.clone();
+		stripped.bytes = out;
+		stripped
+	}
+}
+
 impl TryFrom<Vec<u8>> for StaticInvoice {
 	type Error = Bolt12ParseError;
 
@@ -659,6 +790,20 @@ impl TryFrom<ParsedMessage<FullInvoiceTlvStream>> for StaticInvoice {
 		let tagged_hash = TaggedHash::from_valid_tlv_stream_bytes(SIGNATURE_TAG, &bytes);
 		let pubkey = contents.signing_pubkey;
 		merkle::verify_signature(&signature, &tagged_hash, pubkey)?;
+
+		// PQ: re-attach each post-quantum blinded payment path's in-memory ML-KEM ciphertext list,
+		// conveyed in the static invoice's TLV-243 record (the lists are not part of a path's own
+		// serialization), so the payer can use the hybrid blinded tail.
+		#[cfg(feature = "post-quantum")]
+		let contents = {
+			let mut contents = contents;
+			for (idx, ct) in crate::offers::pq::parse_invoice_pq_kem_cts(&bytes) {
+				if let Some(path) = contents.payment_paths.get_mut(idx) {
+					path.set_kem_ct(Some(ct));
+				}
+			}
+			contents
+		};
 
 		let offer_id = OfferId::from_valid_bolt12_tlv_stream(&bytes);
 		Ok(StaticInvoice { bytes, contents, signature, offer_id })
@@ -847,6 +992,74 @@ mod tests {
 		)
 	}
 
+	#[cfg(feature = "post-quantum")]
+	#[test]
+	fn pq_static_invoice_signature_round_trips() {
+		// A post-quantum offer commits a per-offer ML-DSA key, and the recipient's `build_and_sign`
+		// attaches an ML-DSA signature to the static invoice anchored to that key. Assert it verifies,
+		// survives a serialization round-trip (alongside the still-valid classical signature), conveys
+		// the post-quantum payment paths' ML-KEM ciphertext lists, and rejects the adversarial cases.
+		use crate::offers::invoice::Bolt12PqVerification;
+		use crate::sign::pq::keypair_from_seed;
+		use crate::util::test_utils::TestLogger;
+
+		let node_id = recipient_pubkey();
+		let expanded_key = ExpandedKey::new([42; 32]);
+		let nonce = Nonce::from_entropy_source(&FixedEntropy {});
+		let secp_ctx = Secp256k1::new();
+		let logger = TestLogger::new();
+
+		let offer = OfferBuilder::deriving_signing_pubkey(node_id, &expanded_key, nonce, &secp_ctx)
+			.amount_msats(1000)
+			.path(blinded_path())
+			.build()
+			.unwrap();
+		let anchor = offer.issuer_pq_id().expect("a post-quantum offer commits an ML-DSA issuer key");
+
+		let build = |paths| {
+			StaticInvoiceBuilder::for_offer_using_derived_keys(
+				&offer, paths, vec![blinded_path()], now(), &expanded_key, nonce, &secp_ctx,
+			)
+			.unwrap()
+		};
+
+		let static_invoice = build(payment_paths()).build_and_sign(&secp_ctx).unwrap();
+		// Verifies against the offer's committed key, and survives serialization (re-parsing also
+		// re-checks the classical Schnorr signature, so interop holds with the record present).
+		assert_eq!(static_invoice.verify_pq_signature(Some(&anchor), &logger), Bolt12PqVerification::Verified);
+		let reparsed = StaticInvoice::try_from(static_invoice.bytes.clone()).unwrap();
+		assert_eq!(reparsed.verify_pq_signature(Some(&anchor), &logger), Bolt12PqVerification::Verified);
+
+		// Adversarial: a substituted anchor key is rejected; no anchor is `Unanchored`, never protected.
+		let (_wrong_sk, wrong_pk) = keypair_from_seed(&[7u8; 32]);
+		assert_eq!(static_invoice.verify_pq_signature(Some(&wrong_pk), &logger), Bolt12PqVerification::Invalid);
+		assert_eq!(static_invoice.verify_pq_signature(None, &logger), Bolt12PqVerification::Unanchored);
+
+		// A classically-signed static invoice with NO ML-DSA signature (the downgrade an attacker would
+		// serve to dodge the check) is reported `Absent`, which the payer must reject.
+		let (unsigned, keys) = build(payment_paths()).build().unwrap();
+		let unsigned_static = unsigned
+			.sign(|message: &UnsignedStaticInvoice| {
+				Ok(secp_ctx.sign_schnorr_no_aux_rand(message.tagged_hash.as_digest(), &keys))
+			})
+			.unwrap();
+		assert_eq!(unsigned_static.verify_pq_signature(Some(&anchor), &logger), Bolt12PqVerification::Absent);
+
+		// A post-quantum blinded payment path's ML-KEM ciphertext list is conveyed and re-attached
+		// on parse, while a classical path in the same invoice carries none.
+		let mut pq_paths = payment_paths();
+		let ct_list = vec![
+			9u8;
+			crate::ln::onion_utils::PQ_BLINDED_PATH_MAX_HOPS * crate::crypto::pq_kem::PQ_KEM_CT_LEN
+		];
+		pq_paths[0].set_kem_ct(Some(ct_list.clone()));
+		let pq_static = build(pq_paths).build_and_sign(&secp_ctx).unwrap();
+		let reparsed_pq = StaticInvoice::try_from(pq_static.bytes.clone()).unwrap();
+		assert_eq!(reparsed_pq.payment_paths()[0].kem_ct(), Some(ct_list));
+		assert!(reparsed_pq.payment_paths()[1].kem_ct().is_none());
+		assert_eq!(reparsed_pq.verify_pq_signature(Some(&anchor), &logger), Bolt12PqVerification::Verified);
+	}
+
 	#[test]
 	fn builds_invoice_for_offer_with_defaults() {
 		let node_id = recipient_pubkey();
@@ -879,6 +1092,10 @@ mod tests {
 		invoice.write(&mut buffer).unwrap();
 
 		assert_eq!(invoice.bytes, buffer.as_slice());
+		// The static invoice echoes the offer's post-quantum metadata record.
+		#[cfg(feature = "post-quantum")]
+		assert_eq!(invoice.metadata(), offer.metadata());
+		#[cfg(not(feature = "post-quantum"))]
 		assert_eq!(invoice.metadata(), None);
 		assert_eq!(invoice.amount(), None);
 		assert_eq!(invoice.description(), None);
@@ -903,12 +1120,17 @@ mod tests {
 		assert!(merkle::verify_signature(&invoice.signature, &message, signing_pubkey).is_ok());
 
 		let paths = vec![blinded_path()];
+		// The echoed offer records carry the post-quantum metadata record.
+		#[cfg(feature = "post-quantum")]
+		let expected_metadata = offer.metadata();
+		#[cfg(not(feature = "post-quantum"))]
+		let expected_metadata = None;
 		assert_eq!(
 			invoice.as_tlv_stream(),
 			(
 				OfferTlvStreamRef {
 					chains: None,
-					metadata: None,
+					metadata: expected_metadata,
 					currency: None,
 					amount: None,
 					description: None,
@@ -1413,6 +1635,8 @@ mod tests {
 	#[test]
 	fn fails_parsing_invoice_with_invalid_signature() {
 		let mut invoice = invoice();
+		// With the post-quantum feature the last record is the classically covered ML-DSA record
+		// rather than the signature itself, but corrupting either fails signature verification.
 		let last_signature_byte = invoice.bytes.last_mut().unwrap();
 		*last_signature_byte = last_signature_byte.wrapping_add(1);
 
@@ -1661,7 +1885,13 @@ mod tests {
 		let mut encoded_invoice = Vec::new();
 		invoice.write(&mut encoded_invoice).unwrap();
 
-		BigSize(UNKNOWN_ODD_TYPE).write(&mut encoded_invoice).unwrap();
+		// The post-quantum records end the stream at types 3000000241 and 3000000243, so append
+		// past them to keep TLV types ascending.
+		#[cfg(feature = "post-quantum")]
+		let unknown_odd_type = UNKNOWN_ODD_TYPE + 300;
+		#[cfg(not(feature = "post-quantum"))]
+		let unknown_odd_type = UNKNOWN_ODD_TYPE;
+		BigSize(unknown_odd_type).write(&mut encoded_invoice).unwrap();
 		BigSize(32).write(&mut encoded_invoice).unwrap();
 		[42u8; 32].write(&mut encoded_invoice).unwrap();
 

@@ -82,6 +82,12 @@ pub struct OffersMessageFlow<MR: MessageRouter, L: Logger> {
 	secp_ctx: Secp256k1<secp256k1::All>,
 	message_router: MR,
 
+	// PQ: our own static ML-KEM encapsulation key (BIP32 index 10), supplied at construction from the
+	// node signer. Used as the recipient key when building post-quantum blinded message/payment paths
+	// to ourselves; `None` on a node with no post-quantum identity (then we build classical paths).
+	#[cfg(feature = "post-quantum")]
+	our_pq_kem_key: Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]>,
+
 	#[cfg(not(any(test, feature = "_test_utils")))]
 	pending_offers_messages: Mutex<Vec<(OffersMessage, MessageSendInstructions)>>,
 	#[cfg(any(test, feature = "_test_utils"))]
@@ -114,6 +120,9 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 			secp_ctx,
 			message_router,
 
+			#[cfg(feature = "post-quantum")]
+			our_pq_kem_key: None,
+
 			pending_offers_messages: Mutex::new(Vec::new()),
 			pending_async_payments_messages: Mutex::new(Vec::new()),
 
@@ -121,6 +130,19 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 
 			logger,
 		}
+	}
+
+	/// PQ: records our own static ML-KEM encapsulation key (from [`NodeSigner::get_pq_kem_node_id`]),
+	/// enabling the flow to build post-quantum blinded message and payment paths to ourselves. Returns
+	/// `self` so it can be chained after [`Self::new`].
+	///
+	/// [`NodeSigner::get_pq_kem_node_id`]: crate::sign::NodeSigner::get_pq_kem_node_id
+	#[cfg(feature = "post-quantum")]
+	pub fn with_pq_kem_key(
+		mut self, key: Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]>,
+	) -> Self {
+		self.our_pq_kem_key = key;
+		self
 	}
 
 	/// If we are an async recipient, on startup we'll interactively build offers and static invoices
@@ -215,7 +237,14 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 
 /// The maximum size of a received [`StaticInvoice`] before we'll fail verification in
 /// [`OffersMessageFlow::verify_serve_static_invoice_message].
+#[cfg(not(feature = "post-quantum"))]
 pub const MAX_STATIC_INVOICE_SIZE_BYTES: usize = 5 * 1024;
+/// PQ: a post-quantum static invoice always carries a 2420-byte ML-DSA signature, and (when its
+/// payment paths are post-quantum) per-path ML-KEM ciphertext lists, so the cap is raised to fit them
+/// while staying within the onion-message delivery budget (`BIG_PACKET_HOP_DATA_LEN` = 32768 B). This
+/// bounds the number of post-quantum payment paths a static invoice can carry.
+#[cfg(feature = "post-quantum")]
+pub const MAX_STATIC_INVOICE_SIZE_BYTES: usize = 28 * 1024;
 
 /// Defines the maximum number of [`OffersMessage`] including different reply paths to be sent
 /// along different paths.
@@ -314,6 +343,20 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 		let receive_key = self.get_receive_auth_key();
 		let secp_ctx = &self.secp_ctx;
 
+		// PQ: prefer post-quantum blinded message paths when configured (we hold a static ML-KEM key);
+		// fall back to classical paths if none can be built (e.g. no hop has a pinned ML-KEM key).
+		#[cfg(feature = "post-quantum")]
+		if let Some(our_kem) = self.our_pq_kem_key {
+			if let Ok(paths) = self.message_router.create_pq_blinded_paths(
+				recipient, our_kem, receive_key, context.clone(), peers.clone(), secp_ctx,
+			) {
+				if !paths.is_empty() {
+					log_info!(self.logger, "PQ: built {} post-quantum blinded message path(s)", paths.len());
+					return Ok(paths);
+				}
+			}
+		}
+
 		self.message_router
 			.create_blinded_paths(recipient, receive_key, context, peers, secp_ctx)
 			.and_then(|paths| (!paths.is_empty()).then(|| paths).ok_or(()))
@@ -343,6 +386,21 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 			payment_constraints: PaymentConstraints { max_cltv_expiry, htlc_minimum_msat: 1 },
 			payment_context,
 		};
+
+		// PQ: when we hold a static ML-KEM key, prefer building post-quantum blinded payment paths
+		// (hybrid route-blinding tail) and fall back to classical paths if none can be built.
+		#[cfg(feature = "post-quantum")]
+		if let Some(our_kem) = self.our_pq_kem_key {
+			if let Ok(paths) = router.create_pq_blinded_payment_paths(
+				payee_node_id, our_kem, receive_auth_key, usable_channels.clone(),
+				payee_tlvs.clone(), amount_msats, secp_ctx,
+			) {
+				if !paths.is_empty() {
+					log_info!(self.logger, "PQ: built {} post-quantum blinded payment path(s)", paths.len());
+					return Ok(paths);
+				}
+			}
+		}
 
 		router.create_blinded_payment_paths(
 			payee_node_id,
@@ -1654,6 +1712,14 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 			)
 			.and_then(|builder| builder.build_and_sign(secp_ctx))
 			.map_err(|_| ())?;
+
+		// PQ: a post-quantum offer commits an ML-DSA key, so build_and_sign attached an ML-DSA
+		// signature anchored to it (and any post-quantum payment-path ciphertext lists) on the static
+		// invoice.
+		#[cfg(feature = "post-quantum")]
+		if offer.issuer_pq_id().is_some() {
+			log_info!(self.logger, "PQ: attached ML-DSA signature to a BOLT 12 static invoice");
+		}
 
 		let context = MessageContext::Offers(OffersContext::InvoiceRequest {
 			nonce: offer_nonce,

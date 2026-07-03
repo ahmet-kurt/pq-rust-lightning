@@ -831,6 +831,38 @@ fn ignore_unexpected_static_invoice() {
 	assert!(async_pmts_msgs.is_empty());
 	assert!(nodes[0].node.get_and_clear_pending_events().is_empty());
 
+	// PQ: a static invoice for the CORRECT offer but with its ML-DSA signature stripped (the downgrade
+	// a quantum attacker would serve to dodge the post-quantum check) is rejected, because the record
+	// is classically covered (the strip breaks the Schnorr signature) and we scanned a post-quantum
+	// offer (a re-signed strip fails the ML-DSA downgrade check); we send no held_htlc_available
+	// onion message.
+	#[cfg(feature = "post-quantum")]
+	{
+		let downgraded_static_invoice = valid_static_invoice.test_strip_pq_signature();
+		nodes[1]
+			.node
+			.respond_to_static_invoice_request(
+				downgraded_static_invoice,
+				reply_path.clone(),
+				invoice_request.clone(),
+				invoice_flow_res.invoice_request_path.clone(),
+			)
+			.unwrap();
+		let downgraded_static_invoice_om = nodes[1]
+			.onion_messenger
+			.next_onion_message_for_peer(nodes[0].node.get_our_node_id())
+			.unwrap();
+		nodes[0]
+			.onion_messenger
+			.handle_onion_message(nodes[1].node.get_our_node_id(), &downgraded_static_invoice_om);
+		let async_pmts_msgs = AsyncPaymentsMessageHandler::release_pending_messages(nodes[0].node);
+		assert!(
+			async_pmts_msgs.is_empty(),
+			"PQ: must not pay a static invoice without a valid ML-DSA signature"
+		);
+		assert!(nodes[0].node.get_and_clear_pending_events().is_empty());
+	}
+
 	// A valid static invoice corresponding to the correct offer will succeed and cause us to send a
 	// held_htlc_available onion message.
 	nodes[1]

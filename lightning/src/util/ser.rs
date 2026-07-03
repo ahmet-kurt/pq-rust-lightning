@@ -687,6 +687,8 @@ impl_array!(1300, u8); // for OnionPacket.hop_data
 impl_array!(1312, u8); // for ML-DSA-44 public key pins in the network graph
 #[cfg(feature = "post-quantum")]
 impl_array!(1184, u8); // for ML-KEM-768 encapsulation key pins in the network graph
+#[cfg(feature = "post-quantum")]
+impl_array!(1088, u8); // for ML-KEM-768 ciphertexts carried in post-quantum blinded paths
 
 impl_array!(8, u16);
 impl_array!(32, u16);

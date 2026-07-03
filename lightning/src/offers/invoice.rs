@@ -386,6 +386,44 @@ macro_rules! invoice_derived_signing_pubkey_builder_methods {
 				.unwrap();
 			Ok(invoice)
 		}
+
+		/// PQ: like [`Self::build_and_sign`], but first inserts the post-quantum records (the
+		/// ML-DSA signature derived from `pq_seed` when present, and any hybrid payment paths'
+		/// ML-KEM ciphertext lists) into the unsigned invoice, so the classical signature also
+		/// covers them.
+		#[cfg(feature = "post-quantum")]
+		pub fn build_and_sign_pq<T: secp256k1::Signing>(
+			$self: $self_type, secp_ctx: &Secp256k1<T>, pq_seed: Option<&[u8; 32]>,
+		) -> Result<Bolt12Invoice, Bolt12SemanticError> {
+			#[cfg(feature = "std")]
+			{
+				if $self.invoice.is_offer_or_refund_expired() {
+					return Err(Bolt12SemanticError::AlreadyExpired);
+				}
+			}
+
+			#[cfg(not(feature = "std"))]
+			{
+				if $self.invoice.is_offer_or_refund_expired_no_std($self.invoice.created_at()) {
+					return Err(Bolt12SemanticError::AlreadyExpired);
+				}
+			}
+
+			let Self { invreq_bytes, invoice, signing_pubkey_strategy: DerivedSigningPubkey(keys) } =
+				$self;
+			#[cfg(not(c_bindings))]
+			let mut unsigned_invoice = UnsignedBolt12Invoice::new(invreq_bytes, invoice);
+			#[cfg(c_bindings)]
+			let mut unsigned_invoice = UnsignedBolt12Invoice::new(invreq_bytes, invoice.clone());
+			unsigned_invoice.append_pq_records(pq_seed);
+
+			let invoice = unsigned_invoice
+				.sign(|message: &UnsignedBolt12Invoice| {
+					Ok(secp_ctx.sign_schnorr_no_aux_rand(message.as_ref().as_digest(), &keys))
+				})
+				.unwrap();
+			Ok(invoice)
+		}
 	};
 }
 
@@ -664,6 +702,41 @@ impl UnsignedBolt12Invoice {
 	/// Returns the [`TaggedHash`] of the invoice to sign.
 	pub fn tagged_hash(&self) -> &TaggedHash {
 		&self.tagged_hash
+	}
+
+	/// PQ: derives the issuer's per-offer ML-DSA key from `pq_seed` (when present) and inserts an
+	/// ML-DSA signature record over the invoice's signable bytes, plus the post-quantum blinded
+	/// payment paths' per-hop ML-KEM ciphertext record, into the experimental TLV bytes, then
+	/// recomputes the tagged hash so the classical signature covers the new records (eclair's
+	/// merkle root computation includes unknown records in the signature TLV range, so the records
+	/// must sit in the signed experimental range for every implementation to agree). The payer
+	/// verifies the signature via [`Bolt12Invoice::verify_pq_signature`]; the seed is the one
+	/// recovered while verifying the originating `invoice_request`. A refund-response invoice
+	/// passes no seed (the payer holds no offer committing a key) and conveys only ciphertexts.
+	#[cfg(feature = "post-quantum")]
+	pub(crate) fn append_pq_records(&mut self, pq_seed: Option<&[u8; 32]>) {
+		let signature = pq_seed.map(|pq_seed| {
+			let (pq_secret, _pq_pubkey) = crate::sign::pq::keypair_from_seed(pq_seed);
+			let mut signable = crate::offers::pq::pq_signable_bytes(&self.bytes);
+			signable
+				.extend_from_slice(&crate::offers::pq::pq_signable_bytes(&self.experimental_bytes));
+			crate::sign::pq::sign(&pq_secret, &signable, crate::sign::pq::PQ_CONTEXT_BOLT12)
+		});
+		let kem_cts: Vec<(usize, Vec<u8>)> = self
+			.contents
+			.fields()
+			.payment_paths
+			.iter()
+			.enumerate()
+			.filter_map(|(idx, path)| path.kem_ct().map(|ct| (idx, ct)))
+			.collect();
+		crate::offers::pq::insert_invoice_pq_records(
+			&mut self.experimental_bytes,
+			signature.as_ref(),
+			&kem_cts,
+		);
+		let tlv_stream = TlvStream::new(&self.bytes).chain(TlvStream::new(&self.experimental_bytes));
+		self.tagged_hash = TaggedHash::from_tlv_stream(SIGNATURE_TAG, tlv_stream);
 	}
 }
 
@@ -972,6 +1045,67 @@ impl UnsignedBolt12Invoice {
 	invoice_accessors_common!(self, self.contents, UnsignedBolt12Invoice);
 	invoice_accessors_signing_pubkey!(self, self.contents, UnsignedBolt12Invoice);
 	invoice_accessors!(self, self.contents);
+}
+
+/// The result of verifying the post-quantum (ML-DSA) signature on a [`Bolt12Invoice`] against the
+/// issuer's per-offer key committed in the offer the payer holds.
+#[cfg(feature = "post-quantum")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bolt12PqVerification {
+	/// The invoice carried an ML-DSA signature that verified against the offer's committed key.
+	Verified,
+	/// The invoice carried an ML-DSA signature that did not verify against the offer's committed key
+	/// (a substituted key, a tampered invoice body, or a tampered signature).
+	Invalid,
+	/// The invoice carried no ML-DSA signature. A payer that scanned a post-quantum offer must treat
+	/// this as a downgrade and reject it.
+	Absent,
+	/// The invoice carried an ML-DSA signature but no trusted offer key was supplied to anchor it,
+	/// so it could not be verified. This must never be treated as protection.
+	Unanchored,
+}
+
+#[cfg(feature = "post-quantum")]
+impl Bolt12Invoice {
+	/// Verifies the invoice's post-quantum (ML-DSA) signature against the issuer's per-offer key
+	/// committed in the offer the payer holds, which the caller passes as `trusted_offer_pq_id` (see
+	/// [`Offer::issuer_pq_id`]). The echoed offer key in the invoice is never trusted as the anchor.
+	///
+	/// A payer that scanned a post-quantum offer must require [`Bolt12PqVerification::Verified`] and
+	/// reject [`Bolt12PqVerification::Absent`] (a downgrade) before paying.
+	///
+	/// [`Offer::issuer_pq_id`]: crate::offers::offer::Offer::issuer_pq_id
+	pub fn verify_pq_signature<L: crate::util::logger::Logger>(
+		&self, trusted_offer_pq_id: Option<&[u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]>, logger: &L,
+	) -> Bolt12PqVerification {
+		let signature = match crate::offers::pq::parse_invoice_pq_signature(&self.bytes) {
+			Some(sig) => sig,
+			None => {
+				log_debug!(logger, "PQ: BOLT 12 invoice carries no ML-DSA signature");
+				return Bolt12PqVerification::Absent;
+			},
+		};
+		let anchor = match trusted_offer_pq_id {
+			Some(pk) => pk,
+			None => {
+				log_debug!(logger, "PQ: BOLT 12 invoice carries an ML-DSA signature but no offer key is available to verify it (unanchored)");
+				return Bolt12PqVerification::Unanchored;
+			},
+		};
+		let signable = crate::offers::pq::pq_signable_bytes(&self.bytes);
+		if crate::sign::pq::verify(
+			anchor,
+			&signable,
+			&signature,
+			crate::sign::pq::PQ_CONTEXT_BOLT12,
+		) {
+			log_debug!(logger, "PQ: verified BOLT 12 invoice ML-DSA signature against the offer's committed key");
+			Bolt12PqVerification::Verified
+		} else {
+			log_debug!(logger, "PQ: BOLT 12 invoice ML-DSA signature failed verification against the offer's committed key (substituted key, tampered body, or tampered signature)");
+			Bolt12PqVerification::Invalid
+		}
+	}
 }
 
 impl Bolt12Invoice {
@@ -1628,6 +1762,14 @@ type FullInvoiceTlvStream = (
 	ExperimentalInvoiceTlvStream,
 );
 
+// PQ: the experimental invoice_request Ref stream gains a lifetime under the post-quantum feature
+// (it carries a borrowed refund ciphertext record); this alias keeps the shared tuple type aliases
+// below spelled the same in both builds.
+#[cfg(feature = "post-quantum")]
+type ExpInvReqRef<'a> = ExperimentalInvoiceRequestTlvStreamRef<'a>;
+#[cfg(not(feature = "post-quantum"))]
+type ExpInvReqRef<'a> = ExperimentalInvoiceRequestTlvStreamRef;
+
 type FullInvoiceTlvStreamRef<'a> = (
 	PayerTlvStreamRef<'a>,
 	OfferTlvStreamRef<'a>,
@@ -1635,7 +1777,7 @@ type FullInvoiceTlvStreamRef<'a> = (
 	InvoiceTlvStreamRef<'a>,
 	SignatureTlvStreamRef<'a>,
 	ExperimentalOfferTlvStreamRef,
-	ExperimentalInvoiceRequestTlvStreamRef,
+	ExpInvReqRef<'a>,
 	ExperimentalInvoiceTlvStreamRef,
 );
 
@@ -1679,7 +1821,7 @@ type PartialInvoiceTlvStreamRef<'a> = (
 	InvoiceRequestTlvStreamRef<'a>,
 	InvoiceTlvStreamRef<'a>,
 	ExperimentalOfferTlvStreamRef,
-	ExperimentalInvoiceRequestTlvStreamRef,
+	ExpInvReqRef<'a>,
 	ExperimentalInvoiceTlvStreamRef,
 );
 
@@ -1730,12 +1872,70 @@ impl TryFrom<ParsedMessage<FullInvoiceTlvStream>> for Bolt12Invoice {
 			experimental_invoice_tlv_stream,
 		))?;
 
+		// PQ: re-attach the per-path ML-KEM ciphertext lists conveyed in the invoice-local record so the
+		// payer's `BlindedPaymentPath`s carry them (they are not part of the path's own serialization).
+		#[cfg(feature = "post-quantum")]
+		let contents = {
+			let mut contents = contents;
+			for (idx, ct) in crate::offers::pq::parse_invoice_pq_kem_cts(&bytes) {
+				if let Some(path) = contents.fields_mut().payment_paths.get_mut(idx) {
+					path.set_kem_ct(Some(ct));
+				}
+			}
+			contents
+		};
+
 		let signature = signature
 			.ok_or(Bolt12ParseError::InvalidSemantics(Bolt12SemanticError::MissingSignature))?;
 		let tagged_hash = TaggedHash::from_valid_tlv_stream_bytes(SIGNATURE_TAG, &bytes);
 		let pubkey = contents.fields().signing_pubkey;
 		merkle::verify_signature(&signature, &tagged_hash, pubkey)?;
 
+		let offer_id = match &contents {
+			InvoiceContents::ForOffer { .. } => Some(OfferId::from_valid_bolt12_tlv_stream(&bytes)),
+			InvoiceContents::ForRefund { .. } => None,
+		};
+		Ok(Bolt12Invoice { bytes, contents, signature, tagged_hash, offer_id })
+	}
+}
+
+#[cfg(all(test, feature = "post-quantum"))]
+impl Bolt12Invoice {
+	/// Test-only: parses an invoice without verifying the classical signature, simulating a
+	/// man-in-the-middle who re-signs after tampering (a quantum attacker for an offer invoice,
+	/// or even a classical one for a refund response, whose signing key is unauthenticated).
+	pub(crate) fn test_parse_without_signature_check(
+		bytes: Vec<u8>,
+	) -> Result<Self, Bolt12ParseError> {
+		let parsed = ParsedMessage::<FullInvoiceTlvStream>::try_from(bytes)?;
+		let ParsedMessage { bytes, tlv_stream } = parsed;
+		let (
+			payer_tlv_stream,
+			offer_tlv_stream,
+			invoice_request_tlv_stream,
+			invoice_tlv_stream,
+			SignatureTlvStream { signature },
+			experimental_offer_tlv_stream,
+			experimental_invoice_request_tlv_stream,
+			experimental_invoice_tlv_stream,
+		) = tlv_stream;
+		let mut contents = InvoiceContents::try_from((
+			payer_tlv_stream,
+			offer_tlv_stream,
+			invoice_request_tlv_stream,
+			invoice_tlv_stream,
+			experimental_offer_tlv_stream,
+			experimental_invoice_request_tlv_stream,
+			experimental_invoice_tlv_stream,
+		))?;
+		for (idx, ct) in crate::offers::pq::parse_invoice_pq_kem_cts(&bytes) {
+			if let Some(path) = contents.fields_mut().payment_paths.get_mut(idx) {
+				path.set_kem_ct(Some(ct));
+			}
+		}
+		let signature = signature
+			.ok_or(Bolt12ParseError::InvalidSemantics(Bolt12SemanticError::MissingSignature))?;
+		let tagged_hash = TaggedHash::from_valid_tlv_stream_bytes(SIGNATURE_TAG, &bytes);
 		let offer_id = match &contents {
 			InvoiceContents::ForOffer { .. } => Some(OfferId::from_valid_bolt12_tlv_stream(&bytes)),
 			InvoiceContents::ForRefund { .. } => None,
@@ -1918,6 +2118,10 @@ mod tests {
 	use crate::offers::parse::{Bolt12ParseError, Bolt12SemanticError};
 	use crate::offers::payer::PayerTlvStreamRef;
 	use crate::offers::test_utils::*;
+	#[cfg(feature = "post-quantum")]
+	use super::Bolt12PqVerification;
+	#[cfg(feature = "post-quantum")]
+	use crate::util::test_utils::TestLogger;
 	use crate::prelude::*;
 	use crate::types::features::{Bolt12InvoiceFeatures, InvoiceRequestFeatures, OfferFeatures};
 	use crate::types::string::PrintableString;
@@ -2102,7 +2306,11 @@ mod tests {
 				},
 				SignatureTlvStreamRef { signature: Some(&invoice.signature()) },
 				ExperimentalOfferTlvStreamRef { experimental_foo: None },
-				ExperimentalInvoiceRequestTlvStreamRef { experimental_bar: None },
+				ExperimentalInvoiceRequestTlvStreamRef {
+					#[cfg(feature = "post-quantum")]
+					pq_kem_cts: None,
+					experimental_bar: None,
+				},
 				ExperimentalInvoiceTlvStreamRef { experimental_baz: None },
 			),
 		);
@@ -2205,7 +2413,11 @@ mod tests {
 				},
 				SignatureTlvStreamRef { signature: Some(&invoice.signature()) },
 				ExperimentalOfferTlvStreamRef { experimental_foo: None },
-				ExperimentalInvoiceRequestTlvStreamRef { experimental_bar: None },
+				ExperimentalInvoiceRequestTlvStreamRef {
+					#[cfg(feature = "post-quantum")]
+					pq_kem_cts: None,
+					experimental_bar: None,
+				},
 				ExperimentalInvoiceTlvStreamRef { experimental_baz: None },
 			),
 		);
@@ -2349,6 +2561,454 @@ mod tests {
 		assert!(invoice_request
 			.verify_using_recipient_data(nonce, &expanded_key, &secp_ctx)
 			.is_err());
+	}
+
+	// Builds an offer that commits a per-offer ML-DSA issuer key (the derived-signing-pubkey path),
+	// requests and verifies an invoice for it, and produces the signed `Bolt12Invoice` exactly as the
+	// node response path does. When `attach_pq_sig` is set, the hybrid ML-DSA signature is attached.
+	#[cfg(all(feature = "post-quantum", not(c_bindings)))]
+	fn build_pq_offer_and_invoice(attach_pq_sig: bool) -> (crate::offers::offer::Offer, Bolt12Invoice) {
+		let node_id = recipient_pubkey();
+		let expanded_key = ExpandedKey::new([42; 32]);
+		let entropy = FixedEntropy {};
+		let nonce = Nonce::from_entropy_source(&entropy);
+		let secp_ctx = Secp256k1::new();
+		let payment_id = PaymentId([1; 32]);
+
+		let blinded_path = BlindedMessagePath::from_blinded_path(
+			pubkey(40),
+			pubkey(41),
+			vec![
+				BlindedHop { blinded_node_id: pubkey(42), encrypted_payload: vec![0; 43] },
+				BlindedHop { blinded_node_id: node_id, encrypted_payload: vec![0; 44] },
+			],
+		);
+
+		let offer = OfferBuilder::deriving_signing_pubkey(node_id, &expanded_key, nonce, &secp_ctx)
+			.amount_msats(1000)
+			.path(blinded_path)
+			.build()
+			.unwrap();
+
+		let invoice_request = offer
+			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
+			.unwrap()
+			.build_and_sign()
+			.unwrap();
+
+		let verified_request = invoice_request
+			.verify_using_recipient_data(nonce, &expanded_key, &secp_ctx)
+			.unwrap();
+
+		let invoice = match verified_request {
+			InvoiceRequestVerifiedFromOffer::DerivedKeys(req) => {
+				let pq_seed = req.pq_seed.expect("verified derived request carries a PQ seed");
+				req.respond_using_derived_keys_no_std(payment_paths(), payment_hash(), now())
+					.unwrap()
+					.build_and_sign_pq(&secp_ctx, if attach_pq_sig { Some(&pq_seed) } else { None })
+					.unwrap()
+			},
+			InvoiceRequestVerifiedFromOffer::ExplicitKeys(_) => {
+				panic!("expected invoice request with derived keys")
+			},
+		};
+
+		(offer, invoice)
+	}
+
+	#[cfg(all(feature = "post-quantum", not(c_bindings)))]
+	#[test]
+	fn pq_invoice_conveys_blinded_kem_cts() {
+		// A post-quantum blinded payment path carries an in-memory ML-KEM ciphertext list that is not
+		// part of the path's own serialization; the invoice conveys it in an invoice-local record so a
+		// remote payer recovers it. Build an invoice whose first payment path is post-quantum, re-parse
+		// the serialized invoice, and assert the ciphertext list round-trips onto the payer's path while
+		// the classical path keeps none.
+		let node_id = recipient_pubkey();
+		let expanded_key = ExpandedKey::new([42; 32]);
+		let entropy = FixedEntropy {};
+		let nonce = Nonce::from_entropy_source(&entropy);
+		let secp_ctx = Secp256k1::new();
+		let payment_id = PaymentId([1; 32]);
+
+		let blinded_path = BlindedMessagePath::from_blinded_path(
+			pubkey(40),
+			pubkey(41),
+			vec![
+				BlindedHop { blinded_node_id: pubkey(42), encrypted_payload: vec![0; 43] },
+				BlindedHop { blinded_node_id: node_id, encrypted_payload: vec![0; 44] },
+			],
+		);
+		let offer = OfferBuilder::deriving_signing_pubkey(node_id, &expanded_key, nonce, &secp_ctx)
+			.amount_msats(1000)
+			.path(blinded_path)
+			.build()
+			.unwrap();
+		let invoice_request = offer
+			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
+			.unwrap()
+			.build_and_sign()
+			.unwrap();
+		let verified_request = invoice_request
+			.verify_using_recipient_data(nonce, &expanded_key, &secp_ctx)
+			.unwrap();
+
+		// Mark the first payment path post-quantum by giving it a ciphertext list.
+		let kem_ct_list = vec![
+			7u8;
+			crate::ln::onion_utils::PQ_BLINDED_PATH_MAX_HOPS * crate::crypto::pq_kem::PQ_KEM_CT_LEN
+		];
+		let mut paths = payment_paths();
+		paths[0].set_kem_ct(Some(kem_ct_list.clone()));
+
+		let invoice = match verified_request {
+			InvoiceRequestVerifiedFromOffer::DerivedKeys(req) => {
+				let pq_seed = req.pq_seed.expect("verified derived request carries a PQ seed");
+				req.respond_using_derived_keys_no_std(paths, payment_hash(), now())
+					.unwrap()
+					.build_and_sign_pq(&secp_ctx, Some(&pq_seed))
+					.unwrap()
+			},
+			InvoiceRequestVerifiedFromOffer::ExplicitKeys(_) => {
+				panic!("expected invoice request with derived keys")
+			},
+		};
+
+		// Re-parse the serialized invoice; the post-quantum path's ciphertext list re-attaches and the
+		// classical path keeps none. The ML-DSA signature still verifies (the ciphertext record is
+		// excluded from the signable bytes).
+		let reparsed = Bolt12Invoice::try_from(invoice.encode()).unwrap();
+		assert_eq!(reparsed.payment_paths()[0].kem_ct(), Some(kem_ct_list));
+		assert_eq!(reparsed.payment_paths()[1].kem_ct(), None);
+		let logger = TestLogger::new();
+		let anchor = offer.issuer_pq_id().unwrap();
+		assert_eq!(reparsed.verify_pq_signature(Some(&anchor), &logger), Bolt12PqVerification::Verified);
+	}
+
+	#[cfg(all(feature = "post-quantum", not(c_bindings)))]
+	#[test]
+	fn pq_invoice_records_stay_ahead_of_experimental_records() {
+		// The post-quantum records live in the experimental invoice TLV range and must be inserted
+		// at the position that keeps record types ascending, ahead of any higher-typed experimental
+		// record (the test-only `experimental_baz` sits at the top of the range); appending them at
+		// the end of the stream instead would break the ascending TLV order and fail re-parsing.
+		// Build a derived-keys invoice carrying both an experimental record and a post-quantum
+		// payment path and assert the serialized invoice still re-parses, re-attaches the
+		// ciphertext list, and verifies both signatures.
+		let node_id = recipient_pubkey();
+		let expanded_key = ExpandedKey::new([42; 32]);
+		let entropy = FixedEntropy {};
+		let nonce = Nonce::from_entropy_source(&entropy);
+		let secp_ctx = Secp256k1::new();
+		let payment_id = PaymentId([1; 32]);
+
+		let blinded_path = BlindedMessagePath::from_blinded_path(
+			pubkey(40),
+			pubkey(41),
+			vec![
+				BlindedHop { blinded_node_id: pubkey(42), encrypted_payload: vec![0; 43] },
+				BlindedHop { blinded_node_id: node_id, encrypted_payload: vec![0; 44] },
+			],
+		);
+		let offer = OfferBuilder::deriving_signing_pubkey(node_id, &expanded_key, nonce, &secp_ctx)
+			.amount_msats(1000)
+			.path(blinded_path)
+			.build()
+			.unwrap();
+		let invoice_request = offer
+			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
+			.unwrap()
+			.build_and_sign()
+			.unwrap();
+		let verified_request = invoice_request
+			.verify_using_recipient_data(nonce, &expanded_key, &secp_ctx)
+			.unwrap();
+
+		let kem_ct_list = vec![
+			7u8;
+			crate::ln::onion_utils::PQ_BLINDED_PATH_MAX_HOPS * crate::crypto::pq_kem::PQ_KEM_CT_LEN
+		];
+		let mut paths = payment_paths();
+		paths[0].set_kem_ct(Some(kem_ct_list.clone()));
+
+		let invoice = match verified_request {
+			InvoiceRequestVerifiedFromOffer::DerivedKeys(req) => {
+				let pq_seed = req.pq_seed.expect("verified derived request carries a PQ seed");
+				req.respond_using_derived_keys_no_std(paths, payment_hash(), now())
+					.unwrap()
+					.experimental_baz(42)
+					.build_and_sign_pq(&secp_ctx, Some(&pq_seed))
+					.unwrap()
+			},
+			InvoiceRequestVerifiedFromOffer::ExplicitKeys(_) => {
+				panic!("expected invoice request with derived keys")
+			},
+		};
+
+		let reparsed = Bolt12Invoice::try_from(invoice.encode()).unwrap();
+		assert_eq!(reparsed.payment_paths()[0].kem_ct(), Some(kem_ct_list));
+		let logger = TestLogger::new();
+		let anchor = offer.issuer_pq_id().unwrap();
+		assert_eq!(reparsed.verify_pq_signature(Some(&anchor), &logger), Bolt12PqVerification::Verified);
+		let message = TaggedHash::from_valid_tlv_stream_bytes(SIGNATURE_TAG, &reparsed.bytes);
+		assert!(
+			merkle::verify_signature(&reparsed.signature(), &message, reparsed.signing_pubkey())
+				.is_ok()
+		);
+	}
+
+	#[cfg(all(feature = "post-quantum", not(c_bindings)))]
+	#[test]
+	fn pq_offer_commits_key_and_invoice_verifies() {
+		let logger = TestLogger::new();
+		let (offer, invoice) = build_pq_offer_and_invoice(true);
+
+		// The offer committed a per-offer ML-DSA issuer key.
+		let anchor = offer.issuer_pq_id().expect("offer commits a per-offer ML-DSA key");
+
+		// The invoice carries a valid ML-DSA signature anchored to the offer's committed key.
+		assert_eq!(invoice.verify_pq_signature(Some(&anchor), &logger), Bolt12PqVerification::Verified);
+
+		// Interop: the classical Schnorr signature still verifies byte-for-byte with the records
+		// present, so a vanilla node accepts the invoice on the classical signature alone.
+		let message = TaggedHash::from_valid_tlv_stream_bytes(SIGNATURE_TAG, &invoice.bytes);
+		assert!(
+			merkle::verify_signature(&invoice.signature(), &message, invoice.signing_pubkey())
+				.is_ok()
+		);
+	}
+
+	#[cfg(all(feature = "post-quantum", not(c_bindings)))]
+	#[test]
+	fn pq_rejects_substituted_offer_key() {
+		let logger = TestLogger::new();
+		let (_offer, invoice) = build_pq_offer_and_invoice(true);
+		// An attacker who forged the classical signature with their own ML-DSA key is rejected when
+		// the invoice is anchored to the victim's offer-committed key.
+		let (_attacker_sk, attacker_pk) = crate::sign::pq::keypair_from_seed(&[99u8; 32]);
+		assert_eq!(
+			invoice.verify_pq_signature(Some(&attacker_pk), &logger),
+			Bolt12PqVerification::Invalid
+		);
+	}
+
+	#[cfg(all(feature = "post-quantum", not(c_bindings)))]
+	#[test]
+	fn pq_rejects_tampered_invoice_body() {
+		let logger = TestLogger::new();
+		let (offer, mut invoice) = build_pq_offer_and_invoice(true);
+		let anchor = offer.issuer_pq_id().unwrap();
+		assert_eq!(invoice.verify_pq_signature(Some(&anchor), &logger), Bolt12PqVerification::Verified);
+
+		// Flip a byte in the first record's value (the payer metadata, a signed content record). The
+		// ML-DSA signature no longer matches the recomputed signable bytes.
+		invoice.bytes[2] ^= 0x01;
+		assert_eq!(invoice.verify_pq_signature(Some(&anchor), &logger), Bolt12PqVerification::Invalid);
+	}
+
+	#[cfg(all(feature = "post-quantum", not(c_bindings)))]
+	#[test]
+	fn pq_rejects_tampered_signature() {
+		let logger = TestLogger::new();
+		let (offer, mut invoice) = build_pq_offer_and_invoice(true);
+		let anchor = offer.issuer_pq_id().unwrap();
+
+		// Flip a byte inside the ML-DSA signature record value and verification fails.
+		let sig_range = crate::offers::pq::find_record_value_range(
+			&invoice.bytes,
+			crate::offers::pq::INVOICE_PQ_SIGNATURE_TYPE,
+		)
+		.unwrap();
+		invoice.bytes[sig_range.start + 8] ^= 0x01;
+		assert_eq!(invoice.verify_pq_signature(Some(&anchor), &logger), Bolt12PqVerification::Invalid);
+	}
+
+	#[cfg(all(feature = "post-quantum", not(c_bindings)))]
+	#[test]
+	fn pq_reports_absent_and_unanchored() {
+		let logger = TestLogger::new();
+		let (offer, invoice) = build_pq_offer_and_invoice(true);
+		let anchor = offer.issuer_pq_id().unwrap();
+
+		// A signature is present but no trusted anchor is supplied: never reported as protected.
+		assert_eq!(invoice.verify_pq_signature(None, &logger), Bolt12PqVerification::Unanchored);
+
+		// An invoice with no ML-DSA signature (e.g. from a vanilla payee) is Absent; for an offer
+		// that committed a post-quantum key the payer must treat this as a downgrade and reject it.
+		let (_offer, vanilla_invoice) = build_pq_offer_and_invoice(false);
+		assert_eq!(
+			vanilla_invoice.verify_pq_signature(Some(&anchor), &logger),
+			Bolt12PqVerification::Absent
+		);
+		assert_eq!(vanilla_invoice.verify_pq_signature(None, &logger), Bolt12PqVerification::Absent);
+	}
+
+	#[cfg(all(feature = "post-quantum", not(c_bindings)))]
+	#[test]
+	fn pq_invoice_echoes_vanilla_payers_metadata_record() {
+		// A vanilla payer copies the offer records into its invoice_request verbatim, including
+		// the post-quantum metadata record (a typed field its key derivation covers
+		// consistently), and Core Lightning additionally requires the responding invoice to
+		// mirror its request byte for byte. The responder must therefore echo the record back
+		// rather than strip it; our own payer never includes it in the first place.
+		let node_id = recipient_pubkey();
+		let expanded_key = ExpandedKey::new([42; 32]);
+		let entropy = FixedEntropy {};
+		let nonce = Nonce::from_entropy_source(&entropy);
+		let secp_ctx = Secp256k1::new();
+		let payment_id = PaymentId([1; 32]);
+		let blinded_path = BlindedMessagePath::from_blinded_path(
+			pubkey(40),
+			pubkey(41),
+			vec![
+				BlindedHop { blinded_node_id: pubkey(42), encrypted_payload: vec![0; 43] },
+				BlindedHop { blinded_node_id: node_id, encrypted_payload: vec![0; 44] },
+			],
+		);
+		let offer = OfferBuilder::deriving_signing_pubkey(node_id, &expanded_key, nonce, &secp_ctx)
+			.amount_msats(1000)
+			.path(blinded_path)
+			.build()
+			.unwrap();
+
+		let invoice_request = offer
+			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
+			.unwrap()
+			.build_and_sign()
+			.unwrap();
+
+		// Simulate the vanilla echo by splicing the offer's metadata record into the request
+		// bytes at its sorted position (our own payer strips it).
+		let metadata_record = TlvStream::new(&offer.bytes)
+			.find(|record| crate::offers::pq::is_offer_pq_metadata_record(record))
+			.expect("post-quantum offer carries its records in the metadata record")
+			.record_bytes
+			.to_vec();
+		let request_bytes = invoice_request.bytes.clone();
+		let splice_at = TlvStream::new(&request_bytes)
+			.find(|record| record.r#type > crate::offers::offer::OFFER_METADATA_TYPE)
+			.map(|record| record.end - record.record_bytes.len())
+			.unwrap_or(request_bytes.len());
+		let mut vanilla_request_bytes = request_bytes.clone();
+		vanilla_request_bytes.splice(splice_at..splice_at, metadata_record.iter().cloned());
+
+		let contents = match invoice_request
+			.verify_using_recipient_data(nonce, &expanded_key, &secp_ctx)
+			.unwrap()
+		{
+			InvoiceRequestVerifiedFromOffer::DerivedKeys(req) => req
+				.respond_using_derived_keys_no_std(payment_paths(), payment_hash(), now())
+				.unwrap()
+				.build_and_sign(&secp_ctx)
+				.unwrap()
+				.contents,
+			InvoiceRequestVerifiedFromOffer::ExplicitKeys(_) => {
+				panic!("expected invoice request with derived keys")
+			},
+		};
+
+		// The vanilla payer's echo keeps the record byte for byte, and the trailing request
+		// records survive the copy.
+		let unsigned = UnsignedBolt12Invoice::new(&vanilla_request_bytes, contents.clone());
+		let echoed = TlvStream::new(&unsigned.bytes)
+			.find(|record| crate::offers::pq::is_offer_pq_metadata_record(record))
+			.expect("invoice echoes the vanilla payer's metadata record")
+			.record_bytes
+			.to_vec();
+		assert_eq!(echoed, metadata_record);
+
+		// Our own payer's request carries no record, so neither does the invoice built from it.
+		let unsigned_own = UnsignedBolt12Invoice::new(&request_bytes, contents);
+		assert!(TlvStream::new(&unsigned_own.bytes)
+			.all(|record| !crate::offers::pq::is_offer_pq_metadata_record(&record)));
+	}
+
+	#[cfg(all(feature = "post-quantum", not(c_bindings)))]
+	#[test]
+	fn pq_payer_verifies_invoice_for_metadata_carrying_offer() {
+		// The built offer object must mirror the post-quantum metadata record in its typed
+		// contents: a payer working from the object (rather than a parsed string) derives its
+		// keys from the typed fields, and its stateless verification of the responding invoice
+		// recomputes over the echoed raw records, so the two must cover the same record set.
+		let node_id = recipient_pubkey();
+		let expanded_key = ExpandedKey::new([42; 32]);
+		let entropy = FixedEntropy {};
+		let nonce = Nonce::from_entropy_source(&entropy);
+		let secp_ctx = Secp256k1::new();
+		let payment_id = PaymentId([1; 32]);
+		let blinded_path = BlindedMessagePath::from_blinded_path(
+			pubkey(40),
+			pubkey(41),
+			vec![
+				BlindedHop { blinded_node_id: pubkey(42), encrypted_payload: vec![0; 43] },
+				BlindedHop { blinded_node_id: node_id, encrypted_payload: vec![0; 44] },
+			],
+		);
+		let offer = OfferBuilder::deriving_signing_pubkey(node_id, &expanded_key, nonce, &secp_ctx)
+			.amount_msats(1000)
+			.path(blinded_path)
+			.build()
+			.unwrap();
+
+		// The typed contents carry the same metadata value as the serialized record, so the
+		// object round-trips through parsing unchanged.
+		assert!(offer.metadata().is_some());
+		let reparsed = crate::offers::offer::Offer::try_from(offer.bytes.clone()).unwrap();
+		assert_eq!(reparsed.metadata(), offer.metadata());
+
+		let invoice_request = offer
+			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
+			.unwrap()
+			.build_and_sign()
+			.unwrap();
+		let invoice = match invoice_request
+			.verify_using_recipient_data(nonce, &expanded_key, &secp_ctx)
+			.unwrap()
+		{
+			InvoiceRequestVerifiedFromOffer::DerivedKeys(req) => req
+				.respond_using_derived_keys_no_std(payment_paths(), payment_hash(), now())
+				.unwrap()
+				.build_and_sign(&secp_ctx)
+				.unwrap(),
+			InvoiceRequestVerifiedFromOffer::ExplicitKeys(_) => panic!("expected derived keys"),
+		};
+		assert_eq!(invoice.verify_using_metadata(&expanded_key, &secp_ctx), Ok(payment_id));
+	}
+
+	#[cfg(all(feature = "post-quantum", not(c_bindings)))]
+	#[test]
+	fn pq_measurements() {
+		let (offer, invoice_with) = build_pq_offer_and_invoice(true);
+		let (_offer, invoice_without) = build_pq_offer_and_invoice(false);
+
+		println!("PQ: BOLT 12 offer size (with ML-DSA issuer key): {} bytes", offer.bytes.len());
+		println!(
+			"PQ: BOLT 12 invoice size: {} bytes without ML-DSA signature, {} bytes with it (+{})",
+			invoice_without.bytes.len(),
+			invoice_with.bytes.len(),
+			invoice_with.bytes.len() - invoice_without.bytes.len(),
+		);
+		println!(
+			"PQ: ML-DSA-44 public key {} bytes, signature {} bytes",
+			crate::sign::pq::PQ_PUBLIC_KEY_LEN,
+			crate::sign::pq::PQ_SIGNATURE_LEN,
+		);
+
+		let (sk, pk) = crate::sign::pq::keypair_from_seed(&[7u8; 32]);
+		let msg = crate::offers::pq::pq_signable_bytes(&invoice_with.bytes);
+		let iters = 100u32;
+		let start = std::time::Instant::now();
+		for _ in 0..iters {
+			let _ = crate::sign::pq::sign(&sk, &msg, crate::sign::pq::PQ_CONTEXT_BOLT12);
+		}
+		let sign_us = start.elapsed().as_micros() / iters as u128;
+		let sig = crate::sign::pq::sign(&sk, &msg, crate::sign::pq::PQ_CONTEXT_BOLT12);
+		let start = std::time::Instant::now();
+		for _ in 0..iters {
+			assert!(crate::sign::pq::verify(&pk, &msg, &sig, crate::sign::pq::PQ_CONTEXT_BOLT12));
+		}
+		let verify_us = start.elapsed().as_micros() / iters as u128;
+		println!("PQ: ML-DSA-44 sign {} us, verify {} us (avg/{}, test profile)", sign_us, verify_us, iters);
 	}
 
 	#[test]

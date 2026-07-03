@@ -298,6 +298,16 @@ macro_rules! invoice_request_builder_methods { (
 			let mut tlv_stream = $self.invoice_request.as_tlv_stream();
 			debug_assert!(tlv_stream.2.payer_id.is_none());
 			tlv_stream.0.metadata = None;
+			// The offer's post-quantum metadata record is not copied into the request bytes, so
+			// exclude it from the key derivation too.
+			#[cfg(feature = "post-quantum")]
+			if tlv_stream
+				.1
+				.metadata
+				.map_or(false, |m| crate::offers::pq::is_offer_pq_metadata_value(m))
+			{
+				tlv_stream.1.metadata = None;
+			}
 			if !metadata.derives_payer_keys() {
 				tlv_stream.2.payer_id = $self.payer_signing_pubkey.as_ref();
 			}
@@ -492,11 +502,21 @@ impl UnsignedInvoiceRequest {
 
 		payer_tlv_stream.write(&mut bytes).unwrap();
 
+		let mut offer_prefix_len = 0;
 		for record in TlvStream::new(&offer.bytes).range(OFFER_TYPES) {
+			offer_prefix_len = record.end;
+			// The offer's post-quantum metadata record is not copied into the invoice_request:
+			// the payer anchors the post-quantum data to the offer it already holds, and async
+			// payments must fit the signed invoice_request inside a fixed-size payment onion.
+			// The payer's key derivation excludes it consistently.
+			#[cfg(feature = "post-quantum")]
+			if crate::offers::pq::is_offer_pq_metadata_record(&record) {
+				continue;
+			}
 			record.write(&mut bytes).unwrap();
 		}
 
-		let remaining_bytes = &offer.bytes[bytes.len() - payer_tlv_stream.serialized_length()..];
+		let remaining_bytes = &offer.bytes[offer_prefix_len..];
 
 		invoice_request_tlv_stream.write(&mut bytes).unwrap();
 
@@ -623,6 +643,13 @@ pub struct VerifiedInvoiceRequest<S: SigningPubkeyStrategy> {
 	)]
 	#[cfg_attr(feature = "std", doc = "[`respond_with`]: Self::respond_with")]
 	pub keys: S,
+
+	/// The per-offer ML-DSA seed for signing the invoice's post-quantum signature, recovered from
+	/// the offer nonce while verifying the request. `None` when the request was verified via the
+	/// offer metadata, as such an offer commits no post-quantum issuer key; recipient-data
+	/// verification always re-derives the seed a derived-keys offer commits at build time.
+	#[cfg(feature = "post-quantum")]
+	pub(crate) pq_seed: Option<[u8; 32]>,
 }
 
 /// Represents a [`VerifiedInvoiceRequest`], along with information about how the resulting
@@ -854,6 +881,9 @@ macro_rules! invoice_request_verify_method {
 	) -> Result<InvoiceRequestVerifiedFromOffer, ()> {
 		let (offer_id, keys) =
 			$self.contents.inner.offer.verify_using_metadata(&$self.bytes, key, secp_ctx)?;
+		// An offer verified via its metadata (no blinded path) commits no per-offer post-quantum key.
+		#[cfg(feature = "post-quantum")]
+		let pq_seed: Option<[u8; 32]> = None;
 		let inner = {
 			#[cfg(not(c_bindings))]
 			{ $self }
@@ -866,11 +896,15 @@ macro_rules! invoice_request_verify_method {
 				offer_id,
 				inner,
 				keys: ExplicitSigningPubkey {},
+				#[cfg(feature = "post-quantum")]
+				pq_seed,
 			}),
 			Some(keys) => InvoiceRequestVerifiedFromOffer::DerivedKeys(VerifiedInvoiceRequest {
 				offer_id,
 				inner,
 				keys: DerivedSigningPubkey(keys),
+				#[cfg(feature = "post-quantum")]
+				pq_seed,
 			}),
 		};
 
@@ -899,6 +933,11 @@ macro_rules! invoice_request_verify_method {
 			&$self.bytes, nonce, key, secp_ctx
 		)?;
 
+		// Recover the per-offer ML-DSA seed the offer committed to so the responding invoice can be
+		// signed with the matching post-quantum key.
+		#[cfg(feature = "post-quantum")]
+		let pq_seed = Some(crate::offers::signer::recover_offer_pq_seed(key, nonce));
+
 		let inner = {
 			#[cfg(not(c_bindings))]
 			{ $self }
@@ -911,11 +950,15 @@ macro_rules! invoice_request_verify_method {
 				offer_id,
 				inner,
 				keys: ExplicitSigningPubkey {},
+				#[cfg(feature = "post-quantum")]
+				pq_seed,
 			}),
 			Some(keys) => InvoiceRequestVerifiedFromOffer::DerivedKeys(VerifiedInvoiceRequest {
 				offer_id,
 				inner,
 				keys: DerivedSigningPubkey(keys),
+				#[cfg(feature = "post-quantum")]
+				pq_seed,
 			}),
 		};
 
@@ -1225,6 +1268,8 @@ impl InvoiceRequestContentsWithoutPayerSigningPubkey {
 		};
 
 		let experimental_invoice_request = ExperimentalInvoiceRequestTlvStreamRef {
+			#[cfg(feature = "post-quantum")]
+			pq_kem_cts: None,
 			#[cfg(test)]
 			experimental_bar: self.experimental_bar,
 		};
@@ -1288,7 +1333,7 @@ tlv_stream!(InvoiceRequestTlvStream, InvoiceRequestTlvStreamRef<'a>, INVOICE_REQ
 pub(super) const EXPERIMENTAL_INVOICE_REQUEST_TYPES: core::ops::Range<u64> =
 	2_000_000_000..3_000_000_000;
 
-#[cfg(not(test))]
+#[cfg(all(not(test), not(feature = "post-quantum")))]
 tlv_stream!(
 	ExperimentalInvoiceRequestTlvStream,
 	ExperimentalInvoiceRequestTlvStreamRef,
@@ -1299,10 +1344,29 @@ tlv_stream!(
 	}
 );
 
-#[cfg(test)]
+// The typed record carrying a refund's post-quantum blinded-path ciphertexts; see
+// `pq::REFUND_PQ_KEM_CT_TYPE` for why it must be a typed field rather than an unknown odd record.
+#[cfg(all(not(test), feature = "post-quantum"))]
+tlv_stream!(
+	ExperimentalInvoiceRequestTlvStream, ExperimentalInvoiceRequestTlvStreamRef<'a>,
+	EXPERIMENTAL_INVOICE_REQUEST_TYPES, {
+		(2_000_000_243, pq_kem_cts: (Vec<u8>, WithoutLength)),
+	}
+);
+
+#[cfg(all(test, not(feature = "post-quantum")))]
 tlv_stream!(
 	ExperimentalInvoiceRequestTlvStream, ExperimentalInvoiceRequestTlvStreamRef,
 	EXPERIMENTAL_INVOICE_REQUEST_TYPES, {
+		(2_999_999_999, experimental_bar: (u64, HighZeroBytesDroppedBigSize)),
+	}
+);
+
+#[cfg(all(test, feature = "post-quantum"))]
+tlv_stream!(
+	ExperimentalInvoiceRequestTlvStream, ExperimentalInvoiceRequestTlvStreamRef<'a>,
+	EXPERIMENTAL_INVOICE_REQUEST_TYPES, {
+		(2_000_000_243, pq_kem_cts: (Vec<u8>, WithoutLength)),
 		(2_999_999_999, experimental_bar: (u64, HighZeroBytesDroppedBigSize)),
 	}
 );
@@ -1316,13 +1380,21 @@ type FullInvoiceRequestTlvStream = (
 	ExperimentalInvoiceRequestTlvStream,
 );
 
+// PQ: the experimental invoice_request Ref stream gains a lifetime under the post-quantum feature
+// (it carries a borrowed refund ciphertext record); this alias keeps the shared tuple type aliases
+// below spelled the same in both builds.
+#[cfg(feature = "post-quantum")]
+type ExpInvReqRef<'a> = ExperimentalInvoiceRequestTlvStreamRef<'a>;
+#[cfg(not(feature = "post-quantum"))]
+type ExpInvReqRef<'a> = ExperimentalInvoiceRequestTlvStreamRef;
+
 type FullInvoiceRequestTlvStreamRef<'a> = (
 	PayerTlvStreamRef<'a>,
 	OfferTlvStreamRef<'a>,
 	InvoiceRequestTlvStreamRef<'a>,
 	SignatureTlvStreamRef<'a>,
 	ExperimentalOfferTlvStreamRef,
-	ExperimentalInvoiceRequestTlvStreamRef,
+	ExpInvReqRef<'a>,
 );
 
 impl CursorReadable for FullInvoiceRequestTlvStream {
@@ -1358,7 +1430,7 @@ type PartialInvoiceRequestTlvStreamRef<'a> = (
 	OfferTlvStreamRef<'a>,
 	InvoiceRequestTlvStreamRef<'a>,
 	ExperimentalOfferTlvStreamRef,
-	ExperimentalInvoiceRequestTlvStreamRef,
+	ExpInvReqRef<'a>,
 );
 
 impl TryFrom<Vec<u8>> for UnsignedInvoiceRequest {
@@ -1437,6 +1509,10 @@ impl TryFrom<PartialInvoiceRequestTlvStream> for InvoiceRequestContents {
 			},
 			experimental_offer_tlv_stream,
 			ExperimentalInvoiceRequestTlvStream {
+				// An invoice_request never carries the refund-only ciphertext record; tolerate and
+				// drop it if a payer echoed one.
+				#[cfg(feature = "post-quantum")]
+				pq_kem_cts: _,
 				#[cfg(test)]
 				experimental_bar,
 			},
@@ -1553,6 +1629,10 @@ mod tests {
 		INVOICE_REQUEST_TYPES, PAYER_NOTE_LIMIT, SIGNATURE_TAG,
 	};
 
+	#[cfg(feature = "post-quantum")]
+	use crate::blinded_path::message::BlindedMessagePath;
+	#[cfg(feature = "post-quantum")]
+	use crate::blinded_path::BlindedHop;
 	use crate::ln::channelmanager::PaymentId;
 	use crate::ln::inbound_payment::ExpandedKey;
 	use crate::ln::msgs::{DecodeError, MAX_VALUE_MSAT};
@@ -1662,7 +1742,11 @@ mod tests {
 				},
 				SignatureTlvStreamRef { signature: Some(&invoice_request.signature()) },
 				ExperimentalOfferTlvStreamRef { experimental_foo: None },
-				ExperimentalInvoiceRequestTlvStreamRef { experimental_bar: None },
+				ExperimentalInvoiceRequestTlvStreamRef {
+					#[cfg(feature = "post-quantum")]
+					pq_kem_cts: None,
+					experimental_bar: None,
+				},
 			),
 		);
 
@@ -3168,5 +3252,56 @@ mod tests {
 				assert_eq!(s[..new_len], string_truncate_safe(s.clone(), new_len));
 			}
 		}
+	}
+
+	#[cfg(all(feature = "post-quantum", not(c_bindings)))]
+	#[test]
+	fn pq_payer_strips_offer_metadata_record_from_request() {
+		// The payer does not copy the offer's post-quantum metadata record into its
+		// invoice_request: it anchors the post-quantum data to the offer it already holds, and
+		// async payments must fit the signed invoice_request inside a fixed-size payment onion.
+		// Its key derivation excludes the record consistently, and the responder still verifies
+		// the request (its recomputation always excludes the metadata record, so a vanilla
+		// payer's verbatim echo verifies the same way).
+		let expanded_key = ExpandedKey::new([42; 32]);
+		let entropy = FixedEntropy {};
+		let nonce = Nonce::from_entropy_source(&entropy);
+		let secp_ctx = Secp256k1::new();
+		let payment_id = PaymentId([1; 32]);
+		let node_id = recipient_pubkey();
+
+		// A blinded path makes the offer derive its signing keys, which is what commits the
+		// post-quantum records.
+		let blinded_path = BlindedMessagePath::from_blinded_path(
+			pubkey(40),
+			pubkey(41),
+			vec![
+				BlindedHop { blinded_node_id: pubkey(42), encrypted_payload: vec![0; 43] },
+				BlindedHop { blinded_node_id: node_id, encrypted_payload: vec![0; 44] },
+			],
+		);
+		let offer =
+			OfferBuilder::deriving_signing_pubkey(node_id, &expanded_key, nonce, &secp_ctx)
+				.amount_msats(1000)
+				.path(blinded_path)
+				.build()
+				.unwrap();
+		assert!(offer.issuer_pq_id().is_some());
+		assert!(TlvStream::new(&offer.bytes)
+			.any(|record| crate::offers::pq::is_offer_pq_metadata_record(&record)));
+
+		let invoice_request = offer
+			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
+			.unwrap()
+			.build_and_sign()
+			.unwrap();
+
+		assert!(TlvStream::new(&invoice_request.bytes)
+			.all(|record| !crate::offers::pq::is_offer_pq_metadata_record(&record)));
+		// The trailing offer records survived the strip and the responder verifies the request.
+		assert!(TlvStream::new(&invoice_request.bytes).any(|record| record.r#type == 22));
+		assert!(invoice_request
+			.verify_using_recipient_data(nonce, &expanded_key, &secp_ctx)
+			.is_ok());
 	}
 }

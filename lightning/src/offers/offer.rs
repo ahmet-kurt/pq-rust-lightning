@@ -125,6 +125,17 @@ impl OfferId {
 	const ID_TAG: &'static str = "LDK Offer ID";
 
 	fn from_valid_offer_tlv_stream(bytes: &[u8]) -> Self {
+		// The offer's post-quantum metadata record does not contribute to the offer id: the payer
+		// strips the record from its invoice_request, so the id must stay the same whether it is
+		// recomputed from the offer, from a stripped request, or from a vanilla payer's verbatim
+		// echo. Offer ids are node-local, so this has no interop surface.
+		#[cfg(feature = "post-quantum")]
+		let tagged_hash = TaggedHash::from_tlv_stream(
+			Self::ID_TAG,
+			TlvStream::new(bytes)
+				.filter(|record| !crate::offers::pq::is_offer_pq_metadata_record(record)),
+		);
+		#[cfg(not(feature = "post-quantum"))]
 		let tagged_hash = TaggedHash::from_valid_tlv_stream_bytes(Self::ID_TAG, bytes);
 		Self(tagged_hash.to_bytes())
 	}
@@ -424,6 +435,9 @@ macro_rules! offer_builder_methods { (
 	}
 
 	fn build_without_checks($($self_mut)* $self: $self_type) -> Offer {
+		// The per-offer ML-DSA seed committed alongside a derived classical signing pubkey, if any.
+		#[cfg(feature = "post-quantum")]
+		let mut pq_issuer_seed: Option<[u8; 32]> = None;
 		if let Some(mut metadata) = $self.offer.metadata.take() {
 			// Create the metadata for stateless verification of an InvoiceRequest.
 			if metadata.has_derivation_material() {
@@ -447,6 +461,14 @@ macro_rules! offer_builder_methods { (
 				// Either replace the signing pubkey with the derived pubkey or include the metadata
 				// for verification. In the former case, the blinded paths must include
 				// `OffersContext::InvoiceRequest` instead.
+				// Derived from the symmetric offer key and nonce (not the classical key), so it is
+				// recoverable when signing the invoice but not by a Shor adversary. Some only for a
+				// derived signing pubkey (an offer with blinded paths).
+				#[cfg(feature = "post-quantum")]
+				{
+					pq_issuer_seed = metadata.derive_offer_pq_seed();
+				}
+
 				let (derived_metadata, keys) =
 					metadata.derive_from(iv_bytes, tlv_stream, $self.secp_ctx);
 				match keys {
@@ -461,6 +483,36 @@ macro_rules! offer_builder_methods { (
 		const OFFER_ALLOCATION_SIZE: usize = 512;
 		let mut bytes = Vec::with_capacity(OFFER_ALLOCATION_SIZE);
 		$self.offer.write(&mut bytes).unwrap();
+
+		// Commit the issuer's per-offer ML-DSA public key, plus the introduction-node ML-KEM
+		// ciphertext of each post-quantum blinded path, inside the offer metadata record so a
+		// payer holding the offer can anchor the post-quantum signature on the responding invoice
+		// and address the post-quantum paths. The metadata is a typed field a vanilla payer echoes
+		// verbatim and covers consistently in its stateless verification, unlike an unknown odd
+		// record (our own payer strips it; see `is_offer_pq_metadata_record`), and a derived-keys
+		// offer never carries its own metadata record, so it is free.
+		// Mirror the value into the typed contents so the object matches its serialization.
+		#[cfg(feature = "post-quantum")]
+		if let Some(pq_seed) = pq_issuer_seed {
+			let (_, pq_pubkey) = crate::sign::pq::keypair_from_seed(&pq_seed);
+			let kem_cts: Vec<(usize, [u8; crate::crypto::pq_kem::PQ_KEM_CT_LEN])> = $self
+				.offer
+				.paths
+				.as_ref()
+				.map(|paths| {
+					paths
+						.iter()
+						.enumerate()
+						.filter_map(|(i, path)| path.kem_ct().map(|ct| (i, ct)))
+						.collect()
+				})
+				.unwrap_or_default();
+			if let Some(value) =
+				crate::offers::pq::insert_offer_pq_metadata(&mut bytes, &pq_pubkey, &kem_cts)
+			{
+				$self.offer.metadata = Some(Metadata::Bytes(value));
+			}
+		}
 
 		let id = OfferId::from_valid_offer_tlv_stream(&bytes);
 
@@ -718,6 +770,17 @@ impl Offer {
 		self.id
 	}
 
+	/// The issuer's per-offer ML-DSA public key committed in this offer, if any. A payer uses this
+	/// as the trust anchor when verifying the post-quantum signature on a received
+	/// [`Bolt12Invoice`] via [`Bolt12Invoice::verify_pq_signature`].
+	///
+	/// [`Bolt12Invoice`]: crate::offers::invoice::Bolt12Invoice
+	/// [`Bolt12Invoice::verify_pq_signature`]: crate::offers::invoice::Bolt12Invoice::verify_pq_signature
+	#[cfg(feature = "post-quantum")]
+	pub fn issuer_pq_id(&self) -> Option<[u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]> {
+		crate::offers::pq::parse_offer_pq_pubkey(&self.bytes)
+	}
+
 	pub(super) fn implied_chain(&self) -> ChainHash {
 		self.contents.implied_chain()
 	}
@@ -753,9 +816,15 @@ impl Offer {
 	pub(super) fn tlv_stream_iter<'a>(
 		bytes: &'a [u8],
 	) -> impl core::iter::Iterator<Item = TlvRecord<'a>> {
-		TlvStream::new(bytes)
+		// Exclude the post-quantum metadata record so the offer id stays consistent with
+		// `from_valid_offer_tlv_stream`.
+		#[cfg(feature = "post-quantum")]
+		let offer_records = TlvStream::new(bytes)
 			.range(OFFER_TYPES)
-			.chain(TlvStream::new(bytes).range(EXPERIMENTAL_OFFER_TYPES))
+			.filter(|record| !crate::offers::pq::is_offer_pq_metadata_record(record));
+		#[cfg(not(feature = "post-quantum"))]
+		let offer_records = TlvStream::new(bytes).range(OFFER_TYPES);
+		offer_records.chain(TlvStream::new(bytes).range(EXPERIMENTAL_OFFER_TYPES))
 	}
 
 	pub(super) fn verify<T: secp256k1::Signing>(
@@ -1209,7 +1278,7 @@ impl Quantity {
 pub(super) const OFFER_TYPES: core::ops::Range<u64> = 1..80;
 
 /// TLV record type for [`Offer::metadata`].
-const OFFER_METADATA_TYPE: u64 = 4;
+pub(super) const OFFER_METADATA_TYPE: u64 = 4;
 
 /// TLV record type for [`Offer::description`].
 pub(super) const OFFER_DESCRIPTION_TYPE: u64 = 10;
@@ -1277,7 +1346,23 @@ impl TryFrom<Vec<u8>> for Offer {
 	fn try_from(bytes: Vec<u8>) -> Result<Self, Self::Error> {
 		let offer = ParsedMessage::<FullOfferTlvStream>::try_from(bytes)?;
 		let ParsedMessage { bytes, tlv_stream } = offer;
+		#[cfg(not(feature = "post-quantum"))]
 		let contents = OfferContents::try_from(tlv_stream)?;
+		// Re-attach each post-quantum blinded path's introduction-node ML-KEM ciphertext (carried in
+		// the offer metadata record, not in the path's own serialization) so the payer can use the
+		// path.
+		#[cfg(feature = "post-quantum")]
+		let contents = {
+			let mut contents = OfferContents::try_from(tlv_stream)?;
+			if let Some(paths) = contents.paths.as_mut() {
+				for (idx, ct) in crate::offers::pq::parse_offer_pq_kem_cts(&bytes) {
+					if let Some(path) = paths.get_mut(idx) {
+						path.set_kem_ct(Some(ct));
+					}
+				}
+			}
+			contents
+		};
 		let id = OfferId::from_valid_offer_tlv_stream(&bytes);
 
 		Ok(Offer { bytes, contents, id })
@@ -1611,6 +1696,10 @@ mod tests {
 			.experimental_foo(42)
 			.build()
 			.unwrap();
+		// The offer's post-quantum records ride in the metadata record.
+		#[cfg(feature = "post-quantum")]
+		assert!(offer.metadata().is_some());
+		#[cfg(not(feature = "post-quantum"))]
 		assert!(offer.metadata().is_none());
 		assert_ne!(offer.issuer_signing_pubkey(), Some(node_id));
 
@@ -1811,6 +1900,49 @@ mod tests {
 		assert_ne!(pubkey(42), pubkey(44));
 		assert_eq!(tlv_stream.0.paths, Some(&paths));
 		assert_eq!(tlv_stream.0.issuer_id, Some(&pubkey(42)));
+	}
+
+	#[test]
+	#[cfg(all(feature = "post-quantum", not(c_bindings)))]
+	fn pq_offer_kem_ciphertexts_round_trip() {
+		// An offer carries each post-quantum blinded path's introduction ciphertext in the offer
+		// metadata record, alongside the ML-DSA issuer key. It round-trips through serialization
+		// (re-attached to the right path by index) and a classical path in the same offer carries
+		// no ciphertext.
+		use crate::crypto::pq_kem::PQ_KEM_CT_LEN;
+
+		let expanded_key = ExpandedKey::new([42; 32]);
+		let entropy = FixedEntropy {};
+		let nonce = Nonce::from_entropy_source(&entropy);
+		let secp_ctx = Secp256k1::new();
+
+		let path0 = BlindedMessagePath::from_blinded_path(
+			pubkey(40),
+			pubkey(41),
+			vec![BlindedHop { blinded_node_id: pubkey(43), encrypted_payload: vec![0; 43] }],
+		);
+		let mut path1 = BlindedMessagePath::from_blinded_path(
+			pubkey(50),
+			pubkey(51),
+			vec![BlindedHop { blinded_node_id: pubkey(53), encrypted_payload: vec![0; 53] }],
+		);
+		let ct = [7u8; PQ_KEM_CT_LEN];
+		path1.set_kem_ct(Some(ct));
+
+		let offer =
+			OfferBuilder::deriving_signing_pubkey(pubkey(42), &expanded_key, nonce, &secp_ctx)
+				.path(path0.clone())
+				.path(path1.clone())
+				.build()
+				.unwrap();
+		assert!(offer.issuer_pq_id().is_some());
+
+		// Parsing the offer re-attaches the ciphertext to the right path by index; the classical
+		// path carries none.
+		let parsed = offer.to_string().parse::<Offer>().unwrap();
+		assert_eq!(parsed.paths()[0].kem_ct(), None);
+		assert_eq!(parsed.paths()[1].kem_ct(), Some(ct));
+		assert_eq!(parsed, offer);
 	}
 
 	#[test]

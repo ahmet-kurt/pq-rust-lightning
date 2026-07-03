@@ -1148,6 +1148,21 @@ pub struct UserConfig {
 	/// Default value: `false`
 	#[cfg(feature = "post-quantum")]
 	pub require_post_quantum_payments: bool,
+	/// PQ: if `true`, blinded paths this node builds for its own BOLT 12 offers and invoices are
+	/// post-quantum (hybrid ML-KEM route blinding) whenever a fully-post-quantum path can be built,
+	/// giving route and recipient privacy against a Shor adversary. This covers both the onion-message
+	/// blinded paths (carrying the `invoice_request`/`invoice`) and the blinded payment-path tails.
+	///
+	/// A post-quantum blinded path can only be used by a post-quantum-aware payer, so leaving this
+	/// `false` preserves interoperability: classical paths are built and any payer can use the offer.
+	/// Read once when the [`ChannelManager`] (and its [`OffersMessageFlow`]) is constructed.
+	///
+	/// Default value: `false`
+	///
+	/// [`ChannelManager`]: crate::ln::channelmanager::ChannelManager
+	/// [`OffersMessageFlow`]: crate::offers::flow::OffersMessageFlow
+	#[cfg(feature = "post-quantum")]
+	pub build_post_quantum_blinded_paths: bool,
 	/// PQ: if `true`, the node fails back any inbound HTLC that is not post-quantum-protected (a plain
 	/// or unblinded hop carrying no ML-KEM ciphertext trail, or a blinded hop carrying no blinded
 	/// ciphertext list), rather than accepting a classical (Shor-breakable) onion. This closes the
@@ -1179,6 +1194,8 @@ impl Default for UserConfig {
 			#[cfg(feature = "post-quantum")]
 			require_post_quantum_payments: false,
 			#[cfg(feature = "post-quantum")]
+			build_post_quantum_blinded_paths: false,
+			#[cfg(feature = "post-quantum")]
 			require_post_quantum_inbound: false,
 		}
 	}
@@ -1205,6 +1222,8 @@ impl Readable for UserConfig {
 			reject_inbound_splices: Readable::read(reader)?,
 			#[cfg(feature = "post-quantum")]
 			require_post_quantum_payments: Readable::read(reader)?,
+			#[cfg(feature = "post-quantum")]
+			build_post_quantum_blinded_paths: Readable::read(reader)?,
 			#[cfg(feature = "post-quantum")]
 			require_post_quantum_inbound: Readable::read(reader)?,
 		})

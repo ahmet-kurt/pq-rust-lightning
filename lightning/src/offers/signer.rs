@@ -142,6 +142,22 @@ impl Metadata {
 		}
 	}
 
+	/// Derives the per-offer ML-DSA seed committed in this offer alongside the classical signing
+	/// pubkey, mirroring the classical per-offer key derivation. Returns `Some` only for
+	/// [`Metadata::DerivedSigningPubkey`] (an offer using a derived signing pubkey, i.e. one with
+	/// blinded paths); other variants have no per-offer post-quantum key. The seed depends only on
+	/// the symmetric `offers_base_key` and the nonce, so a Shor adversary cannot recover it from the
+	/// published classical signing pubkey.
+	#[cfg(feature = "post-quantum")]
+	pub fn derive_offer_pq_seed(&self) -> Option<[u8; 32]> {
+		match self {
+			Metadata::DerivedSigningPubkey(material) => Some(
+				crate::offers::pq::pq_seed_from_offer_hmac(material.hmac.clone(), &material.nonce),
+			),
+			_ => None,
+		}
+	}
+
 	pub fn derive_from<W: Writeable, T: secp256k1::Signing>(
 		self, iv_bytes: &[u8; IV_LEN], tlv_stream: W, secp_ctx: Option<&Secp256k1<T>>,
 	) -> (Self, Option<Keypair>) {
@@ -277,6 +293,14 @@ impl MetadataMaterial {
 			},
 		}
 	}
+}
+
+/// Recovers the per-offer ML-DSA seed used to sign a `Bolt12Invoice`, from the recipient's
+/// symmetric offer key and the offer `nonce` recovered while verifying the `invoice_request`. This
+/// matches the seed the offer committed to via [`Metadata::derive_offer_pq_seed`].
+#[cfg(feature = "post-quantum")]
+pub(super) fn recover_offer_pq_seed(expanded_key: &ExpandedKey, nonce: Nonce) -> [u8; 32] {
+	crate::offers::pq::pq_seed_from_offer_hmac(expanded_key.hmac_for_offer(), &nonce)
 }
 
 pub(super) fn derive_keys(nonce: Nonce, expanded_key: &ExpandedKey) -> Keypair {

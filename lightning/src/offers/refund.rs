@@ -189,6 +189,8 @@ macro_rules! refund_explicit_metadata_builder_methods {
 					payer_signing_pubkey: signing_pubkey,
 					payer_note: None,
 					paths: None,
+					#[cfg(feature = "post-quantum")]
+					pq_kem_cts: None,
 					#[cfg(test)]
 					experimental_foo: None,
 					#[cfg(test)]
@@ -233,6 +235,8 @@ macro_rules! refund_builder_methods { (
 				payer: PayerContents(metadata), description: String::new(), absolute_expiry: None,
 				issuer: None, chain: None, amount_msats, features: InvoiceRequestFeatures::empty(),
 				quantity: None, payer_signing_pubkey: node_id, payer_note: None, paths: None,
+				#[cfg(feature = "post-quantum")]
+				pq_kem_cts: None,
 				#[cfg(test)]
 				experimental_foo: None,
 				#[cfg(test)]
@@ -320,6 +324,31 @@ macro_rules! refund_builder_methods { (
 	pub fn build($($self_mut)* $self: $self_type) -> Result<Refund, Bolt12SemanticError> {
 		if $self.refund.chain() == $self.refund.implied_chain() {
 			$self.refund.chain = None;
+		}
+
+		// PQ: convey each post-quantum blinded path's introduction-node ML-KEM ciphertext in a
+		// typed experimental record so a responder that parses the refund from its encoded form
+		// can reply with the invoice over the hybrid path. Set before metadata derivation so the
+		// payer's stateless-verification HMAC covers the record and a stripped record fails
+		// verification once the invoice echoes the refund back.
+		#[cfg(feature = "post-quantum")]
+		{
+			let kem_cts: Vec<(usize, [u8; crate::crypto::pq_kem::PQ_KEM_CT_LEN])> = $self
+				.refund
+				.paths
+				.as_ref()
+				.map(|paths| {
+					paths
+						.iter()
+						.enumerate()
+						.filter_map(|(i, path)| path.kem_ct().map(|ct| (i, ct)))
+						.collect()
+				})
+				.unwrap_or_default();
+			if !kem_cts.is_empty() {
+				$self.refund.pq_kem_cts =
+					Some(crate::offers::pq::encode_refund_pq_kem_cts(&kem_cts));
+			}
 		}
 
 		// Create the metadata for stateless verification of a Bolt12Invoice.
@@ -469,6 +498,11 @@ pub(super) struct RefundContents {
 	payer_signing_pubkey: PublicKey,
 	payer_note: Option<String>,
 	paths: Option<Vec<BlindedMessagePath>>,
+	// PQ: the encoded (path_index, ML-KEM ciphertext) pairs of the refund's post-quantum blinded
+	// message paths, set at build time so the metadata HMAC covers them; see
+	// `pq::REFUND_PQ_KEM_CT_TYPE`.
+	#[cfg(feature = "post-quantum")]
+	pq_kem_cts: Option<Vec<u8>>,
 	#[cfg(test)]
 	experimental_foo: Option<u64>,
 	#[cfg(test)]
@@ -808,6 +842,8 @@ impl RefundContents {
 		};
 
 		let experimental_invoice_request = ExperimentalInvoiceRequestTlvStreamRef {
+			#[cfg(feature = "post-quantum")]
+			pq_kem_cts: self.pq_kem_cts.as_ref(),
 			#[cfg(test)]
 			experimental_bar: self.experimental_bar,
 		};
@@ -848,12 +884,20 @@ type RefundTlvStream = (
 	ExperimentalInvoiceRequestTlvStream,
 );
 
+// PQ: the experimental invoice_request Ref stream gains a lifetime under the post-quantum feature
+// (it carries a borrowed refund ciphertext record); this alias keeps the shared tuple type aliases
+// below spelled the same in both builds.
+#[cfg(feature = "post-quantum")]
+type ExpInvReqRef<'a> = ExperimentalInvoiceRequestTlvStreamRef<'a>;
+#[cfg(not(feature = "post-quantum"))]
+type ExpInvReqRef<'a> = ExperimentalInvoiceRequestTlvStreamRef;
+
 type RefundTlvStreamRef<'a> = (
 	PayerTlvStreamRef<'a>,
 	OfferTlvStreamRef<'a>,
 	InvoiceRequestTlvStreamRef<'a>,
 	ExperimentalOfferTlvStreamRef,
-	ExperimentalInvoiceRequestTlvStreamRef,
+	ExpInvReqRef<'a>,
 );
 
 impl CursorReadable for RefundTlvStream {
@@ -886,7 +930,25 @@ impl TryFrom<Vec<u8>> for Refund {
 	fn try_from(bytes: Vec<u8>) -> Result<Self, Self::Error> {
 		let refund = ParsedMessage::<RefundTlvStream>::try_from(bytes)?;
 		let ParsedMessage { bytes, tlv_stream } = refund;
+		#[cfg(not(feature = "post-quantum"))]
 		let contents = RefundContents::try_from(tlv_stream)?;
+		// Re-attach each post-quantum blinded path's introduction-node ML-KEM ciphertext (carried
+		// in the refund's typed experimental record, not in the path's own serialization) so the
+		// responder can reply with the invoice over the hybrid path.
+		#[cfg(feature = "post-quantum")]
+		let contents = {
+			let mut contents = RefundContents::try_from(tlv_stream)?;
+			if let Some(value) = contents.pq_kem_cts.clone() {
+				if let Some(paths) = contents.paths.as_mut() {
+					for (idx, ct) in crate::offers::pq::parse_refund_pq_kem_cts(&value) {
+						if let Some(path) = paths.get_mut(idx) {
+							path.set_kem_ct(Some(ct));
+						}
+					}
+				}
+			}
+			contents
+		};
 
 		Ok(Refund { bytes, contents })
 	}
@@ -926,6 +988,8 @@ impl TryFrom<RefundTlvStream> for RefundContents {
 				experimental_foo,
 			},
 			ExperimentalInvoiceRequestTlvStream {
+				#[cfg(feature = "post-quantum")]
+				pq_kem_cts,
 				#[cfg(test)]
 				experimental_bar,
 			},
@@ -1003,6 +1067,8 @@ impl TryFrom<RefundTlvStream> for RefundContents {
 			payer_signing_pubkey,
 			payer_note,
 			paths,
+			#[cfg(feature = "post-quantum")]
+			pq_kem_cts,
 			#[cfg(test)]
 			experimental_foo,
 			#[cfg(test)]
@@ -1112,7 +1178,11 @@ mod tests {
 					offer_from_hrn: None,
 				},
 				ExperimentalOfferTlvStreamRef { experimental_foo: None },
-				ExperimentalInvoiceRequestTlvStreamRef { experimental_bar: None },
+				ExperimentalInvoiceRequestTlvStreamRef {
+					#[cfg(feature = "post-quantum")]
+					pq_kem_cts: None,
+					experimental_bar: None,
+				},
 			),
 		);
 

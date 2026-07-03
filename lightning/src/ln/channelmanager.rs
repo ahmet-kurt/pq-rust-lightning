@@ -3897,6 +3897,12 @@ impl<
 			our_network_pubkey, current_timestamp, expanded_inbound_key,
 			node_signer.get_receive_auth_key(), secp_ctx.clone(), message_router, logger.clone(),
 		);
+		// PQ: when configured to, supply our own static ML-KEM key so the flow builds post-quantum
+		// blinded paths for our offers/invoices (default off preserves interop with classical payers).
+		#[cfg(feature = "post-quantum")]
+		let flow = flow.with_pq_kem_key(
+			config.build_post_quantum_blinded_paths.then(|| node_signer.get_pq_kem_node_id()).flatten(),
+		);
 
 		ChannelManager {
 			config: RwLock::new(config),
@@ -6370,6 +6376,7 @@ impl<
 				self.duration_since_epoch(),
 				&self.entropy_source,
 				&self.pending_events,
+				&logger,
 			);
 			match outbound_pmts_res {
 				Ok(()) => {},
@@ -15564,7 +15571,7 @@ macro_rules! create_refund_builder { ($self: ident, $builder: ty) => {
 		let expiration = StaleExpiration::AbsoluteTimeout(absolute_expiry);
 		$self.pending_outbound_payments
 			.add_new_awaiting_invoice(
-				payment_id, expiration, retry_strategy, route_params_config, None,
+				payment_id, expiration, retry_strategy, route_params_config, None, None,
 			)
 			.map_err(|_| Bolt12SemanticError::DuplicatePaymentId)?;
 
@@ -15605,7 +15612,7 @@ macro_rules! create_refund_builder { ($self: ident, $builder: ty) => {
 		let expiration = StaleExpiration::AbsoluteTimeout(absolute_expiry);
 		$self.pending_outbound_payments
 			.add_new_awaiting_invoice(
-				payment_id, expiration, retry_strategy, route_params_config, None,
+				payment_id, expiration, retry_strategy, route_params_config, None, None,
 			)
 			.map_err(|_| Bolt12SemanticError::DuplicatePaymentId)?;
 
@@ -15720,6 +15727,12 @@ impl<
 		&self, offer: &Offer, amount_msats: Option<u64>, payment_id: PaymentId,
 		optional_params: OptionalOfferPaymentParams,
 	) -> Result<(), Bolt12SemanticError> {
+		// PQ: anchor the responding invoice's ML-DSA signature to the offer's committed issuer key, if
+		// the offer is post-quantum, so we refuse to pay a substituted/tampered/downgraded invoice.
+		#[cfg(feature = "post-quantum")]
+		let offer_pq_id = offer.issuer_pq_id().map(|k| k.to_vec());
+		#[cfg(not(feature = "post-quantum"))]
+		let offer_pq_id: Option<Vec<u8>> = None;
 		let create_pending_payment_fn = |retryable_invoice_request: RetryableInvoiceRequest| {
 			self.pending_outbound_payments
 				.add_new_awaiting_invoice(
@@ -15728,6 +15741,7 @@ impl<
 					optional_params.retry_strategy,
 					optional_params.route_params_config,
 					Some(retryable_invoice_request),
+					offer_pq_id.clone(),
 				)
 				.map_err(|_| Bolt12SemanticError::DuplicatePaymentId)
 		};
@@ -15749,6 +15763,11 @@ impl<
 		&self, offer: &OfferFromHrn, amount_msats: u64, payment_id: PaymentId,
 		optional_params: OptionalOfferPaymentParams,
 	) -> Result<(), Bolt12SemanticError> {
+		// PQ: anchor the responding invoice's ML-DSA signature to the offer's committed issuer key.
+		#[cfg(feature = "post-quantum")]
+		let offer_pq_id = offer.offer.issuer_pq_id().map(|k| k.to_vec());
+		#[cfg(not(feature = "post-quantum"))]
+		let offer_pq_id: Option<Vec<u8>> = None;
 		let create_pending_payment_fn = |retryable_invoice_request: RetryableInvoiceRequest| {
 			self.pending_outbound_payments
 				.add_new_awaiting_invoice(
@@ -15757,6 +15776,7 @@ impl<
 					optional_params.retry_strategy,
 					optional_params.route_params_config,
 					Some(retryable_invoice_request),
+					offer_pq_id.clone(),
 				)
 				.map_err(|_| Bolt12SemanticError::DuplicatePaymentId)
 		};
@@ -15791,6 +15811,11 @@ impl<
 		&self, offer: &Offer, amount_msats: Option<u64>, payment_id: PaymentId,
 		optional_params: OptionalOfferPaymentParams, quantity: u64,
 	) -> Result<(), Bolt12SemanticError> {
+		// PQ: anchor the responding invoice's ML-DSA signature to the offer's committed issuer key.
+		#[cfg(feature = "post-quantum")]
+		let offer_pq_id = offer.issuer_pq_id().map(|k| k.to_vec());
+		#[cfg(not(feature = "post-quantum"))]
+		let offer_pq_id: Option<Vec<u8>> = None;
 		let create_pending_payment_fn = |retryable_invoice_request: RetryableInvoiceRequest| {
 			self.pending_outbound_payments
 				.add_new_awaiting_invoice(
@@ -15799,6 +15824,7 @@ impl<
 					optional_params.retry_strategy,
 					optional_params.route_params_config,
 					Some(retryable_invoice_request),
+					offer_pq_id.clone(),
 				)
 				.map_err(|_| Bolt12SemanticError::DuplicatePaymentId)
 		};
@@ -15905,7 +15931,23 @@ impl<
 			None,
 		)?;
 
+		#[cfg(not(feature = "post-quantum"))]
 		let invoice = builder.allow_mpp().build_and_sign(secp_ctx)?;
+
+		// PQ: a refund commits no offer key, so the response invoice's signature stays classical (an
+		// ML-DSA signature would have no key for the payer to anchor it to). Its blinded payment paths
+		// can still be hybrid though, so convey their per-hop ML-KEM ciphertexts the way the offer flow
+		// does, just without the unanchorable signature, so the payer can pay over the post-quantum tail.
+		#[cfg(feature = "post-quantum")]
+		let invoice = {
+			let invoice = builder.allow_mpp().build_and_sign_pq(secp_ctx, None)?;
+			let conveyed =
+				invoice.payment_paths().iter().filter(|path| path.kem_ct().is_some()).count();
+			if conveyed > 0 {
+				log_info!(self.logger, "PQ: conveyed {} ML-KEM ciphertext list(s) for a BOLT 12 refund invoice's hybrid blinded payment paths", conveyed);
+			}
+			invoice
+		};
 
 		self.flow.enqueue_invoice(invoice.clone(), refund, self.get_peers_for_blinded_path())?;
 		Ok(invoice)
@@ -18088,6 +18130,13 @@ impl<
 						log_trace!($logger, "{}", err_msg);
 						InvoiceError::from_string(err_msg.to_string())
 					},
+					// PQ: the responding invoice failed post-quantum (ML-DSA) verification against the
+					// offer's committed key (substituted, tampered, or downgraded); refuse to pay it.
+					#[cfg(feature = "post-quantum")]
+					Err(Bolt12PaymentError::PqVerificationFailed) => {
+						log_trace!($logger, "PQ: not paying BOLT 12 invoice that failed ML-DSA verification");
+						return None;
+					},
 					Err(Bolt12PaymentError::InvalidAmount) => {
 						debug_assert!(false, "Got InvalidAmount paying internally-sourced invoice; this shouldn't happen");
 						log_error!($logger, "Got InvalidAmount paying internally-sourced invoice; this shouldn't happen");
@@ -18157,6 +18206,20 @@ impl<
 
 						match result {
 							Ok((builder, context)) => {
+								// Attach the hybrid post-quantum (ML-DSA) signature anchored to the
+								// per-offer key committed in the offer, if any, inserted before the
+								// classical signing so the classical signature covers it.
+								#[cfg(feature = "post-quantum")]
+								let res = builder
+									.build_and_sign_pq(&self.secp_ctx, request.pq_seed.as_ref())
+									.map(|invoice| {
+										if request.pq_seed.is_some() {
+											log_info!(self.logger, "PQ: attached ML-DSA signature to a BOLT 12 invoice ({}-byte signature)", crate::sign::pq::PQ_SIGNATURE_LEN);
+										}
+										invoice
+									})
+									.map_err(InvoiceError::from);
+								#[cfg(not(feature = "post-quantum"))]
 								let res = builder
 									.build_and_sign(&self.secp_ctx)
 									.map_err(InvoiceError::from);
@@ -18230,7 +18293,7 @@ impl<
 					// Update the corresponding entry in `PendingOutboundPayment` for this invoice.
 					// This ensures that event generation remains idempotent in case we receive
 					// the same invoice multiple times.
-					self.pending_outbound_payments.mark_invoice_received(&invoice, payment_id).ok()?;
+					self.pending_outbound_payments.mark_invoice_received(&invoice, payment_id, &logger).ok()?;
 
 					let event = Event::InvoiceReceived {
 						payment_id, invoice, context, responder,
@@ -21266,6 +21329,12 @@ impl<
 			args.logger.clone(),
 		)
 		.with_async_payments_offers_cache(async_receive_offer_cache);
+		// PQ: when configured to, supply our own static ML-KEM key so the flow builds post-quantum
+		// blinded paths for our offers/invoices (default off preserves interop with classical payers).
+		#[cfg(feature = "post-quantum")]
+		let flow = flow.with_pq_kem_key(
+			args.config.build_post_quantum_blinded_paths.then(|| args.node_signer.get_pq_kem_node_id()).flatten(),
+		);
 
 		let channel_manager = ChannelManager {
 			chain_hash,

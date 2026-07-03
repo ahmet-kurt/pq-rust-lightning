@@ -479,6 +479,22 @@ pub trait MessageRouter {
 		&self, recipient: PublicKey, local_node_receive_key: ReceiveAuthKey,
 		context: MessageContext, peers: Vec<MessageForwardNode>, secp_ctx: &Secp256k1<T>,
 	) -> Result<Vec<BlindedMessagePath>, ()>;
+
+	/// PQ: builds post-quantum [`BlindedMessagePath`]s to the `recipient` (us), folding a per-hop
+	/// ML-KEM secret into each hop's blinding secret so the route and message content stay
+	/// confidential against a Shor adversary (the cascade carries it to the onion key).
+	/// `recipient_pq_kem_key` is our own static ML-KEM key; each intermediate hop's key is resolved
+	/// from its gossip pin. Returns `Err(())` if no fully-post-quantum path can be built, in which case
+	/// the caller falls back to [`Self::create_blinded_paths`]. The default returns `Err(())`.
+	#[cfg(feature = "post-quantum")]
+	fn create_pq_blinded_paths<T: secp256k1::Signing + secp256k1::Verification>(
+		&self, _recipient: PublicKey,
+		_recipient_pq_kem_key: [u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN],
+		_local_node_receive_key: ReceiveAuthKey, _context: MessageContext,
+		_peers: Vec<MessageForwardNode>, _secp_ctx: &Secp256k1<T>,
+	) -> Result<Vec<BlindedMessagePath>, ()> {
+		Err(())
+	}
 }
 
 impl<T: MessageRouter + ?Sized, R: Deref<Target = T>> MessageRouter for R {
@@ -494,6 +510,22 @@ impl<T: MessageRouter + ?Sized, R: Deref<Target = T>> MessageRouter for R {
 	) -> Result<Vec<BlindedMessagePath>, ()> {
 		self.deref().create_blinded_paths(
 			recipient,
+			local_node_receive_key,
+			context,
+			peers,
+			secp_ctx,
+		)
+	}
+
+	#[cfg(feature = "post-quantum")]
+	fn create_pq_blinded_paths<S: secp256k1::Signing + secp256k1::Verification>(
+		&self, recipient: PublicKey, recipient_pq_kem_key: [u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN],
+		local_node_receive_key: ReceiveAuthKey, context: MessageContext,
+		peers: Vec<MessageForwardNode>, secp_ctx: &Secp256k1<S>,
+	) -> Result<Vec<BlindedMessagePath>, ()> {
+		self.deref().create_pq_blinded_paths(
+			recipient,
+			recipient_pq_kem_key,
 			local_node_receive_key,
 			context,
 			peers,
@@ -659,6 +691,62 @@ impl<G: Deref<Target = NetworkGraph<L>>, L: Logger, ES: EntropySource>
 		Ok(paths)
 	}
 
+	/// PQ: builds post-quantum blinded message paths, mirroring the classical introduction-node choice
+	/// (a one-hop path when the recipient is announced, otherwise a path through a peer), but each hop
+	/// must carry a gossip-pinned ML-KEM key and the path is hybrid (`new_pq`). Post-quantum paths use
+	/// no dummy or compact (SCID) hops. Returns `Err(())` if no fully-post-quantum path can be built.
+	#[cfg(feature = "post-quantum")]
+	pub(crate) fn create_pq_blinded_paths_from_iter<
+		I: ExactSizeIterator<Item = MessageForwardNode>,
+		T: secp256k1::Signing + secp256k1::Verification,
+	>(
+		network_graph: &G, recipient: PublicKey,
+		recipient_pq_kem_key: [u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN],
+		local_node_receive_key: ReceiveAuthKey, context: MessageContext, peers: I,
+		entropy_source: &ES, secp_ctx: &Secp256k1<T>,
+	) -> Result<Vec<BlindedMessagePath>, ()> {
+		const MAX_PATHS: usize = 3;
+
+		let network_graph = network_graph.deref().read_only();
+		let is_recipient_announced =
+			network_graph.nodes().contains_key(&NodeId::from_pubkey(&recipient));
+
+		let mut paths: Vec<BlindedMessagePath> = if !is_recipient_announced {
+			peers
+				.filter_map(|peer| {
+					let hop_kem_key = network_graph
+						.node(&NodeId::from_pubkey(&peer.node_id))
+						.and_then(|info| info.pq_kem_node_id())?;
+					BlindedMessagePath::new_pq(
+						&[peer], &[hop_kem_key], recipient, &recipient_pq_kem_key,
+						local_node_receive_key, context.clone(), entropy_source, secp_ctx,
+					)
+					.ok()
+				})
+				.take(MAX_PATHS)
+				.collect()
+		} else {
+			Vec::new()
+		};
+
+		// One-hop post-quantum path (recipient = introduction node), which still protects the message
+		// content, when the recipient is announced.
+		if paths.is_empty() && is_recipient_announced {
+			if let Ok(path) = BlindedMessagePath::new_pq(
+				&[], &[], recipient, &recipient_pq_kem_key, local_node_receive_key, context,
+				entropy_source, secp_ctx,
+			) {
+				paths.push(path);
+			}
+		}
+
+		if paths.is_empty() {
+			Err(())
+		} else {
+			Ok(paths)
+		}
+	}
+
 	pub(crate) fn find_path(
 		network_graph: &G, sender: PublicKey, peers: Vec<PublicKey>, mut destination: Destination,
 	) -> Result<OnionMessagePath, ()> {
@@ -733,6 +821,24 @@ impl<G: Deref<Target = NetworkGraph<L>>, L: Logger, ES: EntropySource> MessageRo
 			false,
 		)
 	}
+
+	#[cfg(feature = "post-quantum")]
+	fn create_pq_blinded_paths<T: secp256k1::Signing + secp256k1::Verification>(
+		&self, recipient: PublicKey, recipient_pq_kem_key: [u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN],
+		local_node_receive_key: ReceiveAuthKey, context: MessageContext,
+		peers: Vec<MessageForwardNode>, secp_ctx: &Secp256k1<T>,
+	) -> Result<Vec<BlindedMessagePath>, ()> {
+		Self::create_pq_blinded_paths_from_iter(
+			&self.network_graph,
+			recipient,
+			recipient_pq_kem_key,
+			local_node_receive_key,
+			context,
+			peers.into_iter(),
+			&self.entropy_source,
+			secp_ctx,
+		)
+	}
 }
 
 /// This message router is similar to [`DefaultMessageRouter`], but it always creates
@@ -791,6 +897,27 @@ impl<G: Deref<Target = NetworkGraph<L>>, L: Logger, ES: EntropySource> MessageRo
 			&self.entropy_source,
 			secp_ctx,
 			true,
+		)
+	}
+
+	#[cfg(feature = "post-quantum")]
+	fn create_pq_blinded_paths<T: secp256k1::Signing + secp256k1::Verification>(
+		&self, recipient: PublicKey, recipient_pq_kem_key: [u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN],
+		local_node_receive_key: ReceiveAuthKey, context: MessageContext,
+		mut peers: Vec<MessageForwardNode>, secp_ctx: &Secp256k1<T>,
+	) -> Result<Vec<BlindedMessagePath>, ()> {
+		for peer in peers.iter_mut() {
+			peer.short_channel_id = None;
+		}
+		DefaultMessageRouter::create_pq_blinded_paths_from_iter(
+			&self.network_graph,
+			recipient,
+			recipient_pq_kem_key,
+			local_node_receive_key,
+			context,
+			peers.into_iter(),
+			&self.entropy_source,
+			secp_ctx,
 		)
 	}
 }
@@ -1122,6 +1249,15 @@ pub fn create_onion_message<
 			},
 		}
 	};
+	// PQ: a post-quantum blinded path carries the introduction node's ML-KEM ciphertext. When we
+	// send straight to the introduction node (no unblinded intermediate hops, the supported
+	// post-quantum case), place it in the outbound message header so the introduction node can
+	// reconstruct its hybrid per-hop secret.
+	#[cfg(feature = "post-quantum")]
+	let pq_kem_ciphertext = match &destination {
+		Destination::BlindedPath(path) if intermediate_nodes.is_empty() => path.kem_ct(),
+		_ => None,
+	};
 	let (packet_payloads, packet_keys) = packet_payloads_and_keys(
 		&secp_ctx,
 		intermediate_nodes,
@@ -1136,7 +1272,12 @@ pub fn create_onion_message<
 		construct_onion_message_packet(packet_payloads, packet_keys, prng_seed)
 			.map_err(|()| SendError::TooBigPacket)?;
 
-	let message = OnionMessage { blinding_point, onion_routing_packet };
+	let message = OnionMessage {
+		blinding_point,
+		onion_routing_packet,
+		#[cfg(feature = "post-quantum")]
+		kem_ciphertext: pq_kem_ciphertext,
+	};
 	Ok((first_node_id, message, first_node_addresses))
 }
 
@@ -1154,6 +1295,27 @@ pub fn peel_onion_message<NS: NodeSigner, L: Logger, CMH: CustomOnionMessageHand
 			log_error!(logger, "Failed to retrieve node secret: {:?}", e);
 			return Err(());
 		},
+	};
+	// PQ: on a post-quantum path the per-hop secret is hybrid. Decapsulate the ML-KEM ciphertext the
+	// message carries for us and fold it into the per-hop secret before any key is derived, so the
+	// route stays hidden. The onion packet key derives from the blinded node id factor below, which
+	// is itself derived from this secret, so this also protects the onion payload.
+	#[cfg(feature = "post-quantum")]
+	let control_tlvs_ss = if let Some(kem_ct) = msg.kem_ciphertext.as_ref() {
+		match node_signer.pq_kem_decapsulate(kem_ct) {
+			Some(kem_ss) => {
+				log_trace!(logger, "PQ: decapsulated ML-KEM secret while peeling onion message");
+				bitcoin::secp256k1::ecdh::SharedSecret::from_bytes(
+					crate::crypto::pq_kem::mix_blinded_path_secret(control_tlvs_ss.as_ref(), &kem_ss),
+				)
+			},
+			None => {
+				log_trace!(logger, "PQ: failed to decapsulate onion message ML-KEM ciphertext");
+				return Err(());
+			},
+		}
+	} else {
+		control_tlvs_ss
 	};
 	let onion_decode_ss = {
 		let blinding_factor = {
@@ -1214,7 +1376,13 @@ pub fn peel_onion_message<NS: NodeSigner, L: Logger, CMH: CustomOnionMessageHand
 				},
 			},
 		};
-		Ok(OnionMessage { blinding_point, onion_routing_packet: outgoing_packet })
+		Ok(OnionMessage {
+			blinding_point,
+			onion_routing_packet: outgoing_packet,
+			// Set by the caller for the next hop when forwarding along a post-quantum path.
+			#[cfg(feature = "post-quantum")]
+			kem_ciphertext: None,
+		})
 	};
 
 	match next_hop {
@@ -1313,6 +1481,8 @@ pub fn peel_onion_message<NS: NodeSigner, L: Logger, CMH: CustomOnionMessageHand
 			Payload::Forward(ForwardControlTlvs::Unblinded(ForwardTlvs {
 				next_hop,
 				next_blinding_override,
+				#[cfg(feature = "post-quantum")]
+				next_kem_ciphertext,
 			})),
 			Some((next_hop_hmac, new_packet_bytes)),
 		)) => {
@@ -1322,6 +1492,12 @@ pub fn peel_onion_message<NS: NodeSigner, L: Logger, CMH: CustomOnionMessageHand
 				new_packet_bytes,
 				next_blinding_override,
 			)?;
+
+			// PQ: carry the next hop's ML-KEM ciphertext (decrypted from our forward TLVs) into the
+			// outbound message header so the next hop can reconstruct its hybrid per-hop secret.
+			#[cfg(feature = "post-quantum")]
+			let onion_message =
+				OnionMessage { kem_ciphertext: next_kem_ciphertext, ..onion_message };
 
 			Ok(PeeledOnion::Forward(next_hop, onion_message))
 		},
@@ -2464,6 +2640,9 @@ fn packet_payloads_and_keys<
 						Payload::Forward(ForwardControlTlvs::Unblinded(ForwardTlvs {
 							next_hop: NextMessageHop::NodeId(unblinded_pk_opt.unwrap()),
 							next_blinding_override: None,
+							// Unblinded sender-prefix hops are classical for now (no ML-KEM).
+							#[cfg(feature = "post-quantum")]
+							next_kem_ciphertext: None,
 						})),
 						ss,
 					));
@@ -2476,6 +2655,8 @@ fn packet_payloads_and_keys<
 						Payload::Forward(ForwardControlTlvs::Unblinded(ForwardTlvs {
 							next_hop: NextMessageHop::NodeId(intro_node_id),
 							next_blinding_override: Some(blinding_pt),
+							#[cfg(feature = "post-quantum")]
+							next_kem_ciphertext: None,
 						})),
 						control_tlvs_ss,
 					));

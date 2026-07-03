@@ -507,6 +507,32 @@ impl<'a> MessageRouter for TestMessageRouter<'a> {
 			),
 		}
 	}
+
+	#[cfg(feature = "post-quantum")]
+	fn create_pq_blinded_paths<T: secp256k1::Signing + secp256k1::Verification>(
+		&self, recipient: PublicKey, recipient_pq_kem_key: [u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN],
+		local_node_receive_key: ReceiveAuthKey, context: MessageContext,
+		peers: Vec<MessageForwardNode>, secp_ctx: &Secp256k1<T>,
+	) -> Result<Vec<BlindedMessagePath>, ()> {
+		let mut peers = peers;
+		{
+			let peers_override = self.peers_override.lock().unwrap();
+			if !peers_override.is_empty() {
+				peers = peers_override
+					.iter()
+					.map(|pk| MessageForwardNode { node_id: *pk, short_channel_id: None })
+					.collect();
+			}
+		}
+		match &self.inner {
+			TestMessageRouterInternal::Default(inner) => inner.create_pq_blinded_paths(
+				recipient, recipient_pq_kem_key, local_node_receive_key, context, peers, secp_ctx,
+			),
+			TestMessageRouterInternal::NodeId(inner) => inner.create_pq_blinded_paths(
+				recipient, recipient_pq_kem_key, local_node_receive_key, context, peers, secp_ctx,
+			),
+		}
+	}
 }
 
 pub struct OnlyReadsKeysInterface {}

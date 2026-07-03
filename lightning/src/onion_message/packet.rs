@@ -244,8 +244,17 @@ impl<T: OnionMessageContents> Writeable for (Payload<T>, [u8; 32]) {
 				control_tlvs_from_local_node: _,
 				control_tlvs_from_phantom_participant: _,
 			} => {
+				// PQ: carry the reply path's introduction-node ML-KEM ciphertext (type 3) alongside
+				// the reply path (type 2) so the recipient can reply over a post-quantum path. `None`
+				// on a classical path, so nothing is written and the bytes stay identical to vanilla.
+				#[cfg(feature = "post-quantum")]
+				let reply_path_kem_ct: Option<Vec<u8>> =
+					reply_path.as_ref().and_then(|p| p.kem_ct()).map(|ct| ct.to_vec());
+				#[cfg(not(feature = "post-quantum"))]
+				let reply_path_kem_ct: Option<Vec<u8>> = None;
 				_encode_varint_length_prefixed_tlv!(w, {
 					(2, reply_path, option),
+					(3, reply_path_kem_ct, option),
 					(4, encrypted_bytes, required_vec),
 					(message.tlv_type(), message, required)
 				})
@@ -265,9 +274,15 @@ impl<T: OnionMessageContents> Writeable for (Payload<T>, [u8; 32]) {
 				control_tlvs_from_local_node: _,
 				control_tlvs_from_phantom_participant: _,
 			} => {
+				#[cfg(feature = "post-quantum")]
+				let reply_path_kem_ct: Option<Vec<u8>> =
+					reply_path.as_ref().and_then(|p| p.kem_ct()).map(|ct| ct.to_vec());
+				#[cfg(not(feature = "post-quantum"))]
+				let reply_path_kem_ct: Option<Vec<u8>> = None;
 				let write_adapter = ChaChaPolyWriteAdapter::new(self.1, &control_tlvs);
 				_encode_varint_length_prefixed_tlv!(w, {
 					(2, reply_path, option),
+					(3, reply_path_kem_ct, option),
 					(4, write_adapter, required),
 					(message.tlv_type(), message, required)
 				})
@@ -290,6 +305,9 @@ impl<H: CustomOnionMessageHandler + ?Sized, L: Logger + ?Sized>
 		let v: BigSize = Readable::read(r)?;
 		let mut rd = FixedLengthReader::new(r, v.0);
 		let mut reply_path: Option<BlindedMessagePath> = None;
+		// PQ: the reply path's introduction-node ML-KEM ciphertext (type 3), re-attached to the reply
+		// path below so the recipient can reply over a post-quantum path.
+		let mut reply_path_kem_ct: Option<Vec<u8>> = None;
 		let mut read_adapter: Option<ChaChaTriPolyReadAdapter<ControlTlvs>> = None;
 		let rho = onion_utils::gen_rho_from_shared_secret(&encrypted_tlvs_ss.secret_bytes());
 		let read_adapter_args =
@@ -299,6 +317,7 @@ impl<H: CustomOnionMessageHandler + ?Sized, L: Logger + ?Sized>
 
 		decode_tlv_stream_with_custom_tlv_decode!(&mut rd, {
 			(2, reply_path, option),
+			(3, reply_path_kem_ct, option),
 			(4, read_adapter, (option: LengthReadableArgs, read_adapter_args)),
 		}, |msg_type, msg_reader| {
 			if msg_type < 64 { return Ok(false) }
@@ -332,6 +351,18 @@ impl<H: CustomOnionMessageHandler + ?Sized, L: Logger + ?Sized>
 			}
 		});
 		rd.eat_remaining().map_err(|_| DecodeError::ShortRead)?;
+
+		// PQ: re-attach the reply path's ML-KEM ciphertext so the recipient can reply over it.
+		#[cfg(feature = "post-quantum")]
+		if let (Some(path), Some(ct_bytes)) = (reply_path.as_mut(), reply_path_kem_ct.as_ref()) {
+			if ct_bytes.len() == crate::crypto::pq_kem::PQ_KEM_CT_LEN {
+				let mut ct = [0u8; crate::crypto::pq_kem::PQ_KEM_CT_LEN];
+				ct.copy_from_slice(ct_bytes);
+				path.set_kem_ct(Some(ct));
+			}
+		}
+		#[cfg(not(feature = "post-quantum"))]
+		let _ = &reply_path_kem_ct;
 
 		match read_adapter {
 			None => return Err(DecodeError::InvalidValue),
@@ -372,14 +403,26 @@ pub(crate) enum ControlTlvs {
 
 impl Readable for ControlTlvs {
 	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
+		// Reasoning: Padding refers to filler data added to a packet to increase
+		// its size and obscure its actual length. Since padding contains no meaningful
+		// information, we can safely omit reading it here.
+		// (1, _padding, option),
+		#[cfg(not(feature = "post-quantum"))]
 		_init_and_read_tlv_stream!(r, {
-			// Reasoning: Padding refers to filler data added to a packet to increase
-			// its size and obscure its actual length. Since padding contains no meaningful
-			// information, we can safely omit reading it here.
-			// (1, _padding, option),
 			(2, short_channel_id, option),
 			(4, next_node_id, option),
 			(8, next_blinding_override, option),
+			(65537, context, option),
+			(65539, is_dummy, option),
+		});
+		// On a post-quantum path the forward TLVs additionally carry the next hop's ML-KEM
+		// ciphertext at type 11.
+		#[cfg(feature = "post-quantum")]
+		_init_and_read_tlv_stream!(r, {
+			(2, short_channel_id, option),
+			(4, next_node_id, option),
+			(8, next_blinding_override, option),
+			(11, next_kem_ciphertext, option),
 			(65537, context, option),
 			(65539, is_dummy, option),
 		});
@@ -392,9 +435,12 @@ impl Readable for ControlTlvs {
 		};
 
 		let payload_fmt = match (next_hop, next_blinding_override, is_dummy) {
-			(Some(hop), _, None) => {
-				ControlTlvs::Forward(ForwardTlvs { next_hop: hop, next_blinding_override })
-			},
+			(Some(hop), _, None) => ControlTlvs::Forward(ForwardTlvs {
+				next_hop: hop,
+				next_blinding_override,
+				#[cfg(feature = "post-quantum")]
+				next_kem_ciphertext,
+			}),
 			(None, None, Some(())) => ControlTlvs::Dummy,
 			(None, None, None) => ControlTlvs::Receive(ReceiveTlvs { context }),
 			_ => return Err(DecodeError::InvalidValue),
