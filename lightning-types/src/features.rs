@@ -85,6 +85,8 @@
 //!   (see [BOLT-2](https://github.com/lightning/bolts/pull/989/files) for more information).
 //! - `PostQuantumGossip` - requires/supports post-quantum (ML-DSA / FIPS 204) signatures on
 //!   `node_announcement` and `channel_update` gossip messages (experimental; no assigned BOLT bit).
+//! - `PostQuantumPayments` - requires/supports post-quantum (ML-KEM / FIPS 203) BOLT 4 payment
+//!   onions, carrying a per-hop ciphertext trail alongside the onion (experimental; no assigned BOLT bit).
 //!
 //! LDK knows about the following features, but does not support them:
 //! - `AnchorsNonzeroFeeHtlcTx` - the initial version of anchor outputs, which was later found to be
@@ -172,7 +174,7 @@ mod sealed {
 			// Byte 8 - 16
 			,,,,,,,,,
 			// Byte 17
-			PostQuantumGossip,
+			PostQuantumGossip | PostQuantumPayments,
 			// Byte 18
 			,
 			// Byte 19
@@ -201,7 +203,7 @@ mod sealed {
 			// Byte 8 - 16
 			,,,,,,,,,
 			// Byte 17
-			PostQuantumGossip,
+			PostQuantumGossip | PostQuantumPayments,
 			// Byte 18
 			,
 			// Byte 19
@@ -748,6 +750,17 @@ mod sealed {
 		clear_pq_gossip,
 		supports_pq_gossip,
 		requires_pq_gossip
+	);
+	define_feature!(
+		141, // No assigned BOLT bit for post-quantum payments yet; experimental odd bit next to PostQuantumGossip (139)
+		PostQuantumPayments,
+		[InitContext, NodeContext],
+		"Feature flags for post-quantum (ML-KEM) BOLT 4 payment onions",
+		set_pq_payments_optional,
+		set_pq_payments_required,
+		clear_pq_payments,
+		supports_pq_payments,
+		requires_pq_payments
 	);
 
 	// Note: update the module-level docs when a new feature bit is added!

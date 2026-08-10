@@ -759,6 +759,19 @@ pub struct UpdateAddHTLC {
 	///
 	/// [`experimental`]: https://github.com/lightning/blips/blob/master/blip-0004.md
 	pub accountable: Option<bool>,
+	/// On a post-quantum payment, the serialized ML-KEM ciphertext trail carried alongside the onion
+	/// so each hop can reconstruct its hybrid per-hop secret (a serialized `onion_utils::PqOnionTrail`).
+	/// `None` on a classical payment, so a classical `update_add_htlc` stays byte-identical to vanilla.
+	/// Only meaningful with the `post-quantum` feature; carried as opaque bytes otherwise.
+	pub pq_onion_trail: Option<Vec<u8>>,
+	/// On a post-quantum blinded payment, the fixed-size list of per-hop ML-KEM ciphertexts for the
+	/// blinded hops, carried alongside the onion. A blinded hop decapsulates the front entry (its
+	/// own ciphertext) to derive its hybrid route-blinding secret and rotates that entry to the
+	/// back; a non-blinded forwarding hop passes the list through unchanged so it reaches the
+	/// introduction node intact. `None` outside a post-quantum blinded path, so a classical
+	/// `update_add_htlc` stays byte-identical to vanilla. Carried as opaque bytes without the
+	/// `post-quantum` feature.
+	pub pq_blinded_ct: Option<Vec<u8>>,
 }
 
 struct AccountableBool<T>(T);
@@ -3555,6 +3568,10 @@ impl_writeable_msg!(UpdateAddHTLC, {
 	// and then downgrade. Once this is fixed, update the type here to match BOLTs PR 989.
 	(75537, hold_htlc, option),
 	(106823, accountable, (option, encoding: (bool, AccountableBool))),
+	// Post-quantum payment ciphertext trail (experimental odd type; no assigned BOLT type yet).
+	(120009, pq_onion_trail, option),
+	// Post-quantum blinded-path per-hop ciphertext list (experimental odd type; no assigned BOLT type yet).
+	(120011, pq_blinded_ct, option),
 });
 
 impl LengthReadable for OnionMessage {
@@ -3758,9 +3775,16 @@ impl<'a> Writeable for OutboundTrampolinePayload<'a> {
 	}
 }
 
-impl<NS: NodeSigner> ReadableArgs<(Option<PublicKey>, NS)> for InboundOnionPayload {
-	fn read<R: Read>(r: &mut R, args: (Option<PublicKey>, NS)) -> Result<Self, DecodeError> {
-		let (update_add_blinding_point, node_signer) = args;
+// PQ: the middle tuple element carries this hop's ML-KEM shared secret on a post-quantum blinded
+// path (the ciphertext having been decapsulated by the caller), folded into the route-blinding
+// secret below so the encrypted recipient data is hybrid. It is always `None` on a classical path.
+impl<NS: NodeSigner> ReadableArgs<(Option<PublicKey>, Option<[u8; 32]>, NS)> for InboundOnionPayload {
+	fn read<R: Read>(
+		r: &mut R, args: (Option<PublicKey>, Option<[u8; 32]>, NS),
+	) -> Result<Self, DecodeError> {
+		let (update_add_blinding_point, pq_blinded_kem_ss, node_signer) = args;
+		#[cfg(not(feature = "post-quantum"))]
+		let _ = pq_blinded_kem_ss;
 
 		let mut amt = None;
 		let mut cltv_value = None;
@@ -3839,7 +3863,20 @@ impl<NS: NodeSigner> ReadableArgs<(Option<PublicKey>, NS)> for InboundOnionPaylo
 			let enc_tlvs_ss = node_signer
 				.ecdh(Recipient::Node, &blinding_point, None)
 				.map_err(|_| DecodeError::InvalidValue)?;
-			let rho = onion_utils::gen_rho_from_shared_secret(&enc_tlvs_ss.secret_bytes());
+			// PQ: on a post-quantum blinded path fold this hop's ML-KEM secret into the route-blinding
+			// secret before deriving rho, so the encrypted recipient data is hybrid (a quantum attacker
+			// who recovers the classical secret cannot derive rho).
+			#[cfg(feature = "post-quantum")]
+			let enc_tlvs_ss_bytes = match pq_blinded_kem_ss {
+				Some(kem_ss) => crate::crypto::pq_kem::mix_blinded_path_secret(
+					&enc_tlvs_ss.secret_bytes(),
+					&kem_ss,
+				),
+				None => enc_tlvs_ss.secret_bytes(),
+			};
+			#[cfg(not(feature = "post-quantum"))]
+			let enc_tlvs_ss_bytes = enc_tlvs_ss.secret_bytes();
+			let rho = onion_utils::gen_rho_from_shared_secret(&enc_tlvs_ss_bytes);
 			let receive_auth_key = node_signer.get_receive_auth_key();
 			let phantom_auth_key = node_signer.get_expanded_key().phantom_node_blinded_path_key;
 			let read_args = (rho, receive_auth_key.0, phantom_auth_key);
@@ -3957,9 +3994,19 @@ impl<NS: NodeSigner> ReadableArgs<(Option<PublicKey>, NS)> for InboundOnionPaylo
 	}
 }
 
-impl<NS: NodeSigner> ReadableArgs<(Option<PublicKey>, NS)> for InboundTrampolinePayload {
-	fn read<R: Read>(r: &mut R, args: (Option<PublicKey>, NS)) -> Result<Self, DecodeError> {
-		let (outer_onion_path_key, node_signer) = args;
+// PQ: the middle tuple element carries this hop's ML-KEM shared secret on a post-quantum blinded
+// Trampoline path (the ciphertext having been decapsulated by the caller), folded into the
+// route-blinding secret below so the encrypted recipient data is hybrid. It is always `None` on a
+// classical path.
+impl<NS: NodeSigner> ReadableArgs<(Option<PublicKey>, Option<[u8; 32]>, NS)>
+	for InboundTrampolinePayload
+{
+	fn read<R: Read>(
+		r: &mut R, args: (Option<PublicKey>, Option<[u8; 32]>, NS),
+	) -> Result<Self, DecodeError> {
+		let (outer_onion_path_key, pq_blinded_kem_ss, node_signer) = args;
+		#[cfg(not(feature = "post-quantum"))]
+		let _ = pq_blinded_kem_ss;
 		let receive_auth_key = node_signer.get_receive_auth_key();
 		let phantom_auth_key = node_signer.get_expanded_key().phantom_node_blinded_path_key;
 
@@ -4012,7 +4059,20 @@ impl<NS: NodeSigner> ReadableArgs<(Option<PublicKey>, NS)> for InboundTrampoline
 			let enc_tlvs_ss = node_signer
 				.ecdh(Recipient::Node, &blinding_point, None)
 				.map_err(|_| DecodeError::InvalidValue)?;
-			let rho = onion_utils::gen_rho_from_shared_secret(&enc_tlvs_ss.secret_bytes());
+			// PQ: on a post-quantum blinded Trampoline path fold this hop's ML-KEM secret into the
+			// route-blinding secret before deriving rho, so the encrypted recipient data is hybrid
+			// (a quantum attacker who recovers the classical secret cannot derive rho).
+			#[cfg(feature = "post-quantum")]
+			let enc_tlvs_ss_bytes = match pq_blinded_kem_ss {
+				Some(kem_ss) => crate::crypto::pq_kem::mix_blinded_path_secret(
+					&enc_tlvs_ss.secret_bytes(),
+					&kem_ss,
+				),
+				None => enc_tlvs_ss.secret_bytes(),
+			};
+			#[cfg(not(feature = "post-quantum"))]
+			let enc_tlvs_ss_bytes = enc_tlvs_ss.secret_bytes();
+			let rho = onion_utils::gen_rho_from_shared_secret(&enc_tlvs_ss_bytes);
 			let mut s = Cursor::new(&enc_tlvs);
 			let mut reader = FixedLengthReader::new(&mut s, enc_tlvs.len() as u64);
 			let read_args = (rho, receive_auth_key.0, phantom_auth_key);
@@ -6114,6 +6174,8 @@ mod tests {
 			blinding_point: None,
 			hold_htlc: None,
 			accountable: None,
+			pq_onion_trail: None,
+			pq_blinded_ct: None,
 		};
 		let encoded_value = update_add_htlc.encode();
 		let target_value = <Vec<u8>>::from_hex("020202020202020202020202020202020202020202020202020202020202020200083a840000034d32144668701144760101010101010101010101010101010101010101010101010101010101010101000c89d4ff031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010202020202020202020202020202020202020202020202020202020202020202").unwrap();
@@ -6370,7 +6432,7 @@ mod tests {
 
 		let node_signer = test_utils::TestKeysInterface::new(&[42; 32], Network::Testnet);
 		let inbound_msg =
-			ReadableArgs::read(&mut Cursor::new(&target_value[..]), (None, &node_signer)).unwrap();
+			ReadableArgs::read(&mut Cursor::new(&target_value[..]), (None, None, &node_signer)).unwrap();
 		if let msgs::InboundOnionPayload::Forward(InboundOnionForwardPayload {
 			short_channel_id,
 			amt_to_forward,
@@ -6401,7 +6463,7 @@ mod tests {
 
 		let node_signer = test_utils::TestKeysInterface::new(&[42; 32], Network::Testnet);
 		let inbound_msg =
-			ReadableArgs::read(&mut Cursor::new(&target_value[..]), (None, &node_signer)).unwrap();
+			ReadableArgs::read(&mut Cursor::new(&target_value[..]), (None, None, &node_signer)).unwrap();
 		if let msgs::InboundOnionPayload::Receive(InboundOnionReceivePayload {
 			payment_data: None,
 			sender_intended_htlc_amt_msat,
@@ -6436,7 +6498,7 @@ mod tests {
 
 		let node_signer = test_utils::TestKeysInterface::new(&[42; 32], Network::Testnet);
 		let inbound_msg =
-			ReadableArgs::read(&mut Cursor::new(&target_value[..]), (None, &node_signer)).unwrap();
+			ReadableArgs::read(&mut Cursor::new(&target_value[..]), (None, None, &node_signer)).unwrap();
 		if let msgs::InboundOnionPayload::Receive(InboundOnionReceivePayload {
 			payment_data: Some(FinalOnionHopData { payment_secret, total_msat: 0x1badca1f }),
 			sender_intended_htlc_amt_msat,
@@ -6472,7 +6534,7 @@ mod tests {
 		let node_signer = test_utils::TestKeysInterface::new(&[42; 32], Network::Testnet);
 		assert!(msgs::InboundOnionPayload::read(
 			&mut Cursor::new(&encoded_value[..]),
-			(None, &node_signer)
+			(None, None, &node_signer)
 		)
 		.is_err());
 		let good_type_range_tlvs = vec![((1 << 16) - 3, vec![42]), ((1 << 16) - 1, vec![42; 32])];
@@ -6481,7 +6543,7 @@ mod tests {
 		}
 		let encoded_value = msg.encode();
 		let inbound_msg =
-			ReadableArgs::read(&mut Cursor::new(&encoded_value[..]), (None, &node_signer)).unwrap();
+			ReadableArgs::read(&mut Cursor::new(&encoded_value[..]), (None, None, &node_signer)).unwrap();
 		match inbound_msg {
 			msgs::InboundOnionPayload::Receive(InboundOnionReceivePayload {
 				custom_tlvs, ..
@@ -6507,7 +6569,7 @@ mod tests {
 		assert_eq!(encoded_value, target_value);
 		let node_signer = test_utils::TestKeysInterface::new(&[42; 32], Network::Testnet);
 		let inbound_msg: msgs::InboundOnionPayload =
-			ReadableArgs::read(&mut Cursor::new(&target_value[..]), (None, &node_signer)).unwrap();
+			ReadableArgs::read(&mut Cursor::new(&target_value[..]), (None, None, &node_signer)).unwrap();
 		if let msgs::InboundOnionPayload::Receive(InboundOnionReceivePayload {
 			payment_data: None,
 			payment_metadata: None,
@@ -6846,8 +6908,9 @@ mod tests {
 		let node_signer = test_utils::TestKeysInterface::new(&[42; 32], Network::Testnet);
 		<msgs::InboundOnionPayload as ReadableArgs<(
 			Option<PublicKey>,
+			Option<[u8; 32]>,
 			&test_utils::TestKeysInterface,
-		)>>::read(&mut rd, (None, &&node_signer))
+		)>>::read(&mut rd, (None, None, &&node_signer))
 		.unwrap();
 	}
 	// see above test, needs to be a separate method for use of the serialization macros.
@@ -7016,6 +7079,8 @@ mod tests {
 			blinding_point: None,
 			hold_htlc: None,
 			accountable: None,
+			pq_onion_trail: None,
+			pq_blinded_ct: None,
 		}
 	}
 
@@ -7033,6 +7098,28 @@ mod tests {
 				bool_signal
 			);
 		}
+	}
+
+	#[cfg(feature = "post-quantum")]
+	#[test]
+	fn update_add_htlc_pq_onion_trail_roundtrips() {
+		// The post-quantum ciphertext trail must survive an `update_add_htlc` wire round-trip, and a
+		// classical message (trail absent) must not carry any of the trail bytes.
+		let mut msg = test_update_add_htlc();
+		assert!(msg.pq_onion_trail.is_none());
+		let classical_encoded = msg.encode();
+
+		let trail_bytes = vec![0x5au8; crate::ln::onion_utils::PQ_PAYMENT_TRAIL_LEN];
+		msg.pq_onion_trail = Some(trail_bytes.clone());
+		let encoded = msg.encode();
+		// The trail (plus its TLV framing) is strictly larger than what a classical message carries.
+		assert!(encoded.len() > classical_encoded.len() + trail_bytes.len());
+
+		let decoded: msgs::UpdateAddHTLC =
+			LengthReadable::read_from_fixed_length_buffer(&mut &encoded[..]).unwrap();
+		assert_eq!(decoded.pq_onion_trail, Some(trail_bytes));
+		assert_eq!(decoded.htlc_id, msg.htlc_id);
+		assert_eq!(decoded.accountable, msg.accountable);
 	}
 
 	fn do_test_htlc_accountable_from_u8(accountable_override: Option<u8>, expected: Option<bool>) {

@@ -5901,6 +5901,58 @@ pub fn create_trampoline_forward_blinded_tail<ES: EntropySource>(
 		blinding_point: blinded_path.blinding_point(),
 		excess_final_cltv_expiry_delta: excess_final_cltv_delta,
 		final_value_msat,
+		kem_ct: None,
+	};
+	(tail, blinded_path)
+}
+
+/// Post-quantum counterpart of [`create_trampoline_forward_blinded_tail`]: builds the blinded path
+/// with `BlindedPaymentPath::new_for_trampoline_pq` so every hop's route-blinding secret is hybrid,
+/// and carries the resulting ML-KEM ciphertext list on the returned tail for the sender to place in
+/// the outbound HTLC's `pq_blinded_ct`.
+#[cfg(feature = "post-quantum")]
+pub fn create_trampoline_forward_blinded_tail_pq<ES: EntropySource>(
+	secp_ctx: &bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>, entropy_source: ES,
+	intermediate_nodes: &[ForwardNode<TrampolineForwardTlvs>],
+	intermediate_pq_kem_keys: &[[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]],
+	payee_node_id: PublicKey, payee_pq_kem_key: &[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN],
+	payee_receive_key: ReceiveAuthKey, payee_tlvs: ReceiveTlvs, min_final_cltv_expiry_delta: u32,
+	excess_final_cltv_delta: u32, final_value_msat: u64,
+) -> (BlindedTail, BlindedPaymentPath) {
+	let blinded_path = BlindedPaymentPath::new_for_trampoline_pq(
+		intermediate_nodes,
+		intermediate_pq_kem_keys,
+		payee_node_id,
+		payee_pq_kem_key,
+		payee_receive_key,
+		payee_tlvs,
+		u64::max_value(),
+		min_final_cltv_expiry_delta as u16,
+		entropy_source,
+		secp_ctx,
+	)
+	.unwrap();
+
+	let tail = BlindedTail {
+		trampoline_hops: vec![TrampolineHop {
+			pubkey: intermediate_nodes.first().map(|n| n.node_id).unwrap_or(payee_node_id),
+			node_features: types::features::Features::empty(),
+			fee_msat: compute_fees(
+				final_value_msat,
+				lightning_types::routing::RoutingFees {
+					base_msat: blinded_path.payinfo.fee_base_msat,
+					proportional_millionths: blinded_path.payinfo.fee_proportional_millionths,
+				},
+			)
+			.unwrap(),
+			cltv_expiry_delta: blinded_path.payinfo.cltv_expiry_delta as u32
+				+ excess_final_cltv_delta,
+		}],
+		hops: blinded_path.blinded_hops().to_vec(),
+		blinding_point: blinded_path.blinding_point(),
+		excess_final_cltv_expiry_delta: excess_final_cltv_delta,
+		final_value_msat,
+		kem_ct: blinded_path.kem_ct(),
 	};
 	(tail, blinded_path)
 }

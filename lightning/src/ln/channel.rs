@@ -533,6 +533,13 @@ struct OutboundHTLCOutput {
 	send_timestamp: Option<Duration>,
 	hold_htlc: Option<()>,
 	accountable: bool,
+	// PQ: the serialized ML-KEM ciphertext trail sent alongside the onion in the outbound
+	// `update_add_htlc` on a post-quantum payment, kept so the message can be rebuilt on
+	// retransmit/reconnect. `None` for a classical HTLC.
+	pq_onion_trail: Option<Vec<u8>>,
+	// PQ: the ML-KEM ciphertext list sent in the outbound `update_add_htlc`'s `pq_blinded_ct` on a
+	// post-quantum blinded payment, kept so the message can be rebuilt on retransmit. `None` otherwise.
+	pq_blinded_ct: Option<Vec<u8>>,
 }
 
 /// See AwaitingRemoteRevoke ChannelState for more info
@@ -552,6 +559,12 @@ enum HTLCUpdateAwaitingACK {
 		blinding_point: Option<PublicKey>,
 		hold_htlc: Option<()>,
 		accountable: bool,
+		// PQ: the serialized ML-KEM ciphertext trail to send alongside the onion when this
+		// holding-cell HTLC is freed, on a post-quantum payment. `None` for a classical HTLC.
+		pq_onion_trail: Option<Vec<u8>>,
+		// PQ: the ML-KEM ciphertext list for the outbound `pq_blinded_ct`, sent when this
+		// holding-cell HTLC is freed on a post-quantum blinded payment. `None` otherwise.
+		pq_blinded_ct: Option<Vec<u8>>,
 	},
 	ClaimHTLC {
 		payment_preimage: PaymentPreimage,
@@ -9284,6 +9297,8 @@ where
 						blinding_point,
 						hold_htlc,
 						accountable,
+						ref pq_onion_trail,
+						ref pq_blinded_ct,
 					} => {
 						match self.send_htlc(
 							amount_msat,
@@ -9296,6 +9311,8 @@ where
 							blinding_point,
 							hold_htlc.is_some(),
 							accountable,
+							pq_onion_trail.clone(),
+							pq_blinded_ct.clone(),
 							fee_estimator,
 							logger,
 						) {
@@ -10743,6 +10760,8 @@ where
 					blinding_point: htlc.blinding_point,
 					hold_htlc: htlc.hold_htlc,
 					accountable: Some(htlc.accountable),
+					pq_onion_trail: htlc.pq_onion_trail.clone(),
+					pq_blinded_ct: htlc.pq_blinded_ct.clone(),
 				});
 			}
 		}
@@ -14430,8 +14449,8 @@ where
 	pub fn queue_add_htlc<F: FeeEstimator, L: Logger>(
 		&mut self, amount_msat: u64, payment_hash: PaymentHash, cltv_expiry: u32,
 		source: HTLCSource, onion_routing_packet: msgs::OnionPacket, skimmed_fee_msat: Option<u64>,
-		blinding_point: Option<PublicKey>, accountable: bool,
-		fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L,
+		blinding_point: Option<PublicKey>, accountable: bool, pq_onion_trail: Option<Vec<u8>>,
+		pq_blinded_ct: Option<Vec<u8>>, fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L,
 	) -> Result<(), (LocalHTLCFailureReason, String)> {
 		self.send_htlc(
 			amount_msat,
@@ -14445,6 +14464,8 @@ where
 			// This method is only called for forwarded HTLCs, which are never held at the next hop
 			false,
 			accountable,
+			pq_onion_trail,
+			pq_blinded_ct,
 			fee_estimator,
 			logger,
 		)
@@ -14476,7 +14497,8 @@ where
 		&mut self, amount_msat: u64, payment_hash: PaymentHash, cltv_expiry: u32,
 		source: HTLCSource, onion_routing_packet: msgs::OnionPacket, mut force_holding_cell: bool,
 		skimmed_fee_msat: Option<u64>, blinding_point: Option<PublicKey>, hold_htlc: bool,
-		accountable: bool, fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L,
+		accountable: bool, pq_onion_trail: Option<Vec<u8>>, pq_blinded_ct: Option<Vec<u8>>,
+		fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L,
 	) -> Result<bool, (LocalHTLCFailureReason, String)> {
 		if !matches!(self.context.channel_state, ChannelState::ChannelReady(_))
 			|| self.context.channel_state.is_local_shutdown_sent()
@@ -14560,6 +14582,8 @@ where
 				blinding_point,
 				hold_htlc: hold_htlc.then(|| ()),
 				accountable,
+				pq_onion_trail,
+				pq_blinded_ct,
 			});
 			return Ok(false);
 		}
@@ -14583,6 +14607,8 @@ where
 			send_timestamp,
 			hold_htlc: hold_htlc.then(|| ()),
 			accountable,
+			pq_onion_trail,
+			pq_blinded_ct,
 		});
 		self.context.next_holder_htlc_id += 1;
 
@@ -14819,8 +14845,8 @@ where
 	pub fn send_htlc_and_commit<F: FeeEstimator, L: Logger>(
 		&mut self, amount_msat: u64, payment_hash: PaymentHash, cltv_expiry: u32,
 		source: HTLCSource, onion_routing_packet: msgs::OnionPacket, skimmed_fee_msat: Option<u64>,
-		hold_htlc: bool, accountable: bool, fee_estimator: &LowerBoundedFeeEstimator<F>,
-		logger: &L,
+		hold_htlc: bool, accountable: bool, pq_onion_trail: Option<Vec<u8>>,
+		pq_blinded_ct: Option<Vec<u8>>, fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L,
 	) -> Result<Option<ChannelMonitorUpdate>, ChannelError> {
 		let send_res = self.send_htlc(
 			amount_msat,
@@ -14833,6 +14859,8 @@ where
 			None,
 			hold_htlc,
 			accountable,
+			pq_onion_trail,
+			pq_blinded_ct,
 			fee_estimator,
 			logger,
 		);
@@ -16584,6 +16612,8 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 		let mut pending_outbound_blinding_points: Vec<Option<PublicKey>> = Vec::new();
 		let mut pending_outbound_held_htlc_flags: Vec<Option<()>> = Vec::new();
 		let mut pending_outbound_accountable: Vec<bool> = Vec::new();
+		let mut pending_outbound_pq_onion_trails: Vec<Option<Vec<u8>>> = Vec::new();
+		let mut pending_outbound_pq_blinded_cts: Vec<Option<Vec<u8>>> = Vec::new();
 
 		(self.context.pending_outbound_htlcs.len() as u64).write(writer)?;
 		for htlc in self.context.pending_outbound_htlcs.iter() {
@@ -16628,6 +16658,8 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 			pending_outbound_blinding_points.push(htlc.blinding_point);
 			pending_outbound_held_htlc_flags.push(htlc.hold_htlc);
 			pending_outbound_accountable.push(htlc.accountable);
+			pending_outbound_pq_onion_trails.push(htlc.pq_onion_trail.clone());
+			pending_outbound_pq_blinded_cts.push(htlc.pq_blinded_ct.clone());
 		}
 
 		let holding_cell_htlc_update_count = self.context.holding_cell_htlc_updates.len();
@@ -16640,6 +16672,10 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 		let mut holding_cell_held_htlc_flags: Vec<Option<()>> =
 			Vec::with_capacity(holding_cell_htlc_update_count);
 		let mut holding_cell_accountable_flags: Vec<bool> =
+			Vec::with_capacity(holding_cell_htlc_update_count);
+		let mut holding_cell_pq_onion_trails: Vec<Option<Vec<u8>>> =
+			Vec::with_capacity(holding_cell_htlc_update_count);
+		let mut holding_cell_pq_blinded_cts: Vec<Option<Vec<u8>>> =
 			Vec::with_capacity(holding_cell_htlc_update_count);
 		// Vec of (htlc_id, failure_code, sha256_of_onion)
 		let mut malformed_htlcs: Vec<(u64, u16, [u8; 32])> = Vec::new();
@@ -16656,6 +16692,8 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 					skimmed_fee_msat,
 					hold_htlc,
 					accountable,
+					ref pq_onion_trail,
+					ref pq_blinded_ct,
 				} => {
 					0u8.write(writer)?;
 					amount_msat.write(writer)?;
@@ -16668,6 +16706,8 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 					holding_cell_blinding_points.push(blinding_point);
 					holding_cell_held_htlc_flags.push(hold_htlc);
 					holding_cell_accountable_flags.push(accountable);
+					holding_cell_pq_onion_trails.push(pq_onion_trail.clone());
+					holding_cell_pq_blinded_cts.push(pq_blinded_ct.clone());
 				},
 				&HTLCUpdateAwaitingACK::ClaimHTLC {
 					ref payment_preimage,
@@ -16886,6 +16926,22 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 		let monitor_pending_tx_signatures =
 			self.context.monitor_pending_tx_signatures.then_some(());
 
+		// PQ: only serialize the post-quantum trail arrays when at least one HTLC carries a trail, so a
+		// channel with no post-quantum HTLCs (every classical node, and classical HTLCs on a PQ node)
+		// stays byte-identical to vanilla (an empty `optional_vec` writes no bytes).
+		if pending_outbound_pq_onion_trails.iter().all(Option::is_none) {
+			pending_outbound_pq_onion_trails.clear();
+		}
+		if holding_cell_pq_onion_trails.iter().all(Option::is_none) {
+			holding_cell_pq_onion_trails.clear();
+		}
+		if pending_outbound_pq_blinded_cts.iter().all(Option::is_none) {
+			pending_outbound_pq_blinded_cts.clear();
+		}
+		if holding_cell_pq_blinded_cts.iter().all(Option::is_none) {
+			holding_cell_pq_blinded_cts.clear();
+		}
+
 		write_tlv_fields!(writer, {
 			(0, self.context.announcement_sigs, option),
 			// minimum_depth and counterparty_selected_channel_reserve_satoshis used to have a
@@ -16945,6 +17001,10 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 			(75, inbound_committed_update_adds, optional_vec),
 			(77, holding_cell_accountable_flags, optional_vec), // Added in 0.3
 			(79, pending_outbound_accountable, optional_vec), // Added in 0.3
+			(81, pending_outbound_pq_onion_trails, optional_vec), // PQ: ML-KEM payment-onion trails
+			(83, holding_cell_pq_onion_trails, optional_vec), // PQ: ML-KEM payment-onion trails
+			(85, pending_outbound_pq_blinded_cts, optional_vec), // PQ: ML-KEM blinded-path ciphertexts
+			(87, holding_cell_pq_blinded_cts, optional_vec), // PQ: ML-KEM blinded-path ciphertexts
 		});
 
 		Ok(())
@@ -17110,6 +17170,8 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 				send_timestamp: None,
 				hold_htlc: None,
 				accountable: false,
+				pq_onion_trail: None,
+				pq_blinded_ct: None,
 			});
 		}
 
@@ -17130,6 +17192,8 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 					blinding_point: None,
 					hold_htlc: None,
 					accountable: false,
+					pq_onion_trail: None,
+					pq_blinded_ct: None,
 				},
 				1 => HTLCUpdateAwaitingACK::ClaimHTLC {
 					payment_preimage: Readable::read(reader)?,
@@ -17332,6 +17396,10 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 		let mut inbound_committed_update_adds_opt: Option<Vec<InboundUpdateAdd>> = None;
 		let mut holding_cell_accountable: Option<Vec<bool>> = None;
 		let mut pending_outbound_accountable: Option<Vec<bool>> = None;
+		let mut pending_outbound_pq_onion_trails: Option<Vec<Option<Vec<u8>>>> = None;
+		let mut holding_cell_pq_onion_trails: Option<Vec<Option<Vec<u8>>>> = None;
+		let mut pending_outbound_pq_blinded_cts: Option<Vec<Option<Vec<u8>>>> = None;
+		let mut holding_cell_pq_blinded_cts: Option<Vec<Option<Vec<u8>>>> = None;
 
 		let mut monitor_pending_tx_signatures: Option<()> = None;
 
@@ -17388,6 +17456,10 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 			(75, inbound_committed_update_adds_opt, optional_vec),
 			(77, holding_cell_accountable, optional_vec), // Added in 0.3
 			(79, pending_outbound_accountable, optional_vec), // Added in 0.3
+			(81, pending_outbound_pq_onion_trails, optional_vec), // PQ: ML-KEM payment-onion trails
+			(83, holding_cell_pq_onion_trails, optional_vec), // PQ: ML-KEM payment-onion trails
+			(85, pending_outbound_pq_blinded_cts, optional_vec), // PQ: ML-KEM blinded-path ciphertexts
+			(87, holding_cell_pq_blinded_cts, optional_vec), // PQ: ML-KEM blinded-path ciphertexts
 		});
 
 		let holder_signer = signer_provider.derive_channel_signer(channel_keys_id);
@@ -17541,6 +17613,50 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 				htlc.accountable = iter.next().ok_or(DecodeError::InvalidValue)?;
 			}
 			// We expect all accountable HTLC signals to be consumed above
+			if iter.next().is_some() {
+				return Err(DecodeError::InvalidValue);
+			}
+		}
+		if let Some(pq_trails) = pending_outbound_pq_onion_trails {
+			let mut iter = pq_trails.into_iter();
+			for htlc in pending_outbound_htlcs.iter_mut() {
+				htlc.pq_onion_trail = iter.next().ok_or(DecodeError::InvalidValue)?;
+			}
+			// We expect all post-quantum onion trails to be consumed above
+			if iter.next().is_some() {
+				return Err(DecodeError::InvalidValue);
+			}
+		}
+		if let Some(pq_trails) = holding_cell_pq_onion_trails {
+			let mut iter = pq_trails.into_iter();
+			for htlc in holding_cell_htlc_updates.iter_mut() {
+				if let HTLCUpdateAwaitingACK::AddHTLC { ref mut pq_onion_trail, .. } = htlc {
+					*pq_onion_trail = iter.next().ok_or(DecodeError::InvalidValue)?;
+				}
+			}
+			// We expect all post-quantum onion trails to be consumed above
+			if iter.next().is_some() {
+				return Err(DecodeError::InvalidValue);
+			}
+		}
+		if let Some(pq_cts) = pending_outbound_pq_blinded_cts {
+			let mut iter = pq_cts.into_iter();
+			for htlc in pending_outbound_htlcs.iter_mut() {
+				htlc.pq_blinded_ct = iter.next().ok_or(DecodeError::InvalidValue)?;
+			}
+			// We expect all post-quantum blinded-path ciphertexts to be consumed above
+			if iter.next().is_some() {
+				return Err(DecodeError::InvalidValue);
+			}
+		}
+		if let Some(pq_cts) = holding_cell_pq_blinded_cts {
+			let mut iter = pq_cts.into_iter();
+			for htlc in holding_cell_htlc_updates.iter_mut() {
+				if let HTLCUpdateAwaitingACK::AddHTLC { ref mut pq_blinded_ct, .. } = htlc {
+					*pq_blinded_ct = iter.next().ok_or(DecodeError::InvalidValue)?;
+				}
+			}
+			// We expect all post-quantum blinded-path ciphertexts to be consumed above
 			if iter.next().is_some() {
 				return Err(DecodeError::InvalidValue);
 			}
@@ -18138,12 +18254,15 @@ mod tests {
 				first_hop_htlc_msat: 548,
 				payment_id: PaymentId([42; 32]),
 				bolt12_invoice: None,
+				pq_hop_kem_secrets: None,
 			},
 			skimmed_fee_msat: None,
 			blinding_point: None,
 			send_timestamp: None,
 			hold_htlc: None,
 			accountable: false,
+			pq_onion_trail: None,
+			pq_blinded_ct: None,
 		});
 
 		// Make sure when Node A calculates their local commitment transaction, none of the HTLCs pass
@@ -18647,6 +18766,7 @@ mod tests {
 			first_hop_htlc_msat: 0,
 			payment_id: PaymentId([42; 32]),
 			bolt12_invoice: None,
+			pq_hop_kem_secrets: None,
 		};
 		let dummy_outbound_output = OutboundHTLCOutput {
 			htlc_id: 0,
@@ -18660,6 +18780,8 @@ mod tests {
 			send_timestamp: None,
 			hold_htlc: None,
 			accountable: false,
+			pq_onion_trail: None,
+			pq_blinded_ct: None,
 		};
 		let mut pending_outbound_htlcs = vec![dummy_outbound_output.clone(); 10];
 		for (idx, htlc) in pending_outbound_htlcs.iter_mut().enumerate() {
@@ -18669,6 +18791,16 @@ mod tests {
 			if idx % 3 == 0 {
 				htlc.skimmed_fee_msat = Some(1);
 			}
+		}
+		// PQ: give a couple of outbound HTLCs a ciphertext trail and a blinded-path ciphertext so the
+		// round-trip below verifies the post-quantum fields survive channel serialization (the contents
+		// need not be real ciphertexts).
+		#[cfg(feature = "post-quantum")]
+		{
+			pending_outbound_htlcs[1].pq_onion_trail = Some(vec![7u8; 96]);
+			pending_outbound_htlcs[4].pq_onion_trail = Some(vec![5u8; 1088]);
+			pending_outbound_htlcs[2].pq_blinded_ct = Some(vec![9u8; 1088]);
+			pending_outbound_htlcs[4].pq_blinded_ct = Some(vec![1u8; 1088]);
 		}
 		chan.context.pending_outbound_htlcs = pending_outbound_htlcs.clone();
 
@@ -18687,6 +18819,8 @@ mod tests {
 			blinding_point: None,
 			hold_htlc: None,
 			accountable: false,
+			pq_onion_trail: None,
+			pq_blinded_ct: None,
 		};
 		let dummy_holding_cell_claim_htlc = |attribution_data| HTLCUpdateAwaitingACK::ClaimHTLC {
 			payment_preimage: PaymentPreimage([42; 32]),
@@ -18744,6 +18878,23 @@ mod tests {
 						Some(AttributionData::new()),
 					));
 				},
+			}
+		}
+		// PQ: give the first holding-cell AddHTLC a trail and a blinded-path ciphertext so the round-trip
+		// verifies both persist too.
+		#[cfg(feature = "post-quantum")]
+		{
+			for update in holding_cell_htlc_updates.iter_mut() {
+				if let HTLCUpdateAwaitingACK::AddHTLC {
+					ref mut pq_onion_trail,
+					ref mut pq_blinded_ct,
+					..
+				} = update
+				{
+					*pq_onion_trail = Some(vec![3u8; 128]);
+					*pq_blinded_ct = Some(vec![4u8; 1088]);
+					break;
+				}
 			}
 		}
 		chan.context.holding_cell_htlc_updates = holding_cell_htlc_updates.clone();

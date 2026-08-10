@@ -1140,6 +1140,25 @@ pub struct UserConfig {
 	///
 	/// [`ChannelManager::splice_channel`]: crate::ln::channelmanager::ChannelManager::splice_channel
 	pub reject_inbound_splices: bool,
+	/// PQ: if `true`, the node refuses to send a payment that cannot be routed entirely over
+	/// post-quantum-capable hops (every hop having a gossip-pinned ML-KEM key) rather than silently
+	/// falling back to a classical onion. This gives downgrade resistance for a post-quantum-required
+	/// sender (the same anchor model as the BOLT 8 transport and onion-message surfaces).
+	///
+	/// Default value: `false`
+	#[cfg(feature = "post-quantum")]
+	pub require_post_quantum_payments: bool,
+	/// PQ: if `true`, the node fails back any inbound HTLC that is not post-quantum-protected (a plain
+	/// or unblinded hop carrying no ML-KEM ciphertext trail, or a blinded hop carrying no blinded
+	/// ciphertext list), rather than accepting a classical (Shor-breakable) onion. This closes the
+	/// receiver-side downgrade gap that [`Self::require_post_quantum_payments`] leaves on the sender: a
+	/// payment steered onto a classical route by an attacker who withholds a hop's gossiped ML-KEM key
+	/// is refused at this node instead of silently accepted. Applies to both forwarded and received
+	/// HTLCs. Leaving it `false` preserves interoperability (classical payments are accepted).
+	///
+	/// Default value: `false`
+	#[cfg(feature = "post-quantum")]
+	pub require_post_quantum_inbound: bool,
 }
 
 #[allow(deprecated)]
@@ -1157,6 +1176,10 @@ impl Default for UserConfig {
 			enable_htlc_hold: false,
 			hold_outbound_htlcs_at_next_hop: false,
 			reject_inbound_splices: true,
+			#[cfg(feature = "post-quantum")]
+			require_post_quantum_payments: false,
+			#[cfg(feature = "post-quantum")]
+			require_post_quantum_inbound: false,
 		}
 	}
 }
@@ -1180,6 +1203,10 @@ impl Readable for UserConfig {
 			hold_outbound_htlcs_at_next_hop: Readable::read(reader)?,
 			enable_htlc_hold: Readable::read(reader)?,
 			reject_inbound_splices: Readable::read(reader)?,
+			#[cfg(feature = "post-quantum")]
+			require_post_quantum_payments: Readable::read(reader)?,
+			#[cfg(feature = "post-quantum")]
+			require_post_quantum_inbound: Readable::read(reader)?,
 		})
 	}
 }

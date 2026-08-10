@@ -1591,9 +1591,10 @@ pub struct NodeInfo {
 	#[cfg(feature = "post-quantum")]
 	pub(crate) pq_node_id: Option<[u8; 1312]>,
 	/// The node's pinned ML-KEM (FIPS 203) static encapsulation key, learned the same way as
-	/// [`Self::pq_node_id`] and pinned with the same continuity rules. Post-quantum peers
-	/// encapsulate to this key, so the resulting shared secret cannot be recovered by a quantum
-	/// attacker who breaks the classical ECDH.
+	/// [`Self::pq_node_id`] and pinned with the same continuity rules. Post-quantum senders
+	/// encapsulate to this key when building blinded paths or payment onions through the node, so
+	/// the per-hop secret cannot be recovered by a quantum attacker who breaks the classical
+	/// per-hop ECDH.
 	#[cfg(feature = "post-quantum")]
 	pub(crate) pq_kem_node_id: Option<[u8; 1184]>,
 	/// In memory, each node is assigned a unique ID. They are eagerly reused, ensuring they remain
@@ -1634,7 +1635,8 @@ impl NodeInfo {
 	}
 
 	/// Returns this node's pinned ML-KEM (FIPS 203) static encapsulation key, if one was learned
-	/// from a post-quantum `node_announcement`. Post-quantum peers encapsulate to this key.
+	/// from a post-quantum `node_announcement`. Senders encapsulate to this key when building
+	/// post-quantum blinded paths or payment onions through this node.
 	#[cfg(feature = "post-quantum")]
 	pub fn pq_kem_node_id(&self) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]> {
 		self.pq_kem_node_id

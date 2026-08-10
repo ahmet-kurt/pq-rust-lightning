@@ -850,6 +850,8 @@ pub fn do_test_fee_spike_buffer(cfg: Option<UserConfig>, htlc_fails: bool) {
 		blinding_point: None,
 		hold_htlc: None,
 		accountable: None,
+		pq_onion_trail: None,
+		pq_blinded_ct: None,
 	};
 
 	nodes[1].node.handle_update_add_htlc(node_a_id, &msg);
@@ -1200,6 +1202,8 @@ pub fn test_chan_reserve_violation_inbound_htlc_inbound_chan() {
 		blinding_point: None,
 		hold_htlc: None,
 		accountable: None,
+		pq_onion_trail: None,
+		pq_blinded_ct: None,
 	};
 
 	nodes[1].node.handle_update_add_htlc(node_a_id, &msg);
@@ -1587,6 +1591,8 @@ pub fn test_update_add_htlc_bolt2_receiver_check_max_htlc_limit() {
 		blinding_point: None,
 		hold_htlc: None,
 		accountable: None,
+		pq_onion_trail: None,
+		pq_blinded_ct: None,
 	};
 
 	for i in 0..50 {
@@ -2189,6 +2195,8 @@ pub fn do_test_dust_limit_fee_accounting(can_afford: bool) {
 		blinding_point: None,
 		hold_htlc: None,
 		accountable: None,
+		pq_onion_trail: None,
+		pq_blinded_ct: None,
 	};
 
 	nodes[1].node.handle_update_add_htlc(node_a_id, &msg);
@@ -2873,6 +2881,8 @@ fn do_test_0reserve_no_outputs_keyed_anchors(payment_success: bool) {
 			blinding_point: None,
 			hold_htlc: None,
 			accountable: None,
+			pq_onion_trail: None,
+			pq_blinded_ct: None,
 		};
 
 		nodes[1].node.handle_update_add_htlc(node_a_id, &msg);
@@ -3476,6 +3486,8 @@ fn test_fail_cannot_afford_dust_htlcs_at_spike_multiple_if_nondust_at_base_feera
 		blinding_point: None,
 		hold_htlc: None,
 		accountable: None,
+		pq_onion_trail: None,
+		pq_blinded_ct: None,
 	};
 
 	nodes[1].node.handle_update_add_htlc(node_a_id, &msg);

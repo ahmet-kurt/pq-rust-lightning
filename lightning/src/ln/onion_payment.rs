@@ -117,10 +117,35 @@ enum RoutingInfo {
 	},
 }
 
+/// PQ: compute the outbound `pq_blinded_ct` list for the next hop. The blinded-path ciphertexts ride
+/// in a fixed-size list alongside the onion; a blinded forward reads the front entry (its own
+/// ciphertext) and rotates it to the back so the next blinded hop finds its ciphertext at the front and
+/// the list keeps a constant size (hiding hop position), while a non-blinded forward passes the list
+/// through unchanged so it reaches the introduction node intact. `None` (the classical case) stays
+/// `None`.
+#[cfg(feature = "post-quantum")]
+fn rotate_blinded_ct_list(list: Option<&Vec<u8>>, is_blinded_forward: bool) -> Option<Vec<u8>> {
+	const CT_LEN: usize = crate::crypto::pq_kem::PQ_KEM_CT_LEN;
+	let list = list?;
+	if !is_blinded_forward || list.len() <= CT_LEN {
+		return Some(list.clone());
+	}
+	let mut rotated = Vec::with_capacity(list.len());
+	rotated.extend_from_slice(&list[CT_LEN..]);
+	rotated.extend_from_slice(&list[..CT_LEN]);
+	Some(rotated)
+}
+
+#[cfg(not(feature = "post-quantum"))]
+fn rotate_blinded_ct_list(list: Option<&Vec<u8>>, _is_blinded_forward: bool) -> Option<Vec<u8>> {
+	list.cloned()
+}
+
 #[rustfmt::skip]
 pub(super) fn create_fwd_pending_htlc_info(
 	msg: &msgs::UpdateAddHTLC, hop_data: onion_utils::Hop, shared_secret: [u8; 32],
-	next_packet_pubkey_opt: Option<Result<PublicKey, secp256k1::Error>>
+	next_packet_pubkey_opt: Option<Result<PublicKey, secp256k1::Error>>,
+	next_pq_onion_trail: Option<Vec<u8>>,
 ) -> Result<PendingHTLCInfo, InboundHTLCErr> {
 	debug_assert!(next_packet_pubkey_opt.is_some());
 
@@ -231,11 +256,24 @@ pub(super) fn create_fwd_pending_htlc_info(
 				hop_data: new_packet_bytes,
 				hmac: next_hop_hmac,
 			};
+			// PQ: the blinded-path ciphertexts ride in a fixed-size rotating list alongside the onion (not
+			// in the onion, which has a hard 1300-byte budget). A blinded forward reads the front entry
+			// (its own ciphertext) and rotates it to the back, so the next hop finds its ciphertext at the
+			// front and the list stays a constant size (no hop-position leak). A non-blinded forward passes
+			// the list through unchanged so it reaches the introduction node intact. `pq_blinded_cur_ct`
+			// keeps this hop's inbound list so a blinded forward can fold its front ciphertext's secret
+			// when advancing the next hop's blinding point.
+			let is_blinded_forward = intro_node_blinding_point.or(msg.blinding_point).is_some();
+			let pq_blinded_next_ct =
+				rotate_blinded_ct_list(msg.pq_blinded_ct.as_ref(), is_blinded_forward);
 			PendingHTLCRouting::Forward {
 				onion_packet: outgoing_packet,
 				short_channel_id,
 				incoming_cltv_expiry: Some(msg.cltv_expiry),
 				hold_htlc: msg.hold_htlc,
+				pq_onion_trail: next_pq_onion_trail,
+				pq_blinded_next_ct,
+				pq_blinded_cur_ct: msg.pq_blinded_ct.clone(),
 				blinded: intro_node_blinding_point.or(msg.blinding_point)
 					.map(|bp| BlindedForward {
 						inbound_blinding_point: bp,
@@ -506,7 +544,7 @@ pub fn peel_payment_onion<NS: NodeSigner, L: Logger, T: secp256k1::Verification>
 	msg: &msgs::UpdateAddHTLC, node_signer: NS, logger: L, secp_ctx: &Secp256k1<T>,
 	cur_height: u32, allow_skimmed_fees: bool,
 ) -> Result<PendingHTLCInfo, InboundHTLCErr> {
-	let (hop, next_packet_details_opt) =
+	let (hop, next_packet_details_opt, next_pq_onion_trail) =
 		decode_incoming_update_add_htlc_onion(msg, &node_signer, &logger, secp_ctx
 	).map_err(|(msg, failure_reason)| {
 		let (reason, err_data) = match msg {
@@ -543,7 +581,7 @@ pub fn peel_payment_onion<NS: NodeSigner, L: Logger, T: secp256k1::Verification>
 
 			// TODO: If this is potentially a phantom payment we should decode the phantom payment
 			// onion here and check it.
-			create_fwd_pending_htlc_info(msg, hop, shared_secret.secret_bytes(), Some(next_packet_pubkey))?
+			create_fwd_pending_htlc_info(msg, hop, shared_secret.secret_bytes(), Some(next_packet_pubkey), next_pq_onion_trail)?
 		},
 		onion_utils::Hop::Dummy { dummy_hop_data, next_hop_hmac, new_packet_bytes, .. } => {
 			let next_packet_details = match next_packet_details_opt {
@@ -599,7 +637,7 @@ pub(super) struct NextPacketDetails {
 #[rustfmt::skip]
 pub(super) fn decode_incoming_update_add_htlc_onion<NS: NodeSigner, L: Logger, T: secp256k1::Verification>(
 	msg: &msgs::UpdateAddHTLC, node_signer: NS, logger: L, secp_ctx: &Secp256k1<T>,
-) -> Result<(onion_utils::Hop, Option<NextPacketDetails>), (HTLCFailureMsg, LocalHTLCFailureReason)> {
+) -> Result<(onion_utils::Hop, Option<NextPacketDetails>, Option<Vec<u8>>), (HTLCFailureMsg, LocalHTLCFailureReason)> {
 	let encode_malformed_error = |message: &str, failure_reason: LocalHTLCFailureReason| {
 		log_info!(logger, "Failed to accept/forward incoming HTLC: {}", message);
 		let (sha256_of_onion, failure_reason) = if msg.blinding_point.is_some() || failure_reason == LocalHTLCFailureReason::InvalidOnionBlinding {
@@ -645,9 +683,9 @@ pub(super) fn decode_incoming_update_add_htlc_onion<NS: NodeSigner, L: Logger, T
 		}), reason));
 	};
 
-	let next_hop = match onion_utils::decode_next_payment_hop(
+	let (next_hop, next_pq_onion_trail, pq_classical_ss, pq_trampoline_classical_ss) = match onion_utils::decode_next_payment_hop(
 		Recipient::Node, &msg.onion_routing_packet.public_key.unwrap(), &msg.onion_routing_packet.hop_data[..], msg.onion_routing_packet.hmac,
-		msg.payment_hash, msg.blinding_point, node_signer
+		msg.payment_hash, msg.blinding_point, msg.pq_onion_trail.as_deref(), msg.pq_blinded_ct.as_deref(), node_signer
 	) {
 		Ok(res) => res,
 		Err(onion_utils::OnionDecodeErr::Malformed { err_msg, reason }) => {
@@ -660,8 +698,10 @@ pub(super) fn decode_incoming_update_add_htlc_onion<NS: NodeSigner, L: Logger, T
 
 	let next_packet_details = match next_hop {
 		onion_utils::Hop::Forward { next_hop_data: msgs::InboundOnionForwardPayload { short_channel_id, amt_to_forward, outgoing_cltv_value }, shared_secret, .. } => {
+			// PQ: the EC pubkey-blinding chain is classical, so the next hop's ephemeral pubkey is
+			// derived from the classical ECDH secret, not the hybrid secret carried in `shared_secret`.
 			let next_packet_pubkey = onion_utils::next_hop_pubkey(secp_ctx,
-				msg.onion_routing_packet.public_key.unwrap(), &shared_secret.secret_bytes());
+				msg.onion_routing_packet.public_key.unwrap(), &pq_classical_ss.unwrap_or_else(|| shared_secret.secret_bytes()));
 			Some(NextPacketDetails {
 				next_packet_pubkey, outgoing_connector: HopConnector::ShortChannelId(short_channel_id),
 				outgoing_amt_msat: amt_to_forward, outgoing_cltv_value
@@ -677,8 +717,13 @@ pub(super) fn decode_incoming_update_add_htlc_onion<NS: NodeSigner, L: Logger, T
 						LocalHTLCFailureReason::InvalidOnionBlinding, shared_secret.secret_bytes(), None, &[0; 32]);
 				}
 			};
+			// PQ: the EC onion-ephemeral chain stays classical, so at an introduction node (which has a
+			// payment-onion ciphertext trail, hence a classical secret) advance it with the classical secret rather
+			// than the hybrid one. At a deeper blinded hop the classical secret is `None` and the hybrid
+			// blinded onion secret is itself the right (recipient-baked) advance.
 			let next_packet_pubkey = onion_utils::next_hop_pubkey(&secp_ctx,
-				msg.onion_routing_packet.public_key.unwrap(), &shared_secret.secret_bytes());
+				msg.onion_routing_packet.public_key.unwrap(),
+				&pq_classical_ss.unwrap_or_else(|| shared_secret.secret_bytes()));
 			Some(NextPacketDetails {
 				next_packet_pubkey, outgoing_connector: HopConnector::ShortChannelId(short_channel_id), outgoing_amt_msat: amt_to_forward,
 				outgoing_cltv_value
@@ -701,8 +746,12 @@ pub(super) fn decode_incoming_update_add_htlc_onion<NS: NodeSigner, L: Logger, T
 			Some(NextPacketDetails { next_packet_pubkey, outgoing_connector: HopConnector::Dummy, outgoing_amt_msat: amt_to_forward, outgoing_cltv_value })
 		}
 		onion_utils::Hop::TrampolineForward { next_trampoline_hop_data: msgs::InboundTrampolineForwardPayload { next_trampoline, .. }, ref outer_hop_data, trampoline_shared_secret, incoming_trampoline_public_key, .. } => {
+			// PQ: the Trampoline ephemeral chain is classical like the outer one, so on a post-quantum
+			// payment the next Trampoline ephemeral pubkey is derived from the classical Trampoline
+			// ECDH secret rather than the hybrid secret carried in `trampoline_shared_secret`.
 			let next_trampoline_packet_pubkey = onion_utils::next_hop_pubkey(secp_ctx,
-				incoming_trampoline_public_key, &trampoline_shared_secret.secret_bytes());
+				incoming_trampoline_public_key,
+				&pq_trampoline_classical_ss.unwrap_or_else(|| trampoline_shared_secret.secret_bytes()));
 			Some(NextPacketDetails {
 				next_packet_pubkey: next_trampoline_packet_pubkey,
 				outgoing_connector: HopConnector::Trampoline(next_trampoline),
@@ -711,8 +760,12 @@ pub(super) fn decode_incoming_update_add_htlc_onion<NS: NodeSigner, L: Logger, T
 			})
 		}
 		onion_utils::Hop::TrampolineBlindedForward { next_trampoline_hop_data: msgs::InboundTrampolineBlindedForwardPayload { next_trampoline, .. }, ref outer_hop_data, trampoline_shared_secret, incoming_trampoline_public_key, .. } => {
+			// PQ: a blinded relaying Trampoline hop is keyed by the recipient-baked hybrid blinded
+			// node id, whose secret is itself the right (recipient-baked) chain advance, so no
+			// classical Trampoline secret is kept for it.
 			let next_trampoline_packet_pubkey = onion_utils::next_hop_pubkey(secp_ctx,
-				incoming_trampoline_public_key, &trampoline_shared_secret.secret_bytes());
+				incoming_trampoline_public_key,
+				&pq_trampoline_classical_ss.unwrap_or_else(|| trampoline_shared_secret.secret_bytes()));
 			Some(NextPacketDetails {
 				next_packet_pubkey: next_trampoline_packet_pubkey,
 				outgoing_connector: HopConnector::Trampoline(next_trampoline),
@@ -723,7 +776,7 @@ pub(super) fn decode_incoming_update_add_htlc_onion<NS: NodeSigner, L: Logger, T
 		_ => None
 	};
 
-	Ok((next_hop, next_packet_details))
+	Ok((next_hop, next_packet_details, next_pq_onion_trail))
 }
 
 pub(super) fn check_incoming_htlc_cltv(
@@ -874,6 +927,8 @@ mod tests {
 			blinding_point: None,
 			hold_htlc: None,
 			accountable: None,
+			pq_onion_trail: None,
+			pq_blinded_ct: None,
 		}
 	}
 

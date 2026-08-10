@@ -219,6 +219,19 @@ pub enum PendingHTLCRouting {
 		/// Whether this HTLC should be held by our node until we receive a corresponding
 		/// [`ReleaseHeldHtlc`] onion message.
 		hold_htlc: Option<()>,
+		/// PQ: the serialized ML-KEM ciphertext trail to forward alongside the outbound onion on a
+		/// post-quantum payment (the next hop's trail, peeled from the inbound one). `None` for a
+		/// classical payment.
+		pq_onion_trail: Option<Vec<u8>>,
+		/// PQ: on a post-quantum blinded payment, the ML-KEM ciphertext list to place in the outbound
+		/// HTLC's `pq_blinded_ct` for the next hop. A blinded forward rotates its inbound list front
+		/// to back (its own consumed entry moving to the back); a non-blinded forward passes its
+		/// inbound list through unchanged. `None` outside a post-quantum blinded path.
+		pq_blinded_next_ct: Option<Vec<u8>>,
+		/// PQ: this hop's own inbound `pq_blinded_ct` on a post-quantum blinded path, kept so a blinded
+		/// forward can fold its ML-KEM secret into the route-blinding secret when advancing the next
+		/// hop's blinding point. `None` outside a post-quantum blinded path.
+		pq_blinded_cur_ct: Option<Vec<u8>>,
 	},
 	/// An HTLC which should be forwarded on to another Trampoline node.
 	TrampolineForward {
@@ -970,6 +983,11 @@ mod fuzzy_channelmanager {
 			/// we can provide proof-of-payment details in payment claim events even after a restart
 			/// with a stale ChannelManager state.
 			bolt12_invoice: Option<PaidBolt12Invoice>,
+			/// PQ: the per-hop ML-KEM shared secrets of the unblinded hops (32 bytes each, in hop order,
+			/// concatenated) for a post-quantum payment, frozen at send time so we can re-derive each
+			/// hop's hybrid secret to decode the (hybrid-keyed) BOLT 4 return error onion. `None` for a
+			/// classical payment.
+			pq_hop_kem_secrets: Option<Vec<u8>>,
 		},
 	}
 
@@ -1073,6 +1091,7 @@ impl Hash for HTLCSource {
 				payment_id,
 				first_hop_htlc_msat,
 				bolt12_invoice,
+				pq_hop_kem_secrets: _,
 			} => {
 				1u8.hash(hasher);
 				path.hash(hasher);
@@ -1102,6 +1121,7 @@ impl HTLCSource {
 			first_hop_htlc_msat: 0,
 			payment_id: PaymentId([2; 32]),
 			bolt12_invoice: None,
+			pq_hop_kem_secrets: None,
 		}
 	}
 
@@ -5487,6 +5507,7 @@ impl<
 		&self, msg: &msgs::UpdateAddHTLC, shared_secret: [u8; 32],
 		decoded_hop: onion_utils::Hop, allow_underpay: bool,
 		next_packet_pubkey_opt: Option<Result<PublicKey, secp256k1::Error>>,
+		next_pq_onion_trail: Option<Vec<u8>>,
 	) -> Result<PendingHTLCInfo, InboundHTLCErr> {
 		match decoded_hop {
 			onion_utils::Hop::Receive { .. } | onion_utils::Hop::BlindedReceive { .. } |
@@ -5502,7 +5523,7 @@ impl<
 					msg.accountable.unwrap_or(false), current_height)
 			},
 			onion_utils::Hop::Forward { .. } | onion_utils::Hop::BlindedForward { .. } => {
-				create_fwd_pending_htlc_info(msg, decoded_hop, shared_secret, next_packet_pubkey_opt)
+				create_fwd_pending_htlc_info(msg, decoded_hop, shared_secret, next_packet_pubkey_opt, next_pq_onion_trail)
 			},
 			onion_utils::Hop::Dummy { .. } => {
 				debug_assert!(
@@ -5519,7 +5540,7 @@ impl<
 				})
 			},
 			onion_utils::Hop::TrampolineForward { .. } | onion_utils::Hop::TrampolineBlindedForward { .. } => {
-				create_fwd_pending_htlc_info(msg, decoded_hop, shared_secret, next_packet_pubkey_opt)
+				create_fwd_pending_htlc_info(msg, decoded_hop, shared_secret, next_packet_pubkey_opt, next_pq_onion_trail)
 			},
 		}
 	}
@@ -5677,21 +5698,135 @@ impl<
 			Some(*payment_hash),
 			payment_id,
 		);
-		let (onion_packet, htlc_msat, htlc_cltv) = onion_utils::create_payment_onion(
-			&self.secp_ctx,
-			&path,
-			&session_priv,
-			recipient_onion,
-			cur_height,
-			payment_hash,
-			keysend_preimage,
-			invoice_request,
-			prng_seed,
-		)
-		.map_err(|e| {
-			log_error!(logger, "Failed to build an onion for path");
-			e
-		})?;
+		#[cfg(not(feature = "post-quantum"))]
+		let (onion_packet, htlc_msat, htlc_cltv, pq_onion_trail, pq_hop_kem_secrets, pq_blinded_ct) = {
+			let (onion_packet, htlc_msat, htlc_cltv) = onion_utils::create_payment_onion(
+				&self.secp_ctx,
+				&path,
+				&session_priv,
+				recipient_onion,
+				cur_height,
+				payment_hash,
+				keysend_preimage,
+				invoice_request,
+				prng_seed,
+			)
+			.map_err(|e| {
+				log_error!(logger, "Failed to build an onion for path");
+				e
+			})?;
+			(onion_packet, htlc_msat, htlc_cltv, None::<Vec<u8>>, None::<Vec<u8>>, None::<Vec<u8>>)
+		};
+		// PQ: build a hybrid ML-KEM payment onion plus its ciphertext trail when every unblinded hop
+		// (the prefix plus, on a blinded path, the introduction node) has a gossip-pinned ML-KEM key,
+		// and the path is trampoline-free and either plain or a post-quantum blinded path (carrying
+		// the per-hop ciphertext list); otherwise build the classical onion. The trail rides alongside
+		// the onion in the first `update_add_htlc`, as does the blinded path's ciphertext list.
+		#[cfg(feature = "post-quantum")]
+		let (onion_packet, htlc_msat, htlc_cltv, pq_onion_trail, pq_hop_kem_secrets, pq_blinded_ct) = {
+			let is_pq_blinded = path.blinded_tail.as_ref().map_or(false, |bt| bt.kem_ct.is_some());
+			// A Trampoline path always carries the recipient's blinded tail inside the Trampoline
+			// onion, so its blinded tail must be post-quantum; a plain path needs no blinded tail.
+			let eligible = !path.hops.is_empty()
+				&& if path.has_trampoline_hops() {
+					is_pq_blinded
+				} else {
+					path.blinded_tail.is_none() || is_pq_blinded
+				};
+			let hop_kem_keys: Option<Vec<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]>> = if eligible {
+				path.hops
+					.iter()
+					.map(|hop| self.router.pq_kem_key_for_node(&hop.pubkey))
+					.collect()
+			} else {
+				None
+			};
+			// On a Trampoline path every unblinded Trampoline hop needs a pinned ML-KEM key too, so
+			// the inner Trampoline onion can be built with hybrid keys (empty otherwise).
+			let trampoline_kem_keys: Option<Vec<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]>> =
+				if hop_kem_keys.is_some() {
+					path.blinded_tail.as_ref().map_or(Some(Vec::new()), |bt| {
+						bt.trampoline_hops
+							.iter()
+							.map(|hop| self.router.pq_kem_key_for_node(&hop.pubkey))
+							.collect()
+					})
+				} else {
+					None
+				};
+			if let (Some(hop_kem_keys), Some(trampoline_kem_keys)) =
+				(hop_kem_keys, trampoline_kem_keys)
+			{
+				let kem_base_seed = self.entropy_source.get_secure_random_bytes();
+				let trail_prng_seed = self.entropy_source.get_secure_random_bytes();
+				let (onion_packet, htlc_msat, htlc_cltv, trail, kem_secrets, pq_blinded_ct) =
+					onion_utils::create_pq_payment_onion(
+						&self.secp_ctx,
+						&path,
+						&session_priv,
+						recipient_onion,
+						cur_height,
+						payment_hash,
+						keysend_preimage,
+						invoice_request,
+						prng_seed,
+						&hop_kem_keys,
+						&trampoline_kem_keys,
+						&kem_base_seed,
+						trail_prng_seed,
+					)
+					.map_err(|e| {
+						log_error!(logger, "PQ: failed to build a post-quantum onion for path");
+						e
+					})?;
+				if path.has_trampoline_hops() {
+					log_info!(
+						logger,
+						"PQ: built hybrid ML-KEM Trampoline payment onion with a {}-byte ciphertext trail over {} outer hop(s) and {} Trampoline hop(s) with a post-quantum blinded tail",
+						trail.hop_data.len(),
+						path.hops.len(),
+						path.blinded_tail.as_ref().map_or(0, |bt| bt.trampoline_hops.len()),
+					);
+				} else {
+					log_info!(
+						logger,
+						"PQ: built hybrid ML-KEM payment onion with a {}-byte ciphertext trail over {} unblinded hop(s){}",
+						trail.hop_data.len(),
+						path.hops.len(),
+						if is_pq_blinded { " and a post-quantum blinded tail" } else { "" },
+					);
+				}
+				(onion_packet, htlc_msat, htlc_cltv, Some(trail.encode()), Some(kem_secrets), pq_blinded_ct)
+			} else {
+				// A post-quantum-required sender refuses to fall back to a classical onion when the
+				// route is not entirely post-quantum-capable (downgrade resistance).
+				if self.config.read().unwrap().require_post_quantum_payments {
+					log_error!(
+						logger,
+						"PQ: refusing to send a non-post-quantum payment (require_post_quantum_payments is set)"
+					);
+					return Err(APIError::InvalidRoute {
+						err: crate::ln::outbound_payment::PQ_ROUTE_REFUSAL_ERR.to_owned(),
+					});
+				}
+				let (onion_packet, htlc_msat, htlc_cltv) = onion_utils::create_payment_onion(
+					&self.secp_ctx,
+					&path,
+					&session_priv,
+					recipient_onion,
+					cur_height,
+					payment_hash,
+					keysend_preimage,
+					invoice_request,
+					prng_seed,
+				)
+				.map_err(|e| {
+					log_error!(logger, "Failed to build an onion for path");
+					e
+				})?;
+				(onion_packet, htlc_msat, htlc_cltv, None::<Vec<u8>>, None::<Vec<u8>>, None::<Vec<u8>>)
+			}
+		};
 
 		let err: Result<(), _> = loop {
 			let first_chan_scid = &path.hops.first().unwrap().short_channel_id;
@@ -5738,6 +5873,7 @@ impl<
 							first_hop_htlc_msat: htlc_msat,
 							payment_id,
 							bolt12_invoice: bolt12_invoice.cloned(),
+							pq_hop_kem_secrets,
 						};
 						let send_res = chan.send_htlc_and_commit(
 							htlc_msat,
@@ -5748,6 +5884,8 @@ impl<
 							None,
 							hold_htlc_at_next_hop,
 							false, // Not accountable by default for sender.
+							pq_onion_trail,
+							pq_blinded_ct,
 							&self.fee_estimator,
 							&&logger,
 						);
@@ -7623,6 +7761,9 @@ impl<
 				blinded,
 				incoming_cltv_expiry,
 				hold_htlc,
+				pq_onion_trail,
+				pq_blinded_next_ct,
+				pq_blinded_cur_ct,
 				..
 			} => {
 				debug_assert!(hold_htlc.is_none(), "Held intercept HTLCs should not be surfaced in an event until the recipient comes online");
@@ -7631,6 +7772,9 @@ impl<
 					blinded,
 					incoming_cltv_expiry,
 					hold_htlc,
+					pq_onion_trail,
+					pq_blinded_next_ct,
+					pq_blinded_cur_ct,
 					short_channel_id: outbound_scid_alias,
 				}
 			},
@@ -7748,7 +7892,7 @@ impl<
 			let mut htlc_forwards = Vec::new();
 			let mut htlc_fails = Vec::new();
 			for update_add_htlc in &update_add_htlcs {
-				let (next_hop, next_packet_details_opt) =
+				let (next_hop, next_packet_details_opt, next_pq_onion_trail) =
 					match decode_incoming_update_add_htlc_onion(
 						&update_add_htlc,
 						&self.node_signer,
@@ -7764,6 +7908,7 @@ impl<
 									..
 								},
 								Some(next_packet_details),
+								_,
 							) => {
 								let new_update_add_htlc =
 									onion_utils::peel_dummy_hop_update_add_htlc(
@@ -7824,6 +7969,25 @@ impl<
 					}};
 				}
 
+				// PQ: if this node requires post-quantum-protected inbound HTLCs, fail back any HTLC that was
+				// not peeled with a hybrid ML-KEM secret: a plain or unblinded hop with no ciphertext trail,
+				// or a blinded hop with no blinded ciphertext list, is a classical (Shor-breakable) onion.
+				// This closes the receiver-side downgrade gap, letting a forwarding or receiving node refuse
+				// a payment that an attacker steered onto a classical route.
+				#[cfg(feature = "post-quantum")]
+				if self.config.read().unwrap().require_post_quantum_inbound {
+					let was_post_quantum = update_add_htlc.pq_onion_trail.is_some()
+						|| (update_add_htlc.blinding_point.is_some()
+							&& update_add_htlc.pq_blinded_ct.is_some());
+					if !was_post_quantum {
+						log_error!(
+							self.logger,
+							"PQ: failing back a non-post-quantum inbound HTLC (require_post_quantum_inbound is set)"
+						);
+						fail_htlc_continue_to_next!(LocalHTLCFailureReason::RequiredNodeFeature);
+					}
+				}
+
 				// Nodes shouldn't expect us to hold HTLCs for them if we don't advertise htlc_hold feature
 				// support.
 				//
@@ -7879,12 +8043,24 @@ impl<
 				let trampoline_shared_secret =
 					next_hop.trampoline_shared_secret().map(|ss| ss.secret_bytes());
 
+				// PQ: a post-quantum Trampoline entrypoint peeled its Trampoline layer with a hybrid
+				// ML-KEM secret (its Trampoline-layer ciphertext rode in the trail behind its
+				// outer-layer entry).
+				#[cfg(feature = "post-quantum")]
+				if trampoline_shared_secret.is_some() && update_add_htlc.pq_onion_trail.is_some() {
+					log_info!(
+						self.logger,
+						"PQ: peeled hybrid ML-KEM Trampoline onion layer using a ciphertext trail entry"
+					);
+				}
+
 				match self.get_pending_htlc_info(
 					&update_add_htlc,
 					shared_secret,
 					next_hop,
 					incoming_accept_underpaying_htlcs,
 					next_packet_details_opt.map(|d| d.next_packet_pubkey),
+					next_pq_onion_trail,
 				) {
 					Ok(info) => {
 						let pending_add = PendingAddHTLCInfo {
@@ -8227,9 +8403,12 @@ impl<
 								onion_packet.hmac,
 								payment_hash,
 								None,
+								// Phantom payments stay classical (no ML-KEM trail or blinded ciphertext).
+								None,
+								None,
 								&self.node_signer,
 							);
-							let next_hop = match decode_res {
+							let (next_hop, _, _, _) = match decode_res {
 								Ok(res) => res,
 								Err(onion_utils::OnionDecodeErr::Malformed { err_msg, reason }) => {
 									let sha256_of_onion =
@@ -8396,21 +8575,42 @@ impl<
 							},
 						..
 					} = payment;
-					let (onion_packet, blinded) = match routing {
-						PendingHTLCRouting::Forward { ref onion_packet, blinded, .. } => {
-							(onion_packet, blinded)
+					let (onion_packet, blinded, pq_onion_trail, pq_blinded_next_ct, pq_blinded_cur_ct) = match routing {
+						PendingHTLCRouting::Forward { ref onion_packet, blinded, ref pq_onion_trail, ref pq_blinded_next_ct, ref pq_blinded_cur_ct, .. } => {
+							(onion_packet, blinded, pq_onion_trail, pq_blinded_next_ct, pq_blinded_cur_ct)
 						},
 						_ => {
 							panic!("short_channel_id != 0 should imply any pending_forward entries are of type Forward");
 						},
 					};
+					#[cfg(not(feature = "post-quantum"))]
+					let _ = pq_blinded_cur_ct;
 					let next_blinding_point = blinded.and_then(|b| {
 						b.next_blinding_override.or_else(|| {
-							let encrypted_tlvs_ss = self
+							#[allow(unused_mut)]
+							let mut encrypted_tlvs_ss = self
 								.node_signer
 								.ecdh(Recipient::Node, &b.inbound_blinding_point, None)
 								.unwrap()
 								.secret_bytes();
+							// PQ: on a post-quantum blinded path, fold this hop's ML-KEM secret (the front
+							// entry of the inbound ciphertext list) into the route-blinding secret so the
+							// advanced blinding point matches the one the recipient baked into the path
+							// (which used the hybrid per-hop secret).
+							#[cfg(feature = "post-quantum")]
+							if let Some(list) = pq_blinded_cur_ct {
+								const CT_LEN: usize = crate::crypto::pq_kem::PQ_KEM_CT_LEN;
+								if list.len() >= CT_LEN {
+									let mut ct = [0u8; CT_LEN];
+									ct.copy_from_slice(&list[..CT_LEN]);
+									if let Some(kem_ss) = self.node_signer.pq_kem_decapsulate(&ct) {
+										encrypted_tlvs_ss = crate::crypto::pq_kem::mix_blinded_path_secret(
+											&encrypted_tlvs_ss,
+											&kem_ss,
+										);
+									}
+								}
+							}
 							onion_utils::next_hop_pubkey(
 								&self.secp_ctx,
 								b.inbound_blinding_point,
@@ -8504,6 +8704,8 @@ impl<
 						*skimmed_fee_msat,
 						next_blinding_point,
 						*incoming_accountable,
+						pq_onion_trail.clone(),
+						pq_blinded_next_ct.clone(),
 						&self.fee_estimator,
 						&&logger,
 					) {
@@ -10637,7 +10839,10 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 	fn finalize_claims(&self, sources: Vec<(HTLCSource, Option<AttributionData>)>) {
 		// Decode attribution data to hold times.
 		let hold_times = sources.into_iter().filter_map(|(source, attribution_data)| {
-			if let HTLCSource::OutboundRoute { ref session_priv, ref path, .. } = source {
+			if let HTLCSource::OutboundRoute {
+				ref session_priv, ref path, ref pq_hop_kem_secrets, ..
+			} = source
+			{
 				// If the path has trampoline hops, we need to hash the session private key to get the outer session key.
 				let derived_key;
 				let session_priv = if path.has_trampoline_hops() {
@@ -10655,6 +10860,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 						&self.logger,
 						path,
 						session_priv,
+						pq_hop_kem_secrets.as_deref(),
 						attribution_data,
 					)
 				});
@@ -18427,6 +18633,9 @@ pub fn provided_init_features(config: &UserConfig) -> InitFeatures {
 	#[cfg(feature = "post-quantum")]
 	features.set_pq_gossip_optional();
 
+	#[cfg(feature = "post-quantum")]
+	features.set_pq_payments_optional();
+
 	features
 }
 
@@ -18463,6 +18672,9 @@ impl_ser_tlv_based_enum!(PendingHTLCRouting,
 		(2, short_channel_id, required),
 		(3, incoming_cltv_expiry, option),
 		(4, hold_htlc, option),
+		(5, pq_onion_trail, option),
+		(7, pq_blinded_next_ct, option),
+		(9, pq_blinded_cur_ct, option),
 	},
 	(1, Receive) => {
 		(0, payment_data, required),
@@ -18683,6 +18895,7 @@ impl Readable for HTLCSource {
 				let mut payment_params: Option<PaymentParameters> = None;
 				let mut blinded_tail: Option<BlindedTail> = None;
 				let mut bolt12_invoice: Option<PaidBolt12Invoice> = None;
+				let mut pq_hop_kem_secrets: Option<Vec<u8>> = None;
 				read_tlv_fields!(reader, {
 					(0, session_priv, required),
 					(1, payment_id, option),
@@ -18691,6 +18904,7 @@ impl Readable for HTLCSource {
 					(5, payment_params, (option: ReadableArgs, 0)),
 					(6, blinded_tail, option),
 					(7, bolt12_invoice, option),
+					(9, pq_hop_kem_secrets, option),
 				});
 				if payment_id.is_none() {
 					// For backwards compat, if there was no payment_id written, use the session_priv bytes
@@ -18714,6 +18928,7 @@ impl Readable for HTLCSource {
 					path,
 					payment_id: payment_id.unwrap(),
 					bolt12_invoice,
+					pq_hop_kem_secrets,
 				})
 			}
 			1 => Ok(HTLCSource::PreviousHopData(Readable::read(reader)?)),
@@ -18733,6 +18948,7 @@ impl Writeable for HTLCSource {
 				ref path,
 				payment_id,
 				bolt12_invoice,
+				ref pq_hop_kem_secrets,
 			} => {
 				0u8.write(writer)?;
 				let payment_id_opt = Some(payment_id);
@@ -18745,6 +18961,7 @@ impl Writeable for HTLCSource {
 				   (5, None::<PaymentParameters>, option), // payment_params in LDK versions prior to 0.0.115
 				   (6, path.blinded_tail, option),
 				   (7, bolt12_invoice, option),
+				   (9, pq_hop_kem_secrets, option), // PQ: per-hop ML-KEM secrets for error-onion decode
 				});
 			},
 			HTLCSource::PreviousHopData(ref field) => {

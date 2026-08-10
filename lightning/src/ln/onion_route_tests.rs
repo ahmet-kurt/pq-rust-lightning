@@ -1967,6 +1967,7 @@ fn test_trampoline_onion_payload_assembly_values() {
 			.unwrap(),
 			excess_final_cltv_expiry_delta: 0,
 			final_value_msat: amt_msat,
+			kem_ct: None,
 		}),
 	};
 	assert_eq!(path.fee_msat(), 156_000);
@@ -2177,6 +2178,7 @@ fn test_trampoline_onion_payload_construction_vectors() {
 			.unwrap(),
 			excess_final_cltv_expiry_delta: 0,
 			final_value_msat: 0,
+			kem_ct: None,
 		}),
 	};
 

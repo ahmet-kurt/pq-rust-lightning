@@ -182,6 +182,11 @@ pub struct TestRouter<'a> {
 	pub next_blinded_payment_paths: Mutex<Vec<BlindedPaymentPath>>,
 	pub next_payment_context_metadata: Mutex<Option<BTreeMap<u64, Vec<u8>>>>,
 	pub scorer: &'a RwLock<TestScorer>,
+	// PQ: per-node ML-KEM encapsulation keys made available to a post-quantum payment sender. In a
+	// real deployment these come from the gossip-pinned key via the network graph; the test harness
+	// injects each hop's real key directly so a functional test need not drive gossip propagation.
+	#[cfg(feature = "post-quantum")]
+	pub pq_kem_keys: Mutex<HashMap<PublicKey, [u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]>>,
 	// PQ: per-node ML-DSA public keys made available to a post-quantum payer as the trusted anchor
 	// for a BOLT 11 invoice signature. In a real deployment these come from the gossip-pinned key via
 	// the network graph; the test harness injects the payee's key directly.
@@ -211,6 +216,8 @@ impl<'a> TestRouter<'a> {
 			next_blinded_payment_paths,
 			next_payment_context_metadata,
 			scorer,
+			#[cfg(feature = "post-quantum")]
+			pq_kem_keys: Mutex::new(new_hash_map()),
 			#[cfg(feature = "post-quantum")]
 			pq_node_ids: Mutex::new(new_hash_map()),
 		}
@@ -361,10 +368,34 @@ impl<'a> Router for TestRouter<'a> {
 	}
 
 	#[cfg(feature = "post-quantum")]
+	fn pq_kem_key_for_node(
+		&self, node_id: &PublicKey,
+	) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]> {
+		self.pq_kem_keys.lock().unwrap().get(node_id).copied()
+	}
+
+	#[cfg(feature = "post-quantum")]
 	fn pq_node_id_for_node(
 		&self, node_id: &PublicKey,
 	) -> Option<[u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]> {
 		self.pq_node_ids.lock().unwrap().get(node_id).copied()
+	}
+
+	#[cfg(feature = "post-quantum")]
+	fn create_pq_blinded_payment_paths<T: secp256k1::Signing + secp256k1::Verification>(
+		&self, recipient: PublicKey, recipient_pq_kem_key: [u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN],
+		local_node_receive_key: ReceiveAuthKey, first_hops: Vec<ChannelDetails>, tlvs: ReceiveTlvs,
+		amount_msats: Option<u64>, secp_ctx: &Secp256k1<T>,
+	) -> Result<Vec<BlindedPaymentPath>, ()> {
+		self.router.create_pq_blinded_payment_paths(
+			recipient,
+			recipient_pq_kem_key,
+			local_node_receive_key,
+			first_hops,
+			tlvs,
+			amount_msats,
+			secp_ctx,
+		)
 	}
 }
 
@@ -2059,6 +2090,13 @@ impl NodeSigner for TestKeysInterface {
 	#[cfg(feature = "post-quantum")]
 	fn get_pq_kem_node_id(&self) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]> {
 		self.backing.get_pq_kem_node_id()
+	}
+
+	#[cfg(feature = "post-quantum")]
+	fn pq_kem_decapsulate(
+		&self, ciphertext: &[u8; crate::crypto::pq_kem::PQ_KEM_CT_LEN],
+	) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_SS_LEN]> {
+		self.backing.pq_kem_decapsulate(ciphertext)
 	}
 }
 

@@ -1061,13 +1061,14 @@ mod fuzzy_onion_utils {
 		encrypted_packet: OnionErrorPacket,
 	) -> DecodedOnionFailure {
 		match htlc_source {
-			HTLCSource::OutboundRoute { ref path, ref session_priv, .. } => {
+			HTLCSource::OutboundRoute { ref path, ref session_priv, ref pq_hop_kem_secrets, .. } => {
 				let mut decoded = process_onion_failure_inner(
 					secp_ctx,
 					logger,
 					path,
 					session_priv,
 					None,
+					pq_hop_kem_secrets.as_deref(),
 					encrypted_packet,
 				);
 				if decoded.peeled_error_packet.take().is_some() {
@@ -1091,11 +1092,14 @@ mod fuzzy_onion_utils {
 					);
 					return permanent_failure();
 				};
+				// Trampoline dispatch paths are built with classical onions, so there are no
+				// per-hop ML-KEM secrets to mix into failure decryption.
 				let mut decoded = process_onion_failure_inner(
 					secp_ctx,
 					logger,
 					&dispatch.path,
 					&dispatch.session_priv,
+					None,
 					None,
 					encrypted_packet,
 				);
@@ -1116,9 +1120,11 @@ mod fuzzy_onion_utils {
 	/// Decodes the attribution data that we got back from upstream on a payment we sent.
 	pub fn decode_fulfill_attribution_data<T: secp256k1::Signing, L: Logger>(
 		secp_ctx: &Secp256k1<T>, logger: &L, path: &Path, outer_session_priv: &SecretKey,
-		mut attribution_data: AttributionData,
+		pq_hop_kem_secrets: Option<&[u8]>, mut attribution_data: AttributionData,
 	) -> Vec<u32> {
 		let mut hold_times = Vec::new();
+		#[cfg(not(feature = "post-quantum"))]
+		let _ = pq_hop_kem_secrets;
 
 		// Only consider hops in the regular path for attribution data. Blinded path attribution data isn't accessible.
 		let shared_secrets =
@@ -1132,6 +1138,25 @@ mod fuzzy_onion_utils {
 		for (route_hop_idx, shared_secret) in
 			shared_secrets.enumerate().take(attributable_hop_count)
 		{
+			// PQ: fold this hop's stored ML-KEM secret into the classical secret so the fulfill attribution
+			// keys match the hybrid secret the hop used on a post-quantum payment.
+			#[cfg(feature = "post-quantum")]
+			let shared_secret = {
+				const SS_LEN: usize = crate::crypto::pq_kem::PQ_KEM_SS_LEN;
+				match pq_hop_kem_secrets {
+					Some(kem_secrets) if (route_hop_idx + 1) * SS_LEN <= kem_secrets.len() => {
+						let off = route_hop_idx * SS_LEN;
+						let mut kem_ss = [0u8; SS_LEN];
+						kem_ss.copy_from_slice(&kem_secrets[off..off + SS_LEN]);
+						let hybrid = crate::crypto::pq_kem::mix_payment_onion_secret(
+							&shared_secret.secret_bytes(),
+							&kem_ss,
+						);
+						SharedSecret::from_bytes(hybrid)
+					},
+					_ => shared_secret,
+				}
+			};
 			attribution_data.crypt(shared_secret.as_ref());
 
 			// Calculate position relative to the last attributable hop. The last attributable hop is at position 0. We need
@@ -1190,7 +1215,8 @@ fn permanent_failure() -> DecodedOnionFailure {
 /// OutboundRoute).
 fn process_onion_failure_inner<T: secp256k1::Signing, L: Logger>(
 	secp_ctx: &Secp256k1<T>, logger: &L, path: &Path, session_priv: &SecretKey,
-	trampoline_session_priv_override: Option<SecretKey>, mut encrypted_packet: OnionErrorPacket,
+	trampoline_session_priv_override: Option<SecretKey>, pq_hop_kem_secrets: Option<&[u8]>,
+	mut encrypted_packet: OnionErrorPacket,
 ) -> DecodedOnionFailure {
 	// Check that there is at least enough data for an hmac, otherwise none of the checking that we may do makes sense.
 	// Also prevent slice out of bounds further down.
@@ -1279,8 +1305,29 @@ fn process_onion_failure_inner<T: secp256k1::Signing, L: Logger>(
 	let mut attribution_failed_channel = None;
 
 	// Handle packed channel/node updates for passing back for the route handler
+	#[cfg(not(feature = "post-quantum"))]
+	let _ = pq_hop_kem_secrets;
 	let mut iter = nontrampolines.chain(trampolines.into_iter().flatten()).enumerate().peekable();
 	while let Some((route_hop_idx, (route_hop_option, shared_secret))) = iter.next() {
+		// PQ: for a post-quantum payment, fold this hop's stored ML-KEM secret into the classical
+		// secret so the ammag/um keys match the hybrid secret the hops used to encrypt the error onion.
+		#[cfg(feature = "post-quantum")]
+		let shared_secret = {
+			const SS_LEN: usize = crate::crypto::pq_kem::PQ_KEM_SS_LEN;
+			match pq_hop_kem_secrets {
+				Some(kem_secrets) if (route_hop_idx + 1) * SS_LEN <= kem_secrets.len() => {
+					let off = route_hop_idx * SS_LEN;
+					let mut kem_ss = [0u8; SS_LEN];
+					kem_ss.copy_from_slice(&kem_secrets[off..off + SS_LEN]);
+					let hybrid = crate::crypto::pq_kem::mix_payment_onion_secret(
+						&shared_secret.secret_bytes(),
+						&kem_ss,
+					);
+					SharedSecret::from_bytes(hybrid)
+				},
+				_ => shared_secret,
+			}
+		};
 		let route_hop = match route_hop_option.as_ref() {
 			Some(hop) => hop,
 			None => {
@@ -2460,10 +2507,47 @@ pub(crate) enum OnionDecodeErr {
 
 pub(crate) fn decode_next_payment_hop<NS: NodeSigner>(
 	recipient: Recipient, hop_pubkey: &PublicKey, hop_data: &[u8], hmac_bytes: [u8; 32],
-	payment_hash: PaymentHash, blinding_point: Option<PublicKey>, node_signer: NS,
-) -> Result<Hop, OnionDecodeErr> {
+	payment_hash: PaymentHash, blinding_point: Option<PublicKey>,
+	inbound_pq_onion_trail: Option<&[u8]>, inbound_pq_blinded_ct: Option<&[u8]>, node_signer: NS,
+) -> Result<(Hop, Option<Vec<u8>>, Option<[u8; 32]>, Option<[u8; 32]>), OnionDecodeErr> {
+	// PQ: on a post-quantum blinded path the inbound HTLC carries a fixed-size list of ML-KEM
+	// ciphertexts (alongside the onion, not inside its hard 1300-byte budget). This hop's ciphertext is
+	// the front entry; it decapsulates it to derive its hybrid route-blinding secret. A non-blinded
+	// forwarding hop sees the introduction node's entry at the front, so decapsulating it yields a secret
+	// it never uses; only a blinded hop folds it into a key. ML-KEM decapsulation is failure-resistant (a
+	// mismatched ciphertext yields an unrelated secret rather than an error), so decapsulating another
+	// node's entry never fails a hop; only a malformed list length or a signer without a KEM key errors
+	// here.
+	#[cfg(not(feature = "post-quantum"))]
+	let _ = inbound_pq_blinded_ct;
+	#[cfg(feature = "post-quantum")]
+	let pq_blinded_kem_ss: Option<[u8; 32]> = match inbound_pq_blinded_ct {
+		Some(list) if list.len() >= crate::crypto::pq_kem::PQ_KEM_CT_LEN => {
+			let mut ct = [0u8; crate::crypto::pq_kem::PQ_KEM_CT_LEN];
+			ct.copy_from_slice(&list[..crate::crypto::pq_kem::PQ_KEM_CT_LEN]);
+			Some(node_signer.pq_kem_decapsulate(&ct).ok_or(OnionDecodeErr::Malformed {
+				err_msg: "Failed to decapsulate post-quantum blinded-path ciphertext",
+				reason: LocalHTLCFailureReason::InvalidOnionBlinding,
+			})?)
+		},
+		Some(_) => {
+			return Err(OnionDecodeErr::Malformed {
+				err_msg: "Invalid post-quantum blinded-path ciphertext list length",
+				reason: LocalHTLCFailureReason::InvalidOnionBlinding,
+			})
+		},
+		None => None,
+	};
+
 	let blinded_node_id_tweak = blinding_point.map(|bp| {
 		let blinded_tlvs_ss = node_signer.ecdh(recipient, &bp, None).unwrap().secret_bytes();
+		// PQ: fold this hop's ML-KEM secret into the route-blinding secret so the blinded node id (and
+		// therefore the onion key derived from it) is hybrid.
+		#[cfg(feature = "post-quantum")]
+		let blinded_tlvs_ss = match pq_blinded_kem_ss {
+			Some(kem_ss) => crate::crypto::pq_kem::mix_blinded_path_secret(&blinded_tlvs_ss, &kem_ss),
+			None => blinded_tlvs_ss,
+		};
 		let mut hmac = HmacEngine::<Sha256>::new(b"blinded_node_id");
 		hmac.input(blinded_tlvs_ss.as_ref());
 		Scalar::from_be_bytes(Hmac::from_engine(hmac).to_byte_array()).unwrap()
@@ -2471,14 +2555,52 @@ pub(crate) fn decode_next_payment_hop<NS: NodeSigner>(
 	let shared_secret =
 		node_signer.ecdh(recipient, hop_pubkey, blinded_node_id_tweak.as_ref()).unwrap();
 
+	// PQ: if the inbound HTLC carries an ML-KEM ciphertext trail, peel this hop's ciphertext, fold the
+	// decapsulated secret into the classical ECDH secret, and use the resulting hybrid secret to peel
+	// the onion (and, downstream, to key the return error onion). The classical secret is kept for the
+	// EC pubkey-blinding chain, which stays classical, and the next hop's trail is forwarded onward.
+	#[cfg(not(feature = "post-quantum"))]
+	let (next_pq_onion_trail, pq_classical_ss): (Option<Vec<u8>>, Option<[u8; 32]>) = {
+		let _ = inbound_pq_onion_trail;
+		(None, None)
+	};
+	#[cfg(feature = "post-quantum")]
+	let (shared_secret, mut next_pq_onion_trail, pq_classical_ss) = match inbound_pq_onion_trail {
+		Some(trail_bytes) => {
+			let classical = shared_secret.secret_bytes();
+			let mut reader = trail_bytes;
+			let trail = PqOnionTrail::read(&mut reader).map_err(|_| OnionDecodeErr::Malformed {
+				err_msg: "Failed to read post-quantum onion trail",
+				reason: LocalHTLCFailureReason::InvalidOnionPayload,
+			})?;
+			let (hybrid, next_trail) = pq_hop_hybrid_secret(&classical, &trail, &node_signer)
+				.ok_or(OnionDecodeErr::Malformed {
+					err_msg: "Failed to derive post-quantum hybrid onion secret",
+					reason: LocalHTLCFailureReason::InvalidOnionPayload,
+				})?;
+			(SharedSecret::from_bytes(hybrid), next_trail.map(|t| t.encode()), Some(classical))
+		},
+		None => (shared_secret, None, None),
+	};
+
+	// PQ: the classical Trampoline-layer ECDH secret, kept alongside the hybrid one because the
+	// Trampoline ephemeral chain (like the outer one) advances with the classical secret. Set only
+	// when a Trampoline entrypoint folds a trail entry into its Trampoline Sphinx secret below.
+	#[allow(unused_mut)]
+	let mut pq_trampoline_classical_ss: Option<[u8; 32]> = None;
+
+	#[cfg(feature = "post-quantum")]
+	let pq_blinded_kem_ss_arg = pq_blinded_kem_ss;
+	#[cfg(not(feature = "post-quantum"))]
+	let pq_blinded_kem_ss_arg: Option<[u8; 32]> = None;
 	let decoded_hop: Result<(msgs::InboundOnionPayload, Option<_>), _> = decode_next_hop(
 		shared_secret.secret_bytes(),
 		hop_data,
 		hmac_bytes,
 		Some(payment_hash),
-		(blinding_point, &node_signer),
+		(blinding_point, pq_blinded_kem_ss_arg, &node_signer),
 	);
-	match decoded_hop {
+	let hop: Result<Hop, OnionDecodeErr> = match decoded_hop {
 		Ok((next_hop_data, Some((next_hop_hmac, FixedSizeOnionPacket(new_packet_bytes))))) => {
 			match next_hop_data {
 				msgs::InboundOnionPayload::Forward(next_hop_data) => Ok(Hop::Forward {
@@ -2530,6 +2652,16 @@ pub(crate) fn decode_next_payment_hop<NS: NodeSigner>(
 				let trampoline_blinded_node_id_tweak = hop_data.current_path_key.map(|bp| {
 					let blinded_tlvs_ss =
 						node_signer.ecdh(recipient, &bp, None).unwrap().secret_bytes();
+					// PQ: fold this hop's ML-KEM secret into the Trampoline route-blinding secret so
+					// the blinded Trampoline node id (and the Trampoline onion key derived from it)
+					// is hybrid.
+					#[cfg(feature = "post-quantum")]
+					let blinded_tlvs_ss = match pq_blinded_kem_ss {
+						Some(kem_ss) => {
+							crate::crypto::pq_kem::mix_blinded_path_secret(&blinded_tlvs_ss, &kem_ss)
+						},
+						None => blinded_tlvs_ss,
+					};
 					let mut hmac = HmacEngine::<Sha256>::new(b"blinded_node_id");
 					hmac.input(blinded_tlvs_ss.as_ref());
 					Scalar::from_be_bytes(Hmac::from_engine(hmac).to_byte_array()).unwrap()
@@ -2542,6 +2674,43 @@ pub(crate) fn decode_next_payment_hop<NS: NodeSigner>(
 					)
 					.unwrap()
 					.secret_bytes();
+
+				// PQ: on a post-quantum payment the trail carries this node's Trampoline-layer
+				// ciphertext right behind its outer-layer entry, so peel the once-rotated trail
+				// again and fold the decapsulated secret into the Trampoline Sphinx secret. A
+				// blinded relaying Trampoline hop (current_path_key set) is keyed by the
+				// recipient-baked hybrid blinded node id instead and consumes no trail entry.
+				#[cfg(feature = "post-quantum")]
+				let trampoline_shared_secret = if hop_data.current_path_key.is_none() {
+					match next_pq_onion_trail.take() {
+						Some(trail_bytes) => {
+							let mut reader = &trail_bytes[..];
+							let trail = PqOnionTrail::read(&mut reader).map_err(|_| {
+								OnionDecodeErr::Malformed {
+									err_msg: "Failed to read post-quantum onion trail",
+									reason: LocalHTLCFailureReason::InvalidOnionPayload,
+								}
+							})?;
+							let (hybrid, next_trail) =
+								pq_hop_hybrid_secret(&trampoline_shared_secret, &trail, &node_signer)
+									.ok_or(OnionDecodeErr::Malformed {
+										err_msg: "Failed to derive post-quantum hybrid Trampoline onion secret",
+										reason: LocalHTLCFailureReason::InvalidOnionPayload,
+									})?;
+							pq_trampoline_classical_ss = Some(trampoline_shared_secret);
+							next_pq_onion_trail = next_trail.map(|t| t.encode());
+							hybrid
+						},
+						None => trampoline_shared_secret,
+					}
+				} else {
+					trampoline_shared_secret
+				};
+
+				#[cfg(feature = "post-quantum")]
+				let pq_trampoline_blinded_kem_ss_arg = pq_blinded_kem_ss;
+				#[cfg(not(feature = "post-quantum"))]
+				let pq_trampoline_blinded_kem_ss_arg: Option<[u8; 32]> = None;
 				let decoded_trampoline_hop: Result<
 					(msgs::InboundTrampolinePayload, Option<([u8; 32], Vec<u8>)>),
 					_,
@@ -2553,7 +2722,7 @@ pub(crate) fn decode_next_payment_hop<NS: NodeSigner>(
 					// When we have a trampoline packet, the current_path_key in our outer onion
 					// payload plays the role of the update_add_htlc blinding_point for the inner
 					// onion.
-					(hop_data.current_path_key, node_signer),
+					(hop_data.current_path_key, pq_trampoline_blinded_kem_ss_arg, node_signer),
 				);
 				match decoded_trampoline_hop {
 					Ok((
@@ -2678,7 +2847,19 @@ pub(crate) fn decode_next_payment_hop<NS: NodeSigner>(
 			},
 		},
 		Err(e) => Err(e),
-	}
+	};
+	hop.map(|hop| {
+		// The trail covers only the unblinded hops (the blinded tail uses the route-blinding cascade), so
+		// a blinded hop drops the dummy-padded remainder rather than forwarding it into the blinded tail.
+		#[cfg(feature = "post-quantum")]
+		let next_pq_onion_trail =
+			if matches!(hop, Hop::BlindedForward { .. } | Hop::BlindedReceive { .. }) {
+				None
+			} else {
+				next_pq_onion_trail
+			};
+		(hop, next_pq_onion_trail, pq_classical_ss, pq_trampoline_classical_ss)
+	})
 }
 
 /// Peels a single dummy hop from an inbound `UpdateAddHTLC` by reconstructing the next
@@ -2890,6 +3071,173 @@ pub(crate) fn create_payment_onion_internal<T: secp256k1::Signing>(
 	Ok((onion_packet, htlc_msat, htlc_cltv))
 }
 
+/// PQ: build a post-quantum hybrid payment onion. Returns the outbound onion (built with per-hop
+/// hybrid keys), the first-hop msat/cltv, the ML-KEM ciphertext trail (carried alongside the onion in
+/// `update_add_htlc` for the unblinded hops' main-onion keys), the per-hop ML-KEM shared secrets of the
+/// unblinded hops (for the return error onion), and the blinded path's per-hop ciphertext list to
+/// place in the outbound HTLC's `pq_blinded_ct` (`None` on a plain path). `hop_kem_keys[i]` is the
+/// pinned ML-KEM key of the `i`th unblinded hop (`path.hops`). A plain path, a post-quantum blinded
+/// path (built via [`BlindedPaymentPath::new_pq`]), or a Trampoline path whose blinded tail is
+/// post-quantum is supported. On a Trampoline path the inner Trampoline onion is built with hybrid
+/// keys too: `trampoline_kem_keys[i]` is the pinned ML-KEM key of the `i`th unblinded Trampoline hop,
+/// and the trail carries the outer hops' ciphertexts followed by the Trampoline hops' ciphertexts, so
+/// the Trampoline node peels two front entries (its outer layer, then its Trampoline layer). The
+/// returned flattened secrets keep that same outer-then-Trampoline order, matching the iteration
+/// order of `process_onion_failure_inner`.
+///
+/// [`BlindedPaymentPath::new_pq`]: crate::blinded_path::payment::BlindedPaymentPath::new_pq
+#[cfg(feature = "post-quantum")]
+pub(crate) fn create_pq_payment_onion<T: secp256k1::Signing>(
+	secp_ctx: &Secp256k1<T>, path: &Path, session_priv: &SecretKey,
+	recipient_onion: &RecipientOnionFields, cur_block_height: u32, payment_hash: &PaymentHash,
+	keysend_preimage: &Option<PaymentPreimage>, invoice_request: Option<&InvoiceRequest>,
+	prng_seed: [u8; 32], hop_kem_keys: &[[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]],
+	trampoline_kem_keys: &[[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]], kem_base_seed: &[u8; 32],
+	trail_prng_seed: [u8; 32],
+) -> Result<(msgs::OnionPacket, u64, u32, PqOnionTrail, Vec<u8>, Option<Vec<u8>>), APIError> {
+	// A blinded tail must be a post-quantum one (carrying the per-hop ciphertext list); a
+	// classical blinded path's node ids are not hybrid and cannot be peeled with hybrid keys.
+	if path.blinded_tail.as_ref().map_or(false, |bt| bt.kem_ct.is_none()) {
+		return Err(APIError::InvalidRoute {
+			err: "Post-quantum payment onion requires a post-quantum blinded path".to_owned(),
+		});
+	}
+	if !path.has_trampoline_hops() {
+		debug_assert!(trampoline_kem_keys.is_empty());
+		let (onion_payloads, htlc_msat, htlc_cltv) = build_onion_payloads(
+			&path,
+			recipient_onion,
+			cur_block_height,
+			keysend_preimage,
+			invoice_request,
+			None,
+		)?;
+		debug_assert_eq!(htlc_cltv - cur_block_height, path.total_cltv_expiry_delta());
+
+		let (onion_keys, trail, kem_secrets) = construct_pq_onion_keys_and_trail(
+			&secp_ctx,
+			&path,
+			session_priv,
+			hop_kem_keys,
+			kem_base_seed,
+			trail_prng_seed,
+		)
+		.map_err(|_| APIError::InvalidRoute {
+			err: "Failed to build post-quantum onion keys (route too long or missing ML-KEM key)"
+				.to_owned(),
+		})?;
+		let onion_packet =
+			construct_onion_packet(onion_payloads, onion_keys, prng_seed, payment_hash).map_err(
+				|_| APIError::InvalidRoute {
+					err: "Route size too large (or empty) considering onion data".to_owned(),
+				},
+			)?;
+		// Flatten the per-hop ML-KEM secrets (32 bytes each, in hop order) for storage on the outbound HTLC.
+		let kem_secrets_flat: Vec<u8> = kem_secrets.iter().flatten().copied().collect();
+		// On a blinded path, carry the blinded tail's ML-KEM ciphertext list in the outbound HTLC.
+		let pq_blinded_ct = path.blinded_tail.as_ref().and_then(|bt| bt.kem_ct.clone());
+		return Ok((onion_packet, htlc_msat, htlc_cltv, trail, kem_secrets_flat, pq_blinded_ct));
+	}
+
+	// Trampoline path: build the inner Trampoline onion with hybrid keys first, then the outer onion
+	// around it, mirroring `create_payment_onion_internal`. The Trampoline onion keeps its classical
+	// size; only the key schedule changes, with the Trampoline hops' ciphertexts riding in the shared
+	// trail behind the outer hops' entries.
+	let blinded_tail = path.blinded_tail.as_ref().expect("Trampoline hops imply a blinded tail");
+	let mut trampoline_outer_onion = RecipientOnionFields {
+		payment_secret: recipient_onion.payment_secret,
+		total_mpp_amount_msat: 0,
+		payment_metadata: None,
+		custom_tlvs: Vec::new(),
+	};
+	if recipient_onion.payment_metadata.is_some() {
+		return Err(APIError::InvalidRoute {
+			err: "Cannot pass payment_metadata to a blinded recipient".to_owned(),
+		});
+	}
+	let (trampoline_payloads, outer_total_msat) = build_trampoline_onion_payloads(
+		&blinded_tail,
+		recipient_onion,
+		cur_block_height,
+		keysend_preimage,
+	)?;
+	trampoline_outer_onion.total_mpp_amount_msat = outer_total_msat;
+
+	let trampoline_session_priv = compute_trampoline_session_priv(session_priv);
+	let (trampoline_onion_keys, trampoline_cts, trampoline_kem_secrets) =
+		construct_pq_onion_keys_inner(
+			secp_ctx,
+			&blinded_tail.trampoline_hops,
+			Some(blinded_tail),
+			&trampoline_session_priv,
+			trampoline_kem_keys,
+			kem_base_seed,
+			path.hops.len(),
+		)
+		.map_err(|_| APIError::InvalidRoute {
+			err: "Failed to build post-quantum Trampoline onion keys (missing ML-KEM key)"
+				.to_owned(),
+		})?;
+	let trampoline_packet = construct_trampoline_onion_packet(
+		trampoline_payloads,
+		trampoline_onion_keys,
+		prng_seed,
+		payment_hash,
+		None,
+	)
+	.map_err(|_| APIError::InvalidRoute {
+		err: "Route size too large (or empty) considering onion data".to_owned(),
+	})?;
+
+	let (onion_payloads, htlc_msat, htlc_cltv) = build_onion_payloads(
+		&path,
+		&trampoline_outer_onion,
+		cur_block_height,
+		keysend_preimage,
+		invoice_request,
+		Some(trampoline_packet),
+	)?;
+	debug_assert_eq!(htlc_cltv - cur_block_height, path.total_cltv_expiry_delta());
+
+	// The outer onion's blinded tail lives inside the Trampoline onion, so the outer hops are keyed
+	// with no blinded tail of their own.
+	let (onion_keys, outer_cts, outer_kem_secrets) = construct_pq_onion_keys_inner(
+		secp_ctx,
+		&path.hops,
+		None,
+		session_priv,
+		hop_kem_keys,
+		kem_base_seed,
+		0,
+	)
+	.map_err(|_| APIError::InvalidRoute {
+		err: "Failed to build post-quantum onion keys (route too long or missing ML-KEM key)"
+			.to_owned(),
+	})?;
+	let onion_packet = construct_onion_packet(onion_payloads, onion_keys, prng_seed, payment_hash)
+		.map_err(|_| APIError::InvalidRoute {
+			err: "Route size too large (or empty) considering onion data".to_owned(),
+		})?;
+
+	// One shared trail: the outer hops' ciphertexts in hop order, then the Trampoline hops'. Each
+	// outer hop rotates one entry, so the Trampoline node finds its outer entry and then its
+	// Trampoline entry at the front.
+	let mut ciphertexts = outer_cts;
+	ciphertexts.extend_from_slice(&trampoline_cts);
+	let trail = build_pq_trail(&ciphertexts, trail_prng_seed).map_err(|_| {
+		APIError::InvalidRoute {
+			err: "Failed to build post-quantum onion keys (route too long or missing ML-KEM key)"
+				.to_owned(),
+		}
+	})?;
+	// Flatten the outer hops' secrets followed by the Trampoline hops' secrets, matching the
+	// outer-then-Trampoline iteration order of the return error onion decoder.
+	let kem_secrets_flat: Vec<u8> =
+		outer_kem_secrets.iter().chain(trampoline_kem_secrets.iter()).flatten().copied().collect();
+	let pq_blinded_ct = blinded_tail.kem_ct.clone();
+	Ok((onion_packet, htlc_msat, htlc_cltv, trail, kem_secrets_flat, pq_blinded_ct))
+}
+
 pub(crate) fn decode_next_untagged_hop<T, R: ReadableArgs<T>, N: NextPacketBytes>(
 	shared_secret: [u8; 32], hop_data: &[u8], hmac_bytes: [u8; 32], read_args: T,
 ) -> Result<(R, Option<([u8; 32], N)>), OnionDecodeErr> {
@@ -2983,6 +3331,259 @@ fn decode_next_hop<T, R: ReadableArgs<T>, N: NextPacketBytes>(
 			}
 		},
 	}
+}
+
+// Post-quantum (hybrid ML-KEM) BOLT 4 payment-onion support.
+//
+// A quantum attacker who records a payment onion can recover each hop's classical per-hop ECDH secret
+// by breaking the hop's node-key discrete log, peel the Sphinx onion, and so deanonymize the whole
+// route and per-hop payloads (a harvest-now-decrypt-later privacy attack; funds stay protected
+// on-chain by BOLT 3, which is out of scope). To resist this we fold a per-hop ML-KEM-768 shared
+// secret into each hop's Sphinx secret (`mix_payment_onion_secret`), so the onion `rho`/`mu` keys
+// become hybrid and a Shor adversary that recovers the classical secret still cannot peel the onion.
+//
+// The ML-KEM ciphertexts do not fit inside the 1300-byte onion (one ciphertext is ~1088 bytes), so
+// they ride in a parallel fixed-size list carried alongside the onion in the `update_add_htlc`
+// message (whose 65535-byte envelope is roomy even though the onion sub-field is not). The list
+// holds one ciphertext per unblinded hop, in hop order, followed by random dummy entries up to a
+// fixed length. Each hop reads the FRONT entry (its own ciphertext), decapsulates it with its
+// static ML-KEM key to form the hybrid secret, and rotates that entry to the back, so the next
+// hop finds its ciphertext at the front and the list stays a constant size. The list carries no
+// secret-keyed structure at all: the entries are opaque public values, useless to a Shor attacker
+// without the hop's ML-KEM key, so unlike a classical-keyed trail it gives a key-breaking attacker
+// no per-hop oracle to confirm a hop's identity, trace the route, or count the hops. Tampering is
+// caught by the hybrid `mu` of the main onion (a swapped ciphertext yields a wrong hybrid secret),
+// and dropping the list fails closed (a hop deriving only the classical secret cannot peel the
+// hybrid-keyed onion). The list is padded to a route-length-independent fixed size, so neither its
+// length nor its contents reveal the hop count.
+
+/// The number of entries a post-quantum payment ciphertext list always carries, matching the onion
+/// maximum hop count, so the real ciphertexts are padded with random dummies to a fixed,
+/// route-length-independent size (see [`build_pq_trail`]).
+#[cfg(feature = "post-quantum")]
+pub(crate) const PQ_PAYMENT_TRAIL_HOPS: usize =
+	crate::routing::router::MAX_PATH_LENGTH_ESTIMATE as usize + 1;
+
+/// The maximum number of hops in a post-quantum blinded payment tail. The per-hop ML-KEM ciphertext
+/// list the sender carries alongside the onion is padded to this many entries so its length never
+/// reveals the actual blinded-tail length as hops rotate it.
+#[cfg(feature = "post-quantum")]
+pub(crate) const PQ_BLINDED_PATH_MAX_HOPS: usize = 10;
+
+/// The fixed serialized length of the payment-onion ML-KEM ciphertext list: one 1088-byte
+/// ciphertext for each of the maximum number of hops.
+#[cfg(feature = "post-quantum")]
+pub(crate) const PQ_PAYMENT_TRAIL_LEN: usize =
+	PQ_PAYMENT_TRAIL_HOPS * crate::crypto::pq_kem::PQ_KEM_CT_LEN;
+
+/// The fixed-size list of ML-KEM ciphertexts that travels alongside a post-quantum payment onion.
+/// `hop_data` holds the real per-hop ciphertexts first, in hop order, followed by random dummy
+/// entries up to [`PQ_PAYMENT_TRAIL_HOPS`]; each hop reads the front entry and rotates it to the
+/// back. The list carries no per-hop authentication of its own (integrity comes from the hybrid
+/// main-onion `mu`), so a Shor attacker that recovers a hop's classical secret gets no oracle.
+#[cfg(feature = "post-quantum")]
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct PqOnionTrail {
+	pub(crate) hop_data: Vec<u8>,
+}
+
+#[cfg(feature = "post-quantum")]
+impl Writeable for PqOnionTrail {
+	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), crate::io::Error> {
+		writer.write_all(&self.hop_data)
+	}
+}
+
+#[cfg(feature = "post-quantum")]
+impl Readable for PqOnionTrail {
+	fn read<R: Read>(reader: &mut R) -> Result<Self, msgs::DecodeError> {
+		let mut hop_data = vec![0u8; PQ_PAYMENT_TRAIL_LEN];
+		reader.read_exact(&mut hop_data)?;
+		Ok(PqOnionTrail { hop_data })
+	}
+}
+
+/// Derives a deterministic per-hop ML-KEM encapsulation seed from a per-payment base seed and the hop
+/// index, so encapsulation is reproducible (the deterministic-encapsulation pattern used elsewhere).
+#[cfg(feature = "post-quantum")]
+fn pq_hop_kem_seed(base_seed: &[u8; 32], idx: usize) -> [u8; 32] {
+	let mut hmac = HmacEngine::<Sha256>::new(b"pq_payment_kem_seed");
+	hmac.input(base_seed);
+	hmac.input(&(idx as u64).to_be_bytes());
+	Hmac::from_engine(hmac).to_byte_array()
+}
+
+/// Derives a deterministic dummy ML-KEM ciphertext for padding the ciphertext list to its fixed
+/// length. No hop ever decapsulates a dummy entry, but a hop must not be able to tell it from a real
+/// entry either, so it is sampled from the distribution of real ciphertexts (see
+/// [`crate::crypto::pq_kem::dummy_ciphertext_from_seed`]) rather than filled with keystream bytes.
+#[cfg(feature = "post-quantum")]
+fn pq_dummy_trail_ct(
+	prng_seed: &[u8; 32], idx: usize,
+) -> [u8; crate::crypto::pq_kem::PQ_KEM_CT_LEN] {
+	let mut ct_seed_hmac = HmacEngine::<Sha256>::new(b"pq_payment_trail_dummy_ct");
+	ct_seed_hmac.input(prng_seed);
+	ct_seed_hmac.input(&(idx as u64).to_be_bytes());
+	let ct_seed = Hmac::from_engine(ct_seed_hmac).to_byte_array();
+	crate::crypto::pq_kem::dummy_ciphertext_from_seed(&ct_seed)
+}
+
+/// Builds the fixed-size ML-KEM ciphertext list for a payment onion. `ciphertexts[i]` is unblinded
+/// hop `i`'s ciphertext; they are laid out in hop order and padded with random dummies (from
+/// [`pq_dummy_trail_ct`]) up to [`PQ_PAYMENT_TRAIL_HOPS`] entries, so the list length never reveals
+/// the hop count and the list carries no per-hop key or MAC for a key-breaking attacker to exploit.
+/// Each hop reads the front entry and rotates it to the back (see [`pq_hop_hybrid_secret`]).
+#[cfg(feature = "post-quantum")]
+fn build_pq_trail(
+	ciphertexts: &[[u8; crate::crypto::pq_kem::PQ_KEM_CT_LEN]], prng_seed: [u8; 32],
+) -> Result<PqOnionTrail, ()> {
+	let real_hops = ciphertexts.len();
+	if real_hops == 0 || real_hops > crate::routing::router::MAX_PATH_LENGTH_ESTIMATE as usize {
+		return Err(());
+	}
+	let mut hop_data = Vec::with_capacity(PQ_PAYMENT_TRAIL_LEN);
+	for ct in ciphertexts {
+		hop_data.extend_from_slice(ct);
+	}
+	for idx in real_hops..PQ_PAYMENT_TRAIL_HOPS {
+		hop_data.extend_from_slice(&pq_dummy_trail_ct(&prng_seed, idx));
+	}
+	debug_assert_eq!(hop_data.len(), PQ_PAYMENT_TRAIL_LEN);
+	Ok(PqOnionTrail { hop_data })
+}
+
+/// Derives the per-hop hybrid onion keys for one onion layer of a post-quantum payment: the first
+/// `hops.len()` hops (keyed by real node ids) each get a fresh ML-KEM encapsulation to their pinned
+/// key folded into the classical Sphinx secret, while any blinded-tail hops beyond them are keyed by
+/// the recipient-baked hybrid blinded node ids and so get onion keys directly with no ciphertext and
+/// no sender-side fold. `kem_seed_idx_offset` positions the deterministic per-hop encapsulation seeds,
+/// so the outer and Trampoline layers of one payment draw from disjoint seed indices (matching their
+/// entries' positions in the shared ciphertext trail). Returns the hybrid [`OnionKeys`], the per-hop
+/// ciphertexts, and the per-hop ML-KEM shared secrets (for the return error onion).
+#[cfg(feature = "post-quantum")]
+fn construct_pq_onion_keys_inner<T: secp256k1::Signing, H: HopInfo>(
+	secp_ctx: &Secp256k1<T>, hops: &[H], blinded_tail: Option<&BlindedTail>,
+	session_priv: &SecretKey, hop_kem_keys: &[[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]],
+	kem_base_seed: &[u8; 32], kem_seed_idx_offset: usize,
+) -> Result<
+	(
+		Vec<OnionKeys>,
+		Vec<[u8; crate::crypto::pq_kem::PQ_KEM_CT_LEN]>,
+		Vec<[u8; crate::crypto::pq_kem::PQ_KEM_SS_LEN]>,
+	),
+	(),
+> {
+	if hops.is_empty() || hop_kem_keys.len() != hops.len() {
+		return Err(());
+	}
+	let num_unblinded = hops.len();
+	let mut onion_keys = Vec::with_capacity(num_unblinded);
+	let mut ciphertexts = Vec::with_capacity(num_unblinded);
+	// The per-hop ML-KEM shared secrets (unblinded hops only), returned so the sender can store them
+	// and later re-derive the hybrid per-hop secret to decode the (hybrid-keyed) BOLT 4 return error
+	// onion. Blinded-tail hops are not folded here, so their secrets are re-derived classically from the
+	// hybrid blinded node ids when decoding a returned failure.
+	let mut kem_secrets = Vec::with_capacity(num_unblinded);
+
+	let iter = construct_onion_keys_generic(secp_ctx, hops, blinded_tail, session_priv);
+	for (shared_secret, _blinding_factor, ephemeral_pubkey, _, idx) in iter {
+		if idx < num_unblinded {
+			// Unblinded hop (prefix or introduction node): fold this hop's ML-KEM secret into the
+			// classical secret so the onion rho/mu become hybrid.
+			let classical = shared_secret.secret_bytes();
+			let hop_seed = pq_hop_kem_seed(kem_base_seed, kem_seed_idx_offset + idx);
+			let (kem_ss, ct) =
+				crate::crypto::pq_kem::encapsulate(&hop_kem_keys[idx], &hop_seed).ok_or(())?;
+			let hybrid = crate::crypto::pq_kem::mix_payment_onion_secret(&classical, &kem_ss);
+			let (rho, mu) = gen_rho_mu_from_shared_secret(&hybrid);
+			onion_keys.push(OnionKeys {
+				#[cfg(test)]
+				shared_secret: SharedSecret::from_bytes(hybrid),
+				#[cfg(test)]
+				blinding_factor: _blinding_factor,
+				ephemeral_pubkey,
+				rho,
+				mu,
+			});
+			ciphertexts.push(ct);
+			kem_secrets.push(kem_ss);
+		} else {
+			// Blinded-tail hop: the shared secret is already hybrid because the recipient baked a
+			// per-hop ML-KEM fold into the blinded node id, so derive the onion keys directly.
+			let (rho, mu) = gen_rho_mu_from_shared_secret(shared_secret.as_ref());
+			onion_keys.push(OnionKeys {
+				#[cfg(test)]
+				shared_secret,
+				#[cfg(test)]
+				blinding_factor: _blinding_factor,
+				ephemeral_pubkey,
+				rho,
+				mu,
+			});
+		}
+	}
+	Ok((onion_keys, ciphertexts, kem_secrets))
+}
+
+/// Sender helper: derives the per-hop hybrid onion keys and builds the ciphertext trail for a
+/// post-quantum payment along `path`. `hop_kem_keys[i]` is the pinned ML-KEM encapsulation key of the
+/// `i`th unblinded hop (`path.hops`, i.e. the prefix plus the introduction node). Returns the hybrid
+/// [`OnionKeys`] (used to build the main onion with [`construct_onion_packet`]), the trail for the
+/// first hop, and the per-hop ML-KEM shared secrets for the unblinded hops (for the return error
+/// onion). A blinded tail is supported: its hops are keyed by the recipient-baked hybrid blinded node
+/// ids, so they get onion keys directly with no trail entry and no sender-side fold. Trampoline is not
+/// supported here; a Trampoline path's two layers are keyed in [`create_pq_payment_onion`].
+#[cfg(feature = "post-quantum")]
+pub(crate) fn construct_pq_onion_keys_and_trail<T: secp256k1::Signing>(
+	secp_ctx: &Secp256k1<T>, path: &Path, session_priv: &SecretKey,
+	hop_kem_keys: &[[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]], kem_base_seed: &[u8; 32],
+	trail_prng_seed: [u8; 32],
+) -> Result<(Vec<OnionKeys>, PqOnionTrail, Vec<[u8; crate::crypto::pq_kem::PQ_KEM_SS_LEN]>), ()> {
+	if path.hops.len() > crate::routing::router::MAX_PATH_LENGTH_ESTIMATE as usize
+		|| path.has_trampoline_hops()
+	{
+		return Err(());
+	}
+
+	let (onion_keys, ciphertexts, kem_secrets) = construct_pq_onion_keys_inner(
+		secp_ctx,
+		&path.hops,
+		path.blinded_tail.as_ref(),
+		session_priv,
+		hop_kem_keys,
+		kem_base_seed,
+		0,
+	)?;
+	let trail = build_pq_trail(&ciphertexts, trail_prng_seed)?;
+	Ok((onion_keys, trail, kem_secrets))
+}
+
+/// Hop helper used on the forwarding/receiving side of a post-quantum payment: given the hop's
+/// classical ECDH secret and the inbound ciphertext list, reads the front ciphertext, decapsulates
+/// it with the node's static KEM key ([`NodeSigner::pq_kem_decapsulate`]), and returns the hybrid
+/// per-hop secret (to peel the main onion with [`decode_next_hop`]) and the list rotated by one
+/// entry to forward to the next hop. Returns `None` only if the list is too short or the signer
+/// cannot decapsulate, so a dropped list fails closed (the hop derives only the classical secret
+/// and cannot peel the hybrid-keyed onion); a tampered entry instead yields a wrong hybrid secret
+/// that fails the main onion's `mu`.
+#[cfg(feature = "post-quantum")]
+pub(crate) fn pq_hop_hybrid_secret<NS: NodeSigner>(
+	classical_ss: &[u8; 32], trail: &PqOnionTrail, node_signer: &NS,
+) -> Option<([u8; 32], Option<PqOnionTrail>)> {
+	const CT_LEN: usize = crate::crypto::pq_kem::PQ_KEM_CT_LEN;
+	if trail.hop_data.len() < CT_LEN {
+		return None;
+	}
+	let mut ciphertext = [0u8; CT_LEN];
+	ciphertext.copy_from_slice(&trail.hop_data[..CT_LEN]);
+	let kem_ss = node_signer.pq_kem_decapsulate(&ciphertext)?;
+	let hybrid = crate::crypto::pq_kem::mix_payment_onion_secret(classical_ss, &kem_ss);
+	// Rotate the consumed front entry to the back so the next hop finds its ciphertext at the front
+	// and the list keeps its fixed size, leaking neither the hop position nor the hop count.
+	let mut rotated = Vec::with_capacity(trail.hop_data.len());
+	rotated.extend_from_slice(&trail.hop_data[CT_LEN..]);
+	rotated.extend_from_slice(&trail.hop_data[..CT_LEN]);
+	Some((hybrid, Some(PqOnionTrail { hop_data: rotated })))
 }
 
 pub(crate) const HOLD_TIME_LEN: usize = 4;
@@ -3760,6 +4361,7 @@ mod tests {
 			first_hop_htlc_msat: 0,
 			payment_id: PaymentId([1; 32]),
 			bolt12_invoice: None,
+			pq_hop_kem_secrets: None,
 		};
 
 		process_onion_failure(&ctx_full, &logger, &htlc_source, onion_error)
@@ -3821,6 +4423,7 @@ mod tests {
 			&logger,
 			&path,
 			&get_test_session_key(),
+			None,
 			attribution_data.clone(),
 		);
 
@@ -3890,6 +4493,7 @@ mod tests {
 				blinding_point: PublicKey::from_slice(&<Vec<u8>>::from_hex("02988face71e92c345a068f740191fd8e53be14f0bb957ef730d3c5f76087b960e").unwrap()).unwrap(),
 				excess_final_cltv_expiry_delta: 0,
 				final_value_msat: 150_000_000,
+				kem_ct: None,
 			}),
 		}
 	}
@@ -3919,6 +4523,7 @@ mod tests {
 				&build_trampoline_test_path(),
 				&outer_session_priv,
 				Some(trampoline_session_priv),
+				None,
 				error_packet,
 			);
 			assert_eq!(
@@ -3946,6 +4551,7 @@ mod tests {
 				first_hop_htlc_msat: dummy_amt_msat,
 				payment_id: PaymentId([1; 32]),
 				bolt12_invoice: None,
+				pq_hop_kem_secrets: None,
 			};
 
 			{
@@ -4124,6 +4730,7 @@ mod tests {
 				blinding_point: node_pk(6),
 				excess_final_cltv_expiry_delta: 0,
 				final_value_msat: 0,
+				kem_ct: None,
 			}),
 		};
 
@@ -4178,6 +4785,7 @@ mod tests {
 			first_hop_htlc_msat: 0,
 			payment_id: PaymentId([1; 32]),
 			bolt12_invoice: None,
+			pq_hop_kem_secrets: None,
 		};
 
 		struct TestCase {
@@ -4321,6 +4929,397 @@ mod tests {
 		assert_eq!(decrypted_failure.attribution_failed_channel, Some(0));
 	}
 
+	#[cfg(feature = "post-quantum")]
+	struct PqTestHopData(u64);
+	#[cfg(feature = "post-quantum")]
+	impl Writeable for PqTestHopData {
+		fn write<W: Writer>(&self, writer: &mut W) -> Result<(), crate::io::Error> {
+			self.0.write(writer)
+		}
+	}
+	#[cfg(feature = "post-quantum")]
+	impl ReadableArgs<()> for PqTestHopData {
+		fn read<R: Read>(reader: &mut R, _params: ()) -> Result<Self, msgs::DecodeError> {
+			Ok(PqTestHopData(Readable::read(reader)?))
+		}
+	}
+
+	#[cfg(feature = "post-quantum")]
+	#[test]
+	fn pq_payment_onion_round_trip() {
+		// Functional + adversarial test of the hybrid ML-KEM payment onion at the Sphinx layer: build a
+		// post-quantum onion + ciphertext trail at the sender, peel it hop by hop, and confirm each hop
+		// recovers its forwarding payload (the route survives), then confirm tamper/downgrade/wrong-key
+		// all fail closed (the ML-KEM secret is load-bearing).
+		let secp_ctx = Secp256k1::new();
+		const N: usize = 4;
+
+		let mut hops = Vec::new();
+		let mut node_secrets = Vec::new();
+		let mut kem_eks = Vec::new();
+		let mut kem_dks = Vec::new();
+		for i in 0..N {
+			let mut secret_bytes = [0u8; 32];
+			secret_bytes[31] = (i + 1) as u8;
+			let secret_key = SecretKey::from_slice(&secret_bytes).unwrap();
+			let pubkey = secret_key.public_key(&secp_ctx);
+			node_secrets.push(secret_key);
+			let (ek, dk) = crate::crypto::pq_kem::keypair_from_seed(&[(0x40 + i) as u8; 32]);
+			kem_eks.push(ek);
+			kem_dks.push(dk);
+			hops.push(RouteHop {
+				pubkey,
+				channel_features: ChannelFeatures::empty(),
+				node_features: NodeFeatures::empty(),
+				short_channel_id: (100 + i) as u64,
+				fee_msat: 0,
+				cltv_expiry_delta: 0,
+				maybe_announced_channel: true,
+			});
+		}
+		let path = Path { hops, blinded_tail: None };
+		let session_priv = SecretKey::from_slice(&[0x21; 32]).unwrap();
+		let payment_hash = PaymentHash([0x99; 32]);
+
+		// Sender derives hybrid onion keys + the ciphertext trail, then builds the main onion.
+		let (onion_keys, trail, _kem_secrets) = construct_pq_onion_keys_and_trail(
+			&secp_ctx,
+			&path,
+			&session_priv,
+			&kem_eks,
+			&[0x55; 32],
+			[0x66; 32],
+		)
+		.unwrap();
+		let payloads: Vec<PqTestHopData> =
+			(0..N).map(|i| PqTestHopData((100 + i) as u64)).collect();
+		let onion = construct_onion_packet_with_writable_hopdata(
+			payloads,
+			onion_keys,
+			[0x77; 32],
+			&payment_hash,
+		)
+		.unwrap();
+
+		println!(
+			"PQ: payment onion ciphertext list = {} bytes ({} entries), main onion hop_data = {} bytes",
+			trail.hop_data.len(),
+			PQ_PAYMENT_TRAIL_HOPS,
+			onion.hop_data.len()
+		);
+		assert_eq!(trail.hop_data.len(), PQ_PAYMENT_TRAIL_LEN);
+
+		// Each hop: classical ECDH, read its front ciphertext, decaps, mix, peel the main onion, rotate.
+		let trail_adv = trail.clone();
+		let mut packet_pubkey = onion.public_key.unwrap();
+		let mut hop_data = onion.hop_data;
+		let mut hmac = onion.hmac;
+		let mut maybe_trail = Some(trail);
+		for i in 0..N {
+			let ss = SharedSecret::new(&packet_pubkey, &node_secrets[i]);
+			let ss_bytes = ss.secret_bytes();
+			let inbound_trail = maybe_trail.take().unwrap();
+			// Read this hop's ciphertext from the front of the list and rotate the consumed entry to the
+			// back; there is no classical-keyed peel, so a key-breaking attacker gets no tracing oracle.
+			let ct: [u8; crate::crypto::pq_kem::PQ_KEM_CT_LEN] =
+				inbound_trail.hop_data[..crate::crypto::pq_kem::PQ_KEM_CT_LEN].try_into().unwrap();
+			let mut rotated = Vec::with_capacity(inbound_trail.hop_data.len());
+			rotated.extend_from_slice(&inbound_trail.hop_data[crate::crypto::pq_kem::PQ_KEM_CT_LEN..]);
+			rotated.extend_from_slice(&inbound_trail.hop_data[..crate::crypto::pq_kem::PQ_KEM_CT_LEN]);
+			let next_trail: Option<PqOnionTrail> = Some(PqOnionTrail { hop_data: rotated });
+			let kem_ss = crate::crypto::pq_kem::decapsulate(&kem_dks[i], &ct).unwrap();
+			let hybrid = crate::crypto::pq_kem::mix_payment_onion_secret(&ss_bytes, &kem_ss);
+			let decoded: Result<(PqTestHopData, Option<([u8; 32], FixedSizeOnionPacket)>), _> =
+				decode_next_hop(hybrid, &hop_data, hmac, Some(payment_hash), ());
+			let (payload, next) = decoded.unwrap();
+			assert_eq!(payload.0, (100 + i) as u64, "hop {} recovered wrong forwarding payload", i);
+			match next {
+				Some((next_hmac, FixedSizeOnionPacket(new_bytes))) => {
+					assert!(i < N - 1, "non-final hop unexpected at last position");
+					assert!(next_trail.is_some(), "non-final hop must forward a trail");
+					packet_pubkey =
+						next_hop_pubkey(&secp_ctx, packet_pubkey, &ss_bytes).unwrap();
+					hop_data = new_bytes;
+					hmac = next_hmac;
+					maybe_trail = next_trail;
+				},
+				None => {
+					// Finality comes from the main onion; the dummy-padded trail still forwards here, so
+					// it never reveals which hop is the route's last.
+					assert_eq!(i, N - 1, "final hop reached too early");
+					assert!(next_trail.is_some(), "dummy-padded trail still forwards at the final hop");
+				},
+			}
+		}
+
+		// Adversarial: a hop that ignores the trail and uses only the classical secret cannot peel the
+		// hybrid-keyed onion. This proves the ML-KEM secret is load-bearing (a dropped trail / quantum
+		// downgrade fails closed rather than silently reverting to classical-only protection).
+		let ss0 = SharedSecret::new(&onion.public_key.unwrap(), &node_secrets[0]);
+		let classical_only: Result<(PqTestHopData, Option<([u8; 32], FixedSizeOnionPacket)>), _> =
+			decode_next_hop(ss0.secret_bytes(), &onion.hop_data, onion.hmac, Some(payment_hash), ());
+		assert!(classical_only.is_err(), "classical-only decode must fail (KEM is load-bearing)");
+
+		// Adversarial: a hop with the wrong ML-KEM key derives a different secret and cannot peel (a
+		// quantum MITM who forged the classical key but cannot bind the pinned ML-KEM key).
+		let ct0: [u8; crate::crypto::pq_kem::PQ_KEM_CT_LEN] =
+			trail_adv.hop_data[..crate::crypto::pq_kem::PQ_KEM_CT_LEN].try_into().unwrap();
+		let (_, wrong_dk) = crate::crypto::pq_kem::keypair_from_seed(&[0xEE; 32]);
+		let wrong_kem_ss = crate::crypto::pq_kem::decapsulate(&wrong_dk, &ct0).unwrap();
+		let wrong_hybrid =
+			crate::crypto::pq_kem::mix_payment_onion_secret(&ss0.secret_bytes(), &wrong_kem_ss);
+		let wrong: Result<(PqTestHopData, Option<([u8; 32], FixedSizeOnionPacket)>), _> =
+			decode_next_hop(wrong_hybrid, &onion.hop_data, onion.hmac, Some(payment_hash), ());
+		assert!(wrong.is_err(), "wrong ML-KEM key must fail to peel");
+
+		// Adversarial: tampering a ciphertext yields a wrong decapsulated secret, so the hop derives a
+		// wrong hybrid secret and the main onion's hybrid mu rejects it. The list carries no MAC of its
+		// own; integrity rides on the hybrid main onion.
+		let mut tampered = trail_adv.hop_data.clone();
+		tampered[0] ^= 0x01;
+		let tampered_ct: [u8; crate::crypto::pq_kem::PQ_KEM_CT_LEN] =
+			tampered[..crate::crypto::pq_kem::PQ_KEM_CT_LEN].try_into().unwrap();
+		let tampered_kem_ss = crate::crypto::pq_kem::decapsulate(&kem_dks[0], &tampered_ct).unwrap();
+		let tampered_hybrid =
+			crate::crypto::pq_kem::mix_payment_onion_secret(&ss0.secret_bytes(), &tampered_kem_ss);
+		let tampered_decode: Result<(PqTestHopData, Option<([u8; 32], FixedSizeOnionPacket)>), _> =
+			decode_next_hop(tampered_hybrid, &onion.hop_data, onion.hmac, Some(payment_hash), ());
+		assert!(tampered_decode.is_err(), "tampered ciphertext must fail the hybrid main-onion mu");
+	}
+
+	#[cfg(feature = "post-quantum")]
+	#[test]
+	fn pq_hop_hybrid_secret_via_node_signer() {
+		// The forwarding/receiving hop primitive `pq_hop_hybrid_secret` must, using only the node's
+		// real `NodeSigner` (its static ML-KEM key), recover the SAME hybrid secret the sender used to
+		// key that hop's onion layer, so the main onion peels. We verify the recovered hybrid's
+		// `rho`/`mu` equal the sender's per-hop onion keys, and that the trail advances then terminates.
+		use crate::util::test_utils::TestNodeSigner;
+		let secp_ctx = Secp256k1::new();
+		const N: usize = 3;
+
+		let mut hops = Vec::new();
+		let mut node_secrets = Vec::new();
+		let mut kem_eks = Vec::new();
+		for i in 0..N {
+			let mut secret_bytes = [0u8; 32];
+			secret_bytes[31] = (i + 1) as u8;
+			let secret_key = SecretKey::from_slice(&secret_bytes).unwrap();
+			// The encapsulation key must match the one `TestNodeSigner` derives from the node secret.
+			let (ek, _) = crate::crypto::pq_kem::keypair_from_seed(&secret_key.secret_bytes());
+			kem_eks.push(ek);
+			hops.push(RouteHop {
+				pubkey: secret_key.public_key(&secp_ctx),
+				channel_features: ChannelFeatures::empty(),
+				node_features: NodeFeatures::empty(),
+				short_channel_id: i as u64,
+				fee_msat: 0,
+				cltv_expiry_delta: 0,
+				maybe_announced_channel: true,
+			});
+			node_secrets.push(secret_key);
+		}
+		let path = Path { hops, blinded_tail: None };
+		let session_priv = SecretKey::from_slice(&[0x33; 32]).unwrap();
+
+		let (onion_keys, trail, _kem_secrets) = construct_pq_onion_keys_and_trail(
+			&secp_ctx,
+			&path,
+			&session_priv,
+			&kem_eks,
+			&[0x44; 32],
+			[0x55; 32],
+		)
+		.unwrap();
+
+		let mut maybe_trail = Some(trail);
+		for i in 0..N {
+			let signer = TestNodeSigner::new(node_secrets[i]);
+			let ss = SharedSecret::new(&onion_keys[i].ephemeral_pubkey, &node_secrets[i]);
+			let inbound = maybe_trail.take().unwrap();
+			let (hybrid, next_trail) =
+				pq_hop_hybrid_secret(&ss.secret_bytes(), &inbound, &signer).unwrap();
+			let (rho, mu) = gen_rho_mu_from_shared_secret(&hybrid);
+			assert_eq!(rho, onion_keys[i].rho, "hop {} recovered hybrid rho mismatch", i);
+			assert_eq!(mu, onion_keys[i].mu, "hop {} recovered hybrid mu mismatch", i);
+			if i < N - 1 {
+				assert!(next_trail.is_some(), "non-final hop must forward a trail");
+				maybe_trail = next_trail;
+			} else {
+				// Finality comes from the hybrid main onion; the dummy-padded trail still forwards a
+				// tail here, so the trail never reveals which hop is the route's last.
+				assert!(next_trail.is_some(), "dummy-padded trail still forwards at the final hop");
+			}
+		}
+	}
+
+	#[cfg(feature = "post-quantum")]
+	#[test]
+	fn pq_payment_trail_hides_hop_count() {
+		// Adversarial: the ciphertext list must not leak the hop count. For several route lengths we
+		// confirm the list is a constant size and that every hop, including the route's last, forwards a
+		// rotated list of the same fixed size (the real ciphertexts are indistinguishable from the random
+		// dummies that pad the list, so its length and contents reveal nothing about the route length).
+		use crate::util::test_utils::TestNodeSigner;
+		let secp_ctx = Secp256k1::new();
+
+		for n in 1..=4usize {
+			let mut hops = Vec::new();
+			let mut node_secrets = Vec::new();
+			let mut kem_eks = Vec::new();
+			for i in 0..n {
+				let mut secret_bytes = [0u8; 32];
+				secret_bytes[31] = (i + 1) as u8;
+				secret_bytes[30] = n as u8;
+				let secret_key = SecretKey::from_slice(&secret_bytes).unwrap();
+				let (ek, _) = crate::crypto::pq_kem::keypair_from_seed(&secret_key.secret_bytes());
+				kem_eks.push(ek);
+				hops.push(RouteHop {
+					pubkey: secret_key.public_key(&secp_ctx),
+					channel_features: ChannelFeatures::empty(),
+					node_features: NodeFeatures::empty(),
+					short_channel_id: i as u64,
+					fee_msat: 0,
+					cltv_expiry_delta: 0,
+					maybe_announced_channel: true,
+				});
+				node_secrets.push(secret_key);
+			}
+			let path = Path { hops, blinded_tail: None };
+			let session_priv = SecretKey::from_slice(&[0x33; 32]).unwrap();
+			let (onion_keys, trail, _kem_secrets) = construct_pq_onion_keys_and_trail(
+				&secp_ctx,
+				&path,
+				&session_priv,
+				&kem_eks,
+				&[0x44; 32],
+				[0x55; 32],
+			)
+			.unwrap();
+
+			// Constant size regardless of route length.
+			assert_eq!(
+				trail.hop_data.len(),
+				PQ_PAYMENT_TRAIL_LEN,
+				"route length {}: list length must not vary with the hop count",
+				n,
+			);
+
+			// A hop that counts the over-represented compressed coefficients of each entry (about 237
+			// of 768 in a real ML-KEM-768 ciphertext, against 193 in uniformly random bytes) must see
+			// the same statistic on the padding as on the real entries, or it could count the hops.
+			let counts: Vec<usize> = trail
+				.hop_data
+				.chunks(crate::crypto::pq_kem::PQ_KEM_CT_LEN)
+				.map(|ct| crate::crypto::pq_kem::four_preimage_count(ct.try_into().unwrap()))
+				.collect();
+			let real_avg = (counts[..n].iter().sum::<usize>() / n) as i64;
+			let dummy_avg =
+				(counts[n..].iter().sum::<usize>() / (PQ_PAYMENT_TRAIL_HOPS - n)) as i64;
+			assert!(
+				(real_avg - dummy_avg).abs() < 60 && dummy_avg > 215,
+				"route length {}: padding must look like real entries (real {}, dummy {})",
+				n,
+				real_avg,
+				dummy_avg,
+			);
+
+			// Every hop, including the last, forwards a rotated list of the same fixed size.
+			let mut maybe_trail = Some(trail);
+			for i in 0..n {
+				let signer = TestNodeSigner::new(node_secrets[i]);
+				let ss = SharedSecret::new(&onion_keys[i].ephemeral_pubkey, &node_secrets[i]);
+				let inbound = maybe_trail.take().unwrap();
+				let (_hybrid, next_trail) =
+					pq_hop_hybrid_secret(&ss.secret_bytes(), &inbound, &signer).unwrap();
+				assert_eq!(
+					next_trail.as_ref().map(|t| t.hop_data.len()),
+					Some(PQ_PAYMENT_TRAIL_LEN),
+					"route length {}: hop {} must forward a constant-size rotated list",
+					n,
+					i,
+				);
+				maybe_trail = next_trail;
+			}
+		}
+	}
+
+	#[cfg(feature = "post-quantum")]
+	#[test]
+	fn pq_payment_trail_carries_no_classical_keying() {
+		// Adversarial (the core route-privacy property): the ciphertext list carries no classical-keyed
+		// structure, so a Shor adversary that recovers a hop's classical ECDH secret gets no oracle from
+		// it to confirm the hop's identity, trace the forward route, or count the hops. We check two
+		// things: a hop's real ciphertext rides in the clear at the front of the list (no per-hop
+		// encryption), and forwarding (the rotation) is identical no matter what classical secret a
+		// peeler uses, while the hybrid per-hop secret still binds the real one.
+		use crate::util::test_utils::TestNodeSigner;
+		let secp_ctx = Secp256k1::new();
+		const CT_LEN: usize = crate::crypto::pq_kem::PQ_KEM_CT_LEN;
+
+		let mut hops = Vec::new();
+		let mut node_secrets = Vec::new();
+		let mut kem_eks = Vec::new();
+		for i in 0..3usize {
+			let mut secret_bytes = [0u8; 32];
+			secret_bytes[31] = (i + 1) as u8;
+			let secret_key = SecretKey::from_slice(&secret_bytes).unwrap();
+			let (ek, _) = crate::crypto::pq_kem::keypair_from_seed(&secret_key.secret_bytes());
+			kem_eks.push(ek);
+			hops.push(RouteHop {
+				pubkey: secret_key.public_key(&secp_ctx),
+				channel_features: ChannelFeatures::empty(),
+				node_features: NodeFeatures::empty(),
+				short_channel_id: i as u64,
+				fee_msat: 0,
+				cltv_expiry_delta: 0,
+				maybe_announced_channel: true,
+			});
+			node_secrets.push(secret_key);
+		}
+		let path = Path { hops, blinded_tail: None };
+		let session_priv = SecretKey::from_slice(&[0x33; 32]).unwrap();
+		let kem_base_seed = [0x44; 32];
+		let (onion_keys, trail, _kem_secrets) = construct_pq_onion_keys_and_trail(
+			&secp_ctx,
+			&path,
+			&session_priv,
+			&kem_eks,
+			&kem_base_seed,
+			[0x55; 32],
+		)
+		.unwrap();
+
+		// The first hop's real ciphertext is the plaintext front of the list (no per-hop encryption):
+		// recompute the sender's encapsulation and match it byte for byte.
+		let hop0_seed = pq_hop_kem_seed(&kem_base_seed, 0);
+		let (_ss, expected_ct0) = crate::crypto::pq_kem::encapsulate(&kem_eks[0], &hop0_seed).unwrap();
+		assert_eq!(
+			&trail.hop_data[..CT_LEN],
+			&expected_ct0[..],
+			"real ciphertext must ride in the clear",
+		);
+
+		// Forwarding is classical-secret-independent: a peeler using the real classical secret and one
+		// using a wrong one produce the SAME forwarded list (so the list is no tracing oracle), while the
+		// hybrid per-hop secret still differs (it genuinely binds the classical secret).
+		let signer = TestNodeSigner::new(node_secrets[0]);
+		let real_ss =
+			SharedSecret::new(&onion_keys[0].ephemeral_pubkey, &node_secrets[0]).secret_bytes();
+		let wrong_ss = [0xABu8; 32];
+		let (hybrid_real, next_real) = pq_hop_hybrid_secret(&real_ss, &trail, &signer).unwrap();
+		let (hybrid_wrong, next_wrong) = pq_hop_hybrid_secret(&wrong_ss, &trail, &signer).unwrap();
+		assert_eq!(
+			next_real.unwrap().hop_data,
+			next_wrong.unwrap().hop_data,
+			"the forwarded list must not depend on the classical secret (no oracle)",
+		);
+		assert_ne!(
+			hybrid_real, hybrid_wrong,
+			"the hybrid per-hop secret must still bind the classical secret",
+		);
+	}
+
 	#[test]
 	fn test_long_route_attributable_failure() {
 		// Test a long route that exceeds the reach of attribution data.
@@ -4363,6 +5362,7 @@ mod tests {
 			first_hop_htlc_msat: 0,
 			payment_id: PaymentId([1; 32]),
 			bolt12_invoice: None,
+			pq_hop_kem_secrets: None,
 		};
 
 		// Iterate over all possible failure positions and check that the cases that can be attributed are.
@@ -4472,6 +5472,7 @@ mod tests {
 			first_hop_htlc_msat: 0,
 			payment_id: PaymentId([1; 32]),
 			bolt12_invoice: None,
+			pq_hop_kem_secrets: None,
 		};
 
 		let decrypted_failure = process_onion_failure(&ctx_full, &logger, &htlc_source, packet);

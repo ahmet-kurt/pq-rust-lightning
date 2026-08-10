@@ -124,6 +124,17 @@ where
 	}
 
 	#[cfg(feature = "post-quantum")]
+	fn pq_kem_key_for_node(
+		&self, node_id: &PublicKey,
+	) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]> {
+		self.network_graph
+			.deref()
+			.read_only()
+			.node(&NodeId::from_pubkey(node_id))
+			.and_then(|node| node.pq_kem_node_id())
+	}
+
+	#[cfg(feature = "post-quantum")]
 	fn pq_node_id_for_node(
 		&self, node_id: &PublicKey,
 	) -> Option<[u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]> {
@@ -229,6 +240,83 @@ where
 			},
 		}
 	}
+
+	#[cfg(feature = "post-quantum")]
+	#[rustfmt::skip]
+	fn create_pq_blinded_payment_paths<T: secp256k1::Signing + secp256k1::Verification>(
+		&self, recipient: PublicKey, recipient_pq_kem_key: [u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN],
+		local_node_receive_key: ReceiveAuthKey, first_hops: Vec<ChannelDetails>, tlvs: ReceiveTlvs,
+		amount_msats: Option<u64>, secp_ctx: &Secp256k1<T>,
+	) -> Result<Vec<BlindedPaymentPath>, ()> {
+		const MAX_PAYMENT_PATHS: usize = 3;
+		const MIN_PEER_CHANNELS: usize = 3;
+
+		let network_graph = self.network_graph.deref().read_only();
+		let is_recipient_announced =
+			network_graph.nodes().contains_key(&NodeId::from_pubkey(&recipient));
+		let has_one_peer = first_hops.first()
+			.map(|details| details.counterparty.node_id)
+			.map(|node_id| first_hops.iter().skip(1).all(|d| d.counterparty.node_id == node_id))
+			.unwrap_or(false);
+
+		// Same peer selection as the classical path, but each hop must additionally carry a pinned
+		// ML-KEM key, and we build a hybrid path (`new_pq`) instead of a classical one.
+		let mut paths: Vec<BlindedPaymentPath> = first_hops.into_iter()
+			.filter(|details| details.counterparty.features.supports_route_blinding())
+			.filter(|details| amount_msats.unwrap_or(0) <= details.inbound_capacity_msat)
+			.filter(|details| amount_msats.unwrap_or(u64::MAX) >= details.inbound_htlc_minimum_msat.unwrap_or(0))
+			.filter(|details| amount_msats.unwrap_or(0) <= details.inbound_htlc_maximum_msat.unwrap_or(u64::MAX))
+			.filter(|details| network_graph
+				.node(&NodeId::from_pubkey(&details.counterparty.node_id))
+				.map(|node| !is_recipient_announced || node.channels.len() >= MIN_PEER_CHANNELS)
+				.unwrap_or(!is_recipient_announced && has_one_peer)
+			)
+			.filter_map(|details| {
+				let node_id = details.counterparty.node_id;
+				// PQ: a hop can only be on a post-quantum path if it has a gossip-pinned ML-KEM key.
+				let hop_kem_key = network_graph
+					.node(&NodeId::from_pubkey(&node_id))
+					.and_then(|node| node.pq_kem_node_id())?;
+				let short_channel_id = details.get_inbound_payment_scid()?;
+				let payment_relay: PaymentRelay = match details.counterparty.forwarding_info {
+					Some(forwarding_info) => forwarding_info.try_into().ok()?,
+					None => return None,
+				};
+				let cltv_expiry_delta = payment_relay.cltv_expiry_delta as u32;
+				let payment_constraints = PaymentConstraints {
+					max_cltv_expiry: tlvs.payment_constraints.max_cltv_expiry.saturating_add(cltv_expiry_delta),
+					htlc_minimum_msat: details.inbound_htlc_minimum_msat.unwrap_or(0),
+				};
+				let forward_node = PaymentForwardNode {
+					tlvs: ForwardTlvs {
+						short_channel_id, payment_relay, payment_constraints,
+						next_blinding_override: None, features: BlindedHopFeatures::empty(),
+					},
+					node_id,
+					htlc_maximum_msat: details.inbound_htlc_maximum_msat.unwrap_or(u64::MAX),
+				};
+				BlindedPaymentPath::new_pq(
+					&[forward_node], &[hop_kem_key], recipient, &recipient_pq_kem_key,
+					local_node_receive_key, tlvs.clone(), u64::MAX, MIN_FINAL_CLTV_EXPIRY_DELTA,
+					&self.entropy_source, secp_ctx,
+				).ok()
+			})
+			.take(MAX_PAYMENT_PATHS)
+			.collect();
+
+		// Fall back to a one-hop post-quantum path (recipient = introduction node), which still
+		// protects the encrypted recipient data, when the recipient is announced.
+		if paths.is_empty() && is_recipient_announced {
+			if let Ok(path) = BlindedPaymentPath::new_pq(
+				&[], &[], recipient, &recipient_pq_kem_key, local_node_receive_key, tlvs,
+				u64::MAX, MIN_FINAL_CLTV_EXPIRY_DELTA, &self.entropy_source, secp_ctx,
+			) {
+				paths.push(path);
+			}
+		}
+
+		if paths.is_empty() { Err(()) } else { Ok(paths) }
+	}
 }
 
 /// A `Router` that returns a fixed route one time, erroring otherwise. Useful for
@@ -306,6 +394,16 @@ pub trait Router {
 		secp_ctx: &Secp256k1<T>,
 	) -> Result<Vec<BlindedPaymentPath>, ()>;
 
+	/// PQ: returns the gossip-pinned ML-KEM encapsulation key for `node_id`, used by a post-quantum
+	/// payment sender to build the per-hop hybrid onion. Returns `None` if the node has no pinned key
+	/// (in which case it cannot be on an all-post-quantum route). The default returns `None`.
+	#[cfg(feature = "post-quantum")]
+	fn pq_kem_key_for_node(
+		&self, _node_id: &PublicKey,
+	) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]> {
+		None
+	}
+
 	/// PQ: returns the gossip-pinned ML-DSA public key for `node_id`, used by a post-quantum payer to
 	/// anchor a BOLT 11 invoice's signature to the payee's pinned key when the caller did not supply a
 	/// trusted key out of band. Returns `None` if the node has no pinned key. The default returns `None`.
@@ -314,6 +412,23 @@ pub trait Router {
 		&self, _node_id: &PublicKey,
 	) -> Option<[u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]> {
 		None
+	}
+
+	/// PQ: builds post-quantum [`BlindedPaymentPath`]s to the `recipient` (us), folding a per-hop
+	/// ML-KEM secret into each hop's route-blinding secret so the blinded tail stays confidential
+	/// against a Shor adversary (the cascade carries it to the blinded node id and the onion key).
+	/// `recipient_pq_kem_key` is our own static ML-KEM key; each intermediate hop's key is resolved
+	/// from its gossip pin. Returns `Err(())` if no fully-post-quantum path can be built, in which case
+	/// the caller falls back to the classical [`Self::create_blinded_payment_paths`]. The default
+	/// returns `Err(())`.
+	#[cfg(feature = "post-quantum")]
+	fn create_pq_blinded_payment_paths<T: secp256k1::Signing + secp256k1::Verification>(
+		&self, _recipient: PublicKey,
+		_recipient_pq_kem_key: [u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN],
+		_local_node_receive_key: ReceiveAuthKey, _first_hops: Vec<ChannelDetails>, _tlvs: ReceiveTlvs,
+		_amount_msats: Option<u64>, _secp_ctx: &Secp256k1<T>,
+	) -> Result<Vec<BlindedPaymentPath>, ()> {
+		Err(())
 	}
 }
 
@@ -356,10 +471,34 @@ impl<T: Router + ?Sized, R: Deref<Target = T>> Router for R {
 	}
 
 	#[cfg(feature = "post-quantum")]
+	fn pq_kem_key_for_node(
+		&self, node_id: &PublicKey,
+	) -> Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]> {
+		self.deref().pq_kem_key_for_node(node_id)
+	}
+
+	#[cfg(feature = "post-quantum")]
 	fn pq_node_id_for_node(
 		&self, node_id: &PublicKey,
 	) -> Option<[u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]> {
 		self.deref().pq_node_id_for_node(node_id)
+	}
+
+	#[cfg(feature = "post-quantum")]
+	fn create_pq_blinded_payment_paths<S: secp256k1::Signing + secp256k1::Verification>(
+		&self, recipient: PublicKey, recipient_pq_kem_key: [u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN],
+		local_node_receive_key: ReceiveAuthKey, first_hops: Vec<ChannelDetails>, tlvs: ReceiveTlvs,
+		amount_msats: Option<u64>, secp_ctx: &Secp256k1<S>,
+	) -> Result<Vec<BlindedPaymentPath>, ()> {
+		self.deref().create_pq_blinded_payment_paths(
+			recipient,
+			recipient_pq_kem_key,
+			local_node_receive_key,
+			first_hops,
+			tlvs,
+			amount_msats,
+			secp_ctx,
+		)
 	}
 }
 
@@ -630,6 +769,16 @@ pub struct BlindedTail {
 	pub excess_final_cltv_expiry_delta: u32,
 	/// The total amount paid on this [`Path`], excluding the fees.
 	pub final_value_msat: u64,
+	/// On a post-quantum [`BlindedPaymentPath`] (built via [`BlindedPaymentPath::new_pq`]), the
+	/// fixed-size list of per-hop ML-KEM ciphertexts the sender places in the first outbound
+	/// `update_add_htlc`'s `pq_blinded_ct`. Its front entry is the introduction node's ciphertext,
+	/// which that node decapsulates to derive its hybrid route-blinding secret before rotating the
+	/// list onward. `None` on a classical path. Carried as opaque bytes without the `post-quantum`
+	/// feature.
+	///
+	/// [`BlindedPaymentPath`]: crate::blinded_path::payment::BlindedPaymentPath
+	/// [`BlindedPaymentPath::new_pq`]: crate::blinded_path::payment::BlindedPaymentPath::new_pq
+	pub kem_ct: Option<Vec<u8>>,
 }
 
 impl_ser_tlv_based!(BlindedTail, {
@@ -638,6 +787,8 @@ impl_ser_tlv_based!(BlindedTail, {
 	(4, excess_final_cltv_expiry_delta, required),
 	(6, final_value_msat, required),
 	(8, trampoline_hops, optional_vec),
+	// Post-quantum per-hop ciphertext list (experimental odd type; no assigned BOLT type yet).
+	(9, kem_ct, option),
 });
 
 /// A path in a [`Route`] to the payment recipient. Must always be at least length one.
@@ -1090,6 +1241,25 @@ impl Writeable for PaymentParameters {
 				blinded_hints = Some(crate::util::ser::IterableOwned(hints_iter));
 			}
 		}
+		// PQ: a post-quantum blinded path carries an in-memory per-hop ML-KEM ciphertext list that is not
+		// part of the blinded path's own serialization, so persist it alongside the paths (one entry per
+		// blinded hint, empty for a classical path) to keep the parameters round-trippable for retries.
+		// Only written when at least one path is post-quantum, so vanilla stays byte-identical.
+		#[cfg(feature = "post-quantum")]
+		let blinded_kem_cts: Option<Vec<u8>> = match &self.payee {
+			Payee::Blinded { route_hints, .. } if route_hints.iter().any(|p| p.kem_ct().is_some()) => {
+				let mut flat = Vec::new();
+				for path in route_hints {
+					let ct = path.kem_ct().unwrap_or_default();
+					crate::util::ser::BigSize(ct.len() as u64).write(&mut flat).expect("Vec is infallible");
+					flat.extend_from_slice(&ct);
+				}
+				Some(flat)
+			},
+			_ => None,
+		};
+		#[cfg(not(feature = "post-quantum"))]
+		let blinded_kem_cts: Option<Vec<u8>> = None;
 		write_tlv_fields!(writer, {
 			(0, self.payee.node_id(), option),
 			(1, self.max_total_cltv_expiry_delta, required),
@@ -1103,6 +1273,8 @@ impl Writeable for PaymentParameters {
 			(9, self.payee.final_cltv_expiry_delta(), option),
 			(11, self.previously_failed_blinded_path_idxs, required_vec),
 			(13, self.max_path_length, required),
+			// Post-quantum per-path ML-KEM ciphertext lists (experimental odd type; no assigned BOLT type).
+			(15, blinded_kem_cts, option),
 		});
 		Ok(())
 	}
@@ -1124,15 +1296,38 @@ impl ReadableArgs<u32> for PaymentParameters {
 			(9, final_cltv_expiry_delta, (default_value, default_final_cltv_expiry_delta)),
 			(11, previously_failed_blinded_path_idxs, optional_vec),
 			(13, max_path_length, (default_value, MAX_PATH_LENGTH_ESTIMATE)),
+			(15, blinded_kem_cts, option),
 		});
 		let blinded_route_hints = blinded_route_hints.unwrap_or(vec![]);
 		let payee = if blinded_route_hints.len() != 0 {
 			if clear_route_hints.len() != 0 || payee_pubkey.is_some() { return Err(DecodeError::InvalidValue) }
+			#[allow(unused_mut)]
+			let mut route_hints: Vec<BlindedPaymentPath> = blinded_route_hints
+				.into_iter()
+				.map(|(payinfo, path)| BlindedPaymentPath::from_parts(path, payinfo))
+				.collect();
+			// PQ: re-attach the per-path ML-KEM ciphertext lists persisted alongside the paths (parsed
+			// from the flat BigSize-length-prefixed encoding, one entry per path in order).
+			#[cfg(feature = "post-quantum")]
+			if let Some(flat) = blinded_kem_cts {
+				let flat: Vec<u8> = flat;
+				let mut cur = crate::io::Cursor::new(&flat[..]);
+				for path in route_hints.iter_mut() {
+					let len = <crate::util::ser::BigSize as Readable>::read(&mut cur)
+						.map_err(|_| DecodeError::InvalidValue)?
+						.0 as usize;
+					let mut ct = vec![0u8; len];
+					use crate::io::Read;
+					cur.read_exact(&mut ct).map_err(|_| DecodeError::InvalidValue)?;
+					if !ct.is_empty() {
+						path.set_kem_ct(Some(ct));
+					}
+				}
+			}
+			#[cfg(not(feature = "post-quantum"))]
+			let _: Option<Vec<u8>> = blinded_kem_cts;
 			Payee::Blinded {
-				route_hints: blinded_route_hints
-					.into_iter()
-					.map(|(payinfo, path)| BlindedPaymentPath::from_parts(path, payinfo))
-					.collect(),
+				route_hints,
 				features: features.and_then(|f: Features| f.bolt12()),
 			}
 		} else {
@@ -3924,6 +4119,12 @@ pub(crate) fn get_route<L: Logger, S: ScoreLookUp>(
 		let blinded_tail = payment_path.hops.last().and_then(|(h, _)| {
 			if let Some(blinded_path) = h.candidate.blinded_path() {
 				final_cltv_delta = h.candidate.cltv_expiry_delta();
+				// PQ: carry the per-hop ML-KEM ciphertext list through to the sender so it can place it
+				// in the outbound HTLC on a post-quantum blinded path.
+				#[cfg(feature = "post-quantum")]
+				let kem_ct = blinded_path.kem_ct();
+				#[cfg(not(feature = "post-quantum"))]
+				let kem_ct: Option<Vec<u8>> = None;
 				Some(BlindedTail {
 					// TODO: fill correctly
 					trampoline_hops: vec![],
@@ -3931,6 +4132,7 @@ pub(crate) fn get_route<L: Logger, S: ScoreLookUp>(
 					blinding_point: blinded_path.blinding_point(),
 					excess_final_cltv_expiry_delta: 0,
 					final_value_msat: h.fee_msat,
+					kem_ct,
 				})
 			} else { None }
 		});
@@ -8234,6 +8436,7 @@ mod tests {
 				blinding_point: ln_test_utils::pubkey(43),
 				excess_final_cltv_expiry_delta: 40,
 				final_value_msat: 100,
+				kem_ct: None,
 			})}, Path {
 			hops: vec![RouteHop {
 				pubkey: ln_test_utils::pubkey(51),
@@ -8261,6 +8464,7 @@ mod tests {
 			blinding_point: ln_test_utils::pubkey(47),
 			excess_final_cltv_expiry_delta: 41,
 			final_value_msat: 101,
+			kem_ct: None,
 		});
 		let encoded_route = route.encode();
 		let decoded_route: Route = Readable::read(&mut Cursor::new(&encoded_route[..])).unwrap();
@@ -8299,6 +8503,7 @@ mod tests {
 				blinding_point: ln_test_utils::pubkey(48),
 				excess_final_cltv_expiry_delta: 0,
 				final_value_msat: 200,
+				kem_ct: None,
 			}),
 		};
 		inflight_htlcs.process_path(&path, ln_test_utils::pubkey(44));
@@ -8361,6 +8566,7 @@ mod tests {
 				blinding_point,
 				excess_final_cltv_expiry_delta: 0,
 				final_value_msat: 200,
+				kem_ct: None,
 			}),
 		};
 		inflight_htlcs.process_path(&path, ln_test_utils::pubkey(44));
@@ -8439,6 +8645,7 @@ mod tests {
 				blinding_point: ln_test_utils::pubkey(44),
 				excess_final_cltv_expiry_delta: 0,
 				final_value_msat: 200,
+				kem_ct: None,
 			}),
 		}], route_params: RouteParameters::from_payment_params_and_value(PaymentParameters::from_node_id(ln_test_utils::pubkey(42), 0), 200)};
 

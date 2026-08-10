@@ -1602,6 +1602,8 @@ fn update_add_msg(
 		blinding_point,
 		hold_htlc: None,
 		accountable: None,
+		pq_onion_trail: None,
+		pq_blinded_ct: None,
 	}
 }
 
@@ -1684,7 +1686,8 @@ fn route_blinding_spec_test_vector() {
 			hops: blinded_hops,
 			blinding_point: bob_blinding_point,
 			excess_final_cltv_expiry_delta: 0,
-			final_value_msat: amt_msat
+			final_value_msat: amt_msat,
+			kem_ct: None,
 		}),
 	};
 	let cur_height = 747_000;
@@ -1723,7 +1726,7 @@ fn route_blinding_spec_test_vector() {
 	let bob_node_signer = TestEcdhSigner { node_secret: bob_secret };
 	// Can't use the public API here as we need to avoid the CLTV delta checks (test vector uses
 	// < MIN_CLTV_EXPIRY_DELTA).
-	let (bob_peeled_onion, next_packet_details_opt) =
+	let (bob_peeled_onion, next_packet_details_opt, _) =
 		match onion_payment::decode_incoming_update_add_htlc_onion(
 			&bob_update_add, &bob_node_signer, &logger, &secp_ctx
 		) {
@@ -1757,7 +1760,7 @@ fn route_blinding_spec_test_vector() {
 		carol_onion
 	);
 	let carol_node_signer = TestEcdhSigner { node_secret: carol_secret };
-	let (carol_peeled_onion, next_packet_details_opt) =
+	let (carol_peeled_onion, next_packet_details_opt, _) =
 		match onion_payment::decode_incoming_update_add_htlc_onion(
 			&carol_update_add, &carol_node_signer, &logger, &secp_ctx
 		) {
@@ -1791,7 +1794,7 @@ fn route_blinding_spec_test_vector() {
 		dave_onion
 	);
 	let dave_node_signer = TestEcdhSigner { node_secret: dave_secret };
-	let (dave_peeled_onion, next_packet_details_opt) =
+	let (dave_peeled_onion, next_packet_details_opt, _) =
 		match onion_payment::decode_incoming_update_add_htlc_onion(
 			&dave_update_add, &dave_node_signer, &logger, &secp_ctx
 		) {
@@ -1899,7 +1902,8 @@ fn test_combined_trampoline_onion_creation_vectors() {
 			],
 			blinding_point: pubkey_from_hex("02988face71e92c345a068f740191fd8e53be14f0bb957ef730d3c5f76087b960e"),
 			excess_final_cltv_expiry_delta: 0,
-			final_value_msat: 150_000_000
+			final_value_msat: 150_000_000,
+			kem_ct: None,
 		}),
 	};
 
@@ -1994,7 +1998,8 @@ fn test_trampoline_inbound_payment_decoding() {
 			],
 			blinding_point: pubkey_from_hex("02988face71e92c345a068f740191fd8e53be14f0bb957ef730d3c5f76087b960e"),
 			excess_final_cltv_expiry_delta: 0,
-			final_value_msat: 150_000_000
+			final_value_msat: 150_000_000,
+			kem_ct: None,
 		})
 	};
 
@@ -2036,7 +2041,7 @@ fn test_trampoline_inbound_payment_decoding() {
 	let bob_update_add = update_add_msg(111_000, 747_501, None, bob_onion);
 	let bob_node_signer = TestEcdhSigner { node_secret: bob_secret };
 
-	let (bob_peeled_onion, next_packet_details_opt) = onion_payment::decode_incoming_update_add_htlc_onion(
+	let (bob_peeled_onion, next_packet_details_opt, _) = onion_payment::decode_incoming_update_add_htlc_onion(
 		&bob_update_add, &bob_node_signer, &logger, &secp_ctx
 	).unwrap_or_else(|_| panic!());
 
@@ -2056,7 +2061,7 @@ fn test_trampoline_inbound_payment_decoding() {
 	let carol_update_add = update_add_msg(carol_packet_details.outgoing_amt_msat, carol_packet_details.outgoing_cltv_value, None, carol_onion);
 
 	let carol_node_signer = TestEcdhSigner { node_secret: carol_secret };
-	let (carol_peeled_onion, _) = onion_payment::decode_incoming_update_add_htlc_onion(
+	let (carol_peeled_onion, _, _) = onion_payment::decode_incoming_update_add_htlc_onion(
 		&carol_update_add, &carol_node_signer, &logger, &secp_ctx
 	).unwrap_or_else(|_| panic!());
 
@@ -2169,6 +2174,7 @@ fn test_trampoline_forward_payload_encoded_as_receive() {
 				blinding_point: carol_blinding_point,
 				excess_final_cltv_expiry_delta: 39,
 				final_value_msat: amt_msat,
+				kem_ct: None,
 			})
 		}],
 		route_params: RouteParameters::from_payment_params_and_value(
@@ -2339,6 +2345,7 @@ fn do_test_trampoline_single_hop_receive(success: bool) {
 				blinding_point: blinded_path.blinding_point(),
 				excess_final_cltv_expiry_delta: 39,
 				final_value_msat: amt_msat,
+				kem_ct: None,
 			})
 		}],
 		route_params: RouteParameters::from_payment_params_and_value(
@@ -3021,4 +3028,815 @@ fn test_trampoline_mpp_accumulation() {
 	do_trampoline_mpp_test(None);
 	do_trampoline_mpp_test(Some(TrampolineTimeout::Ticks));
 	do_trampoline_mpp_test(Some(TrampolineTimeout::OnChain));
+}
+
+/// PQ: sets up the 3-node Trampoline receive topology of `do_test_trampoline_single_hop_receive`
+/// with every hop's ML-KEM key pinned at the sender and a post-quantum blinded path for Carol, and
+/// returns the route plus payment identifiers. The sender then builds a hybrid outer onion, a hybrid
+/// inner Trampoline onion, one shared ciphertext trail carrying the outer hops' entries followed by
+/// Carol's Trampoline entry, and the blinded path's ciphertext list.
+#[cfg(feature = "post-quantum")]
+fn pq_trampoline_receive_setup<'a, 'b, 'c>(
+	nodes: &Vec<Node<'a, 'b, 'c>>,
+) -> (Route, PaymentHash, crate::types::payment::PaymentPreimage, PaymentSecret) {
+	let secp_ctx = Secp256k1::new();
+
+	let (_, _, chan_id_alice_bob, _) =
+		create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 0);
+	let (_, _, chan_id_bob_carol, _) =
+		create_announced_chan_between_nodes_with_value(&nodes, 1, 2, 1_000_000, 0);
+
+	for i in 0..3 {
+		connect_blocks(&nodes[i], 3 * CHAN_CONFIRM_DEPTH + 1 - nodes[i].best_block_info().1);
+	}
+
+	let bob_node_id = nodes[1].node().get_our_node_id();
+	let carol_node_id = nodes[2].node().get_our_node_id();
+
+	let alice_bob_scid = get_scid_from_channel_id(&nodes[0], chan_id_alice_bob);
+	let bob_carol_scid = get_scid_from_channel_id(&nodes[1], chan_id_bob_carol);
+
+	// Pin the ML-KEM keys of every outer hop and Trampoline hop at the sender.
+	{
+		let mut keys = nodes[0].router.pq_kem_keys.lock().unwrap();
+		keys.insert(bob_node_id, nodes[1].keys_manager.get_pq_kem_node_id().unwrap());
+		keys.insert(carol_node_id, nodes[2].keys_manager.get_pq_kem_node_id().unwrap());
+	}
+
+	let amt_msat = 1000;
+	let carol_cltv_expiry_delta = 104 + 39;
+	let (payment_preimage, payment_hash, payment_secret) =
+		get_payment_preimage_hash(&nodes[2], Some(amt_msat), None);
+
+	// Create a post-quantum 1-hop blinded path for Carol; its ciphertext list rides in the outbound
+	// HTLC's `pq_blinded_ct` so Carol can derive her hybrid route-blinding secret.
+	let payee_tlvs = ReceiveTlvs {
+		payment_secret,
+		payment_constraints: PaymentConstraints {
+			max_cltv_expiry: u32::max_value(),
+			htlc_minimum_msat: amt_msat,
+		},
+		payment_context: PaymentContext::Bolt12Refund(Bolt12RefundContext {
+			payment_metadata: None,
+		}),
+	};
+	let receive_auth_key = nodes[2].keys_manager.get_receive_auth_key();
+	let carol_kem_key = nodes[2].keys_manager.get_pq_kem_node_id().unwrap();
+	let blinded_path = BlindedPaymentPath::new_pq(
+		&[],
+		&[],
+		carol_node_id,
+		&carol_kem_key,
+		receive_auth_key,
+		payee_tlvs,
+		u64::MAX,
+		0,
+		nodes[2].keys_manager,
+		&secp_ctx,
+	)
+	.unwrap();
+
+	let route = Route {
+		paths: vec![Path {
+			hops: vec![
+				// Bob
+				RouteHop {
+					pubkey: bob_node_id,
+					node_features: NodeFeatures::empty(),
+					short_channel_id: alice_bob_scid,
+					channel_features: ChannelFeatures::empty(),
+					fee_msat: 1000,
+					cltv_expiry_delta: 48,
+					maybe_announced_channel: false,
+				},
+				// Carol
+				RouteHop {
+					pubkey: carol_node_id,
+					node_features: NodeFeatures::empty(),
+					short_channel_id: bob_carol_scid,
+					channel_features: ChannelFeatures::empty(),
+					fee_msat: 0,
+					cltv_expiry_delta: carol_cltv_expiry_delta,
+					maybe_announced_channel: false,
+				},
+			],
+			blinded_tail: Some(BlindedTail {
+				trampoline_hops: vec![
+					// Carol
+					TrampolineHop {
+						pubkey: carol_node_id,
+						node_features: Features::empty(),
+						fee_msat: amt_msat,
+						cltv_expiry_delta: carol_cltv_expiry_delta,
+					},
+				],
+				hops: blinded_path.blinded_hops().to_vec(),
+				blinding_point: blinded_path.blinding_point(),
+				excess_final_cltv_expiry_delta: 39,
+				final_value_msat: amt_msat,
+				kem_ct: blinded_path.kem_ct(),
+			}),
+		}],
+		route_params: RouteParameters::from_payment_params_and_value(
+			PaymentParameters::from_node_id(carol_node_id, carol_cltv_expiry_delta),
+			amt_msat,
+		),
+	};
+	(route, payment_hash, payment_preimage, payment_secret)
+}
+
+#[cfg(feature = "post-quantum")]
+fn do_pq_trampoline_single_hop_receive(success: bool) {
+	// PQ: the post-quantum counterpart of `do_test_trampoline_single_hop_receive`. Alice pays Carol
+	// (a Trampoline blinded receive) over A -> B -> C with a hybrid outer onion and a hybrid inner
+	// Trampoline onion: the shared ciphertext trail carries Bob's and Carol's outer entries followed
+	// by Carol's Trampoline entry, and the blinded ciphertext list carries Carol's route-blinding
+	// entry. On the failure branch Carol double-wraps the error with her hybrid Trampoline and outer
+	// secrets, which Alice can only decode by folding the ML-KEM secrets it stored at send time.
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &vec![None; 3]);
+	let mut nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+
+	let (route, payment_hash, payment_preimage, payment_secret) =
+		pq_trampoline_receive_setup(&nodes);
+	let bob_node_id = nodes[1].node().get_our_node_id();
+	let amt_msat = route.paths[0].blinded_tail.as_ref().unwrap().final_value_msat;
+
+	nodes[0]
+		.node
+		.send_payment_with_route(
+			route,
+			payment_hash,
+			RecipientOnionFields::spontaneous_empty(amt_msat),
+			PaymentId(payment_hash.0),
+		)
+		.unwrap();
+	check_added_monitors(&nodes[0], 1);
+
+	// The first update_add_htlc must carry the fixed-size ciphertext trail and the blinded path's
+	// ciphertext list alongside the (size-unchanged) onion.
+	let mut events = nodes[0].node.get_and_clear_pending_msg_events();
+	assert_eq!(events.len(), 1);
+	let ev = remove_first_msg_event_to_node(&bob_node_id, &mut events);
+	if let MessageSendEvent::UpdateHTLCs { ref updates, .. } = ev {
+		let add = &updates.update_add_htlcs[0];
+		let trail = add.pq_onion_trail.as_ref();
+		assert!(trail.is_some(), "PQ: a Trampoline payment must carry the ciphertext trail");
+		assert_eq!(trail.unwrap().len(), onion_utils::PQ_PAYMENT_TRAIL_LEN);
+		let blinded_ct = add.pq_blinded_ct.as_ref();
+		assert!(blinded_ct.is_some(), "PQ: the blinded ciphertext list must ride with the HTLC");
+		assert_eq!(
+			blinded_ct.unwrap().len(),
+			onion_utils::PQ_BLINDED_PATH_MAX_HOPS * crate::crypto::pq_kem::PQ_KEM_CT_LEN
+		);
+	} else {
+		panic!("expected UpdateHTLCs");
+	}
+
+	let path: &[&Node] = &[&nodes[1], &nodes[2]];
+	let args = PassAlongPathArgs::new(&nodes[0], path, amt_msat, payment_hash, ev)
+		.with_payment_secret(payment_secret);
+	do_pass_along_path(args);
+
+	// Carol peeled her Trampoline layer with a hybrid ML-KEM secret.
+	nodes[2].logger.assert_log_contains(
+		"lightning::ln::channelmanager",
+		"PQ: peeled hybrid ML-KEM Trampoline onion layer",
+		1,
+	);
+
+	if success {
+		claim_payment(&nodes[0], &[&nodes[1], &nodes[2]], payment_preimage);
+	} else {
+		fail_payment(&nodes[0], &[&nodes[1], &nodes[2]], payment_hash);
+	}
+}
+
+#[cfg(feature = "post-quantum")]
+#[test]
+fn pq_trampoline_single_hop_receive() {
+	// PQ: a hybrid Trampoline payment A (0) -> B (1) -> C(Trampoline blinded receive) (2) succeeds.
+	do_pq_trampoline_single_hop_receive(true);
+
+	// PQ: the failing variant exercises the hybrid double-wrapped Trampoline error path.
+	do_pq_trampoline_single_hop_receive(false);
+}
+
+#[cfg(feature = "post-quantum")]
+#[test]
+fn pq_trampoline_trail_strip_fails() {
+	// PQ adversarial: a quantum man-in-the-middle strips the ciphertext trail off the HTLC bound for
+	// the Trampoline node (a downgrade attempt). Without its ML-KEM secrets Carol can only derive
+	// classical secrets, which peel neither the hybrid outer layer nor the hybrid Trampoline layer,
+	// so the HTLC fails closed instead of being accepted as a classical Trampoline payment.
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &vec![None; 3]);
+	let mut nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+
+	let (route, payment_hash, _payment_preimage, _payment_secret) =
+		pq_trampoline_receive_setup(&nodes);
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+	let amt_msat = route.paths[0].blinded_tail.as_ref().unwrap().final_value_msat;
+
+	nodes[0]
+		.node
+		.send_payment_with_route(
+			route,
+			payment_hash,
+			RecipientOnionFields::spontaneous_empty(amt_msat),
+			PaymentId(payment_hash.0),
+		)
+		.unwrap();
+	check_added_monitors(&nodes[0], 1);
+
+	// Pass A -> B unmodified, then strip the trail from the B -> C update_add_htlc.
+	let send_event = SendEvent::from_node(&nodes[0]);
+	nodes[1].node.handle_update_add_htlc(node_a_id, &send_event.msgs[0]);
+	do_commitment_signed_dance(&nodes[1], &nodes[0], &send_event.commitment_msg, false, false);
+	expect_and_process_pending_htlcs(&nodes[1], false);
+	check_added_monitors(&nodes[1], 1);
+
+	let mut send_event = SendEvent::from_node(&nodes[1]);
+	assert!(send_event.msgs[0].pq_onion_trail.is_some());
+	send_event.msgs[0].pq_onion_trail = None;
+	nodes[2].node.handle_update_add_htlc(node_b_id, &send_event.msgs[0]);
+	do_commitment_signed_dance(&nodes[2], &nodes[1], &send_event.commitment_msg, false, false);
+
+	// Carol cannot peel the hybrid-keyed onion without the trail, so she fails the HTLC back
+	// instead of accepting the payment.
+	nodes[2].node.process_pending_htlc_forwards();
+	let events = nodes[2].node.get_and_clear_pending_events();
+	assert!(
+		!events.iter().any(|ev| matches!(ev, Event::PaymentClaimable { .. })),
+		"PQ: a trail-stripped Trampoline HTLC must not become claimable"
+	);
+	check_added_monitors(&nodes[2], 1);
+	let c_events = nodes[2].node.get_and_clear_pending_msg_events();
+	let failed_back = c_events.iter().any(|ev| matches!(ev, MessageSendEvent::UpdateHTLCs { updates, .. }
+		if !updates.update_fail_malformed_htlcs.is_empty() || !updates.update_fail_htlcs.is_empty()));
+	assert!(failed_back, "PQ: a trail-stripped Trampoline HTLC must be failed back (fail-closed)");
+}
+
+#[cfg(feature = "post-quantum")]
+#[test]
+fn pq_trampoline_trail_tamper_fails() {
+	// PQ adversarial: the second trail entry of the HTLC bound for the Trampoline node (its
+	// Trampoline-layer ciphertext, sitting right behind its outer-layer entry) is corrupted on the
+	// wire. Carol's outer peel still succeeds (the front entry is intact), but decapsulating the
+	// tampered entry yields a wrong hybrid Trampoline secret, so the Trampoline onion's HMAC fails
+	// and the HTLC is failed back. This proves the Trampoline layer's keys really depend on its own
+	// trail entry.
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &vec![None; 3]);
+	let mut nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+
+	let (route, payment_hash, _payment_preimage, _payment_secret) =
+		pq_trampoline_receive_setup(&nodes);
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+	let amt_msat = route.paths[0].blinded_tail.as_ref().unwrap().final_value_msat;
+
+	nodes[0]
+		.node
+		.send_payment_with_route(
+			route,
+			payment_hash,
+			RecipientOnionFields::spontaneous_empty(amt_msat),
+			PaymentId(payment_hash.0),
+		)
+		.unwrap();
+	check_added_monitors(&nodes[0], 1);
+
+	let send_event = SendEvent::from_node(&nodes[0]);
+	nodes[1].node.handle_update_add_htlc(node_a_id, &send_event.msgs[0]);
+	do_commitment_signed_dance(&nodes[1], &nodes[0], &send_event.commitment_msg, false, false);
+	expect_and_process_pending_htlcs(&nodes[1], false);
+	check_added_monitors(&nodes[1], 1);
+
+	// Corrupt the front-but-one entry (Carol's Trampoline-layer ciphertext) of the B -> C trail.
+	const CT_LEN: usize = crate::crypto::pq_kem::PQ_KEM_CT_LEN;
+	let mut send_event = SendEvent::from_node(&nodes[1]);
+	{
+		let trail = send_event.msgs[0].pq_onion_trail.as_mut().unwrap();
+		for byte in trail[CT_LEN..2 * CT_LEN].iter_mut() {
+			*byte ^= 0x55;
+		}
+	}
+	nodes[2].node.handle_update_add_htlc(node_b_id, &send_event.msgs[0]);
+	do_commitment_signed_dance(&nodes[2], &nodes[1], &send_event.commitment_msg, false, false);
+
+	nodes[2].node.process_pending_htlc_forwards();
+	let events = nodes[2].node.get_and_clear_pending_events();
+	assert!(
+		!events.iter().any(|ev| matches!(ev, Event::PaymentClaimable { .. })),
+		"PQ: a Trampoline HTLC with a tampered Trampoline trail entry must not become claimable"
+	);
+	check_added_monitors(&nodes[2], 1);
+	let c_events = nodes[2].node.get_and_clear_pending_msg_events();
+	let failed_back = c_events.iter().any(|ev| matches!(ev, MessageSendEvent::UpdateHTLCs { updates, .. }
+		if !updates.update_fail_malformed_htlcs.is_empty() || !updates.update_fail_htlcs.is_empty()));
+	assert!(failed_back, "PQ: a tampered Trampoline trail entry must fail the HTLC back");
+}
+
+#[cfg(feature = "post-quantum")]
+#[test]
+fn pq_trampoline_blinded_ct_strip_fails() {
+	// PQ adversarial: the blinded ciphertext list is stripped from the HTLC bound for the Trampoline
+	// node. Carol's outer and Trampoline Sphinx layers still peel (their entries ride in the trail),
+	// but without her blinded-list entry her route-blinding secret stays classical, so the hybrid
+	// encrypted recipient data fails to decrypt and the HTLC is failed back rather than accepted.
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &vec![None; 3]);
+	let mut nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+
+	let (route, payment_hash, _payment_preimage, _payment_secret) =
+		pq_trampoline_receive_setup(&nodes);
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+	let amt_msat = route.paths[0].blinded_tail.as_ref().unwrap().final_value_msat;
+
+	nodes[0]
+		.node
+		.send_payment_with_route(
+			route,
+			payment_hash,
+			RecipientOnionFields::spontaneous_empty(amt_msat),
+			PaymentId(payment_hash.0),
+		)
+		.unwrap();
+	check_added_monitors(&nodes[0], 1);
+
+	let send_event = SendEvent::from_node(&nodes[0]);
+	nodes[1].node.handle_update_add_htlc(node_a_id, &send_event.msgs[0]);
+	do_commitment_signed_dance(&nodes[1], &nodes[0], &send_event.commitment_msg, false, false);
+	expect_and_process_pending_htlcs(&nodes[1], false);
+	check_added_monitors(&nodes[1], 1);
+
+	let mut send_event = SendEvent::from_node(&nodes[1]);
+	assert!(send_event.msgs[0].pq_blinded_ct.is_some());
+	send_event.msgs[0].pq_blinded_ct = None;
+	nodes[2].node.handle_update_add_htlc(node_b_id, &send_event.msgs[0]);
+	do_commitment_signed_dance(&nodes[2], &nodes[1], &send_event.commitment_msg, false, false);
+
+	nodes[2].node.process_pending_htlc_forwards();
+	let events = nodes[2].node.get_and_clear_pending_events();
+	assert!(
+		!events.iter().any(|ev| matches!(ev, Event::PaymentClaimable { .. })),
+		"PQ: a Trampoline HTLC with a stripped blinded ciphertext list must not become claimable"
+	);
+	check_added_monitors(&nodes[2], 1);
+	let c_events = nodes[2].node.get_and_clear_pending_msg_events();
+	let failed_back = c_events.iter().any(|ev| matches!(ev, MessageSendEvent::UpdateHTLCs { updates, .. }
+		if !updates.update_fail_malformed_htlcs.is_empty() || !updates.update_fail_htlcs.is_empty()));
+	assert!(failed_back, "PQ: a stripped blinded ciphertext list must fail the Trampoline HTLC back");
+}
+
+#[cfg(feature = "post-quantum")]
+#[test]
+fn pq_trampoline_required_sender_refuses_classical() {
+	// PQ: a sender configured with `require_post_quantum_payments` refuses a Trampoline route on
+	// which some Trampoline hop has no pinned ML-KEM key, rather than downgrading the inner
+	// Trampoline onion to classical keys. The outer hops here are fully post-quantum-capable, so
+	// this specifically exercises the Trampoline-hop key check.
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let mut config = test_default_channel_config();
+	config.require_post_quantum_payments = true;
+	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[Some(config), None, None]);
+	let mut nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+
+	let (mut route, payment_hash, _payment_preimage, _payment_secret) =
+		pq_trampoline_receive_setup(&nodes);
+	let amt_msat = route.paths[0].blinded_tail.as_ref().unwrap().final_value_msat;
+
+	// Add a second Trampoline hop whose node has no pinned ML-KEM key at the sender, making the
+	// inner Trampoline onion not post-quantum-capable while the outer hops still are. Shift part
+	// of the first hop's CLTV onto it so the Trampoline CLTVs still sum to the last outer hop's
+	// delta and the last hop still covers the blinded tail's excess delta.
+	let unpinned_trampoline = PublicKey::from_slice(&[2; 33]).unwrap();
+	{
+		let trampoline_hops =
+			&mut route.paths[0].blinded_tail.as_mut().unwrap().trampoline_hops;
+		trampoline_hops[0].cltv_expiry_delta -= 48;
+		trampoline_hops.push(TrampolineHop {
+			pubkey: unpinned_trampoline,
+			node_features: Features::empty(),
+			fee_msat: 0,
+			cltv_expiry_delta: 48,
+		});
+	}
+
+	let _res = nodes[0].node.send_payment_with_route(
+		route,
+		payment_hash,
+		RecipientOnionFields::spontaneous_empty(amt_msat),
+		PaymentId(payment_hash.0),
+	);
+	// The refusal prevents any (classical) HTLC from being sent over the wire.
+	assert!(
+		nodes[0].node.get_and_clear_pending_msg_events().is_empty(),
+		"PQ: a required-PQ sender must not send a Trampoline payment lacking a Trampoline hop key"
+	);
+	check_added_monitors(&nodes[0], 0);
+	let _ = nodes[0].node.get_and_clear_pending_events();
+}
+
+#[cfg(feature = "post-quantum")]
+#[test]
+fn pq_trampoline_require_inbound_rejects_classical() {
+	// PQ adversarial: a Trampoline node configured with `require_post_quantum_inbound` fails back a
+	// classical Trampoline payment (no ciphertext trail) instead of accepting it, closing the
+	// receiver-side downgrade gap for Trampoline entrypoints.
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let mut config = test_default_channel_config();
+	config.require_post_quantum_inbound = true;
+	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, None, Some(config)]);
+	let mut nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+
+	let secp_ctx = Secp256k1::new();
+
+	let (_, _, chan_id_alice_bob, _) =
+		create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 0);
+	let (_, _, chan_id_bob_carol, _) =
+		create_announced_chan_between_nodes_with_value(&nodes, 1, 2, 1_000_000, 0);
+
+	for i in 0..3 {
+		connect_blocks(&nodes[i], 3 * CHAN_CONFIRM_DEPTH + 1 - nodes[i].best_block_info().1);
+	}
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node().get_our_node_id();
+	let carol_node_id = nodes[2].node().get_our_node_id();
+
+	let alice_bob_scid = get_scid_from_channel_id(&nodes[0], chan_id_alice_bob);
+	let bob_carol_scid = get_scid_from_channel_id(&nodes[1], chan_id_bob_carol);
+
+	let amt_msat = 1000;
+	let carol_cltv_expiry_delta = 104 + 39;
+	let (_payment_preimage, payment_hash, payment_secret) =
+		get_payment_preimage_hash(&nodes[2], Some(amt_msat), None);
+
+	// A classical (non-post-quantum) blinded path and no pinned ML-KEM keys at the sender: Alice
+	// builds a classical Trampoline payment with no ciphertext trail.
+	let payee_tlvs = ReceiveTlvs {
+		payment_secret,
+		payment_constraints: PaymentConstraints {
+			max_cltv_expiry: u32::max_value(),
+			htlc_minimum_msat: amt_msat,
+		},
+		payment_context: PaymentContext::Bolt12Refund(Bolt12RefundContext {
+			payment_metadata: None,
+		}),
+	};
+	let receive_auth_key = nodes[2].keys_manager.get_receive_auth_key();
+	let blinded_path = BlindedPaymentPath::new(
+		&[],
+		carol_node_id,
+		receive_auth_key,
+		payee_tlvs,
+		u64::MAX,
+		0,
+		nodes[2].keys_manager,
+		&secp_ctx,
+	)
+	.unwrap();
+
+	let route = Route {
+		paths: vec![Path {
+			hops: vec![
+				RouteHop {
+					pubkey: node_b_id,
+					node_features: NodeFeatures::empty(),
+					short_channel_id: alice_bob_scid,
+					channel_features: ChannelFeatures::empty(),
+					fee_msat: 1000,
+					cltv_expiry_delta: 48,
+					maybe_announced_channel: false,
+				},
+				RouteHop {
+					pubkey: carol_node_id,
+					node_features: NodeFeatures::empty(),
+					short_channel_id: bob_carol_scid,
+					channel_features: ChannelFeatures::empty(),
+					fee_msat: 0,
+					cltv_expiry_delta: carol_cltv_expiry_delta,
+					maybe_announced_channel: false,
+				},
+			],
+			blinded_tail: Some(BlindedTail {
+				trampoline_hops: vec![TrampolineHop {
+					pubkey: carol_node_id,
+					node_features: Features::empty(),
+					fee_msat: amt_msat,
+					cltv_expiry_delta: carol_cltv_expiry_delta,
+				}],
+				hops: blinded_path.blinded_hops().to_vec(),
+				blinding_point: blinded_path.blinding_point(),
+				excess_final_cltv_expiry_delta: 39,
+				final_value_msat: amt_msat,
+				kem_ct: None,
+			}),
+		}],
+		route_params: RouteParameters::from_payment_params_and_value(
+			PaymentParameters::from_node_id(carol_node_id, carol_cltv_expiry_delta),
+			amt_msat,
+		),
+	};
+
+	nodes[0]
+		.node
+		.send_payment_with_route(
+			route,
+			payment_hash,
+			RecipientOnionFields::spontaneous_empty(amt_msat),
+			PaymentId(payment_hash.0),
+		)
+		.unwrap();
+	check_added_monitors(&nodes[0], 1);
+
+	let send_event = SendEvent::from_node(&nodes[0]);
+	assert!(
+		send_event.msgs[0].pq_onion_trail.is_none(),
+		"the route is not post-quantum-capable, so Alice builds a classical Trampoline onion"
+	);
+	nodes[1].node.handle_update_add_htlc(node_a_id, &send_event.msgs[0]);
+	do_commitment_signed_dance(&nodes[1], &nodes[0], &send_event.commitment_msg, false, false);
+	expect_and_process_pending_htlcs(&nodes[1], false);
+	check_added_monitors(&nodes[1], 1);
+
+	// Carol requires post-quantum inbound HTLCs, so she fails the classical Trampoline HTLC back
+	// instead of accepting it.
+	let send_event = SendEvent::from_node(&nodes[1]);
+	nodes[2].node.handle_update_add_htlc(node_b_id, &send_event.msgs[0]);
+	do_commitment_signed_dance(&nodes[2], &nodes[1], &send_event.commitment_msg, false, false);
+	nodes[2].node.process_pending_htlc_forwards();
+	let events = nodes[2].node.get_and_clear_pending_events();
+	assert!(
+		!events.iter().any(|ev| matches!(ev, Event::PaymentClaimable { .. })),
+		"PQ: a classical Trampoline HTLC must not become claimable at a require-PQ-inbound node"
+	);
+	check_added_monitors(&nodes[2], 1);
+	let c_events = nodes[2].node.get_and_clear_pending_msg_events();
+	let failed_back = c_events.iter().any(|ev| matches!(ev, MessageSendEvent::UpdateHTLCs { updates, .. }
+		if !updates.update_fail_htlcs.is_empty() || !updates.update_fail_malformed_htlcs.is_empty()));
+	assert!(failed_back, "PQ: a require-PQ-inbound Trampoline node must fail back a classical HTLC");
+}
+
+/// PQ: sets up channels and sends a post-quantum Trampoline MPP payment across two paths, mirroring
+/// `send_trampoline_mpp_payment`. Carol's inner Trampoline onion is a hybrid-keyed blinded forward
+/// to an unknown next Trampoline (forwarding is not implemented upstream, so Carol validates and
+/// then rejects), built over a post-quantum blinded Trampoline path so Carol's next-Trampoline data
+/// is hybrid-encrypted.
+#[cfg(feature = "post-quantum")]
+fn send_pq_trampoline_mpp_payment<'a, 'b, 'c>(
+	nodes: &'a Vec<Node<'a, 'b, 'c>>,
+) -> (PaymentHash, u64, MessageSendEvent, MessageSendEvent) {
+	let secp_ctx = Secp256k1::new();
+
+	let alice_bob_chan =
+		create_announced_chan_between_nodes_with_value(nodes, 0, 1, 1_000_000, 0).2;
+	let bob_carol_chan =
+		create_announced_chan_between_nodes_with_value(nodes, 1, 2, 1_000_000, 0).2;
+	let alice_barry_chan =
+		create_announced_chan_between_nodes_with_value(nodes, 0, 3, 1_000_000, 0).2;
+	let barry_carol_chan =
+		create_announced_chan_between_nodes_with_value(nodes, 3, 2, 1_000_000, 0).2;
+
+	let per_path_amt = 500_000;
+	let total_amt = per_path_amt * 2;
+	let (_, payment_hash, payment_secret) =
+		get_payment_preimage_hash(&nodes[2], Some(total_amt), None);
+
+	let bob_node_id = nodes[1].node.get_our_node_id();
+	let carol_node_id = nodes[2].node.get_our_node_id();
+	let barry_node_id = nodes[3].node.get_our_node_id();
+
+	let alice_bob_scid = get_scid_from_channel_id(&nodes[0], alice_bob_chan);
+	let bob_carol_scid = get_scid_from_channel_id(&nodes[1], bob_carol_chan);
+	let alice_barry_scid = get_scid_from_channel_id(&nodes[0], alice_barry_chan);
+	let barry_carol_scid = get_scid_from_channel_id(&nodes[3], barry_carol_chan);
+
+	// Pin the ML-KEM keys of every outer hop and of Carol (the Trampoline hop) at the sender.
+	{
+		let mut keys = nodes[0].router.pq_kem_keys.lock().unwrap();
+		keys.insert(bob_node_id, nodes[1].keys_manager.get_pq_kem_node_id().unwrap());
+		keys.insert(barry_node_id, nodes[3].keys_manager.get_pq_kem_node_id().unwrap());
+		keys.insert(carol_node_id, nodes[2].keys_manager.get_pq_kem_node_id().unwrap());
+	}
+
+	let trampoline_cltv = 42;
+	let excess_final_cltv = 70;
+
+	// Note we don't actually have an outgoing channel for Carol, we just use our default fee
+	// policy. The unknown next Trampoline gets a throwaway ML-KEM key; it never receives anything.
+	let carol_relay = ChannelConfig::default();
+	let carol_kem_key = nodes[2].keys_manager.get_pq_kem_node_id().unwrap();
+	let (next_trampoline_kem_key, _) = crate::crypto::pq_kem::keypair_from_seed(&[41u8; 32]);
+
+	let next_trampoline = PublicKey::from_slice(&[2; 33]).unwrap();
+	let fwd_tail = || {
+		let intermediate_nodes = [ForwardNode {
+			tlvs: blinded_path::payment::TrampolineForwardTlvs {
+				next_trampoline,
+				payment_constraints: PaymentConstraints {
+					max_cltv_expiry: u32::max_value(),
+					htlc_minimum_msat: 1,
+				},
+				features: BlindedHopFeatures::empty(),
+				payment_relay: PaymentRelay {
+					cltv_expiry_delta: carol_relay.cltv_expiry_delta,
+					fee_proportional_millionths: carol_relay.forwarding_fee_proportional_millionths,
+					fee_base_msat: carol_relay.forwarding_fee_base_msat,
+				},
+				next_blinding_override: None,
+			},
+			node_id: carol_node_id,
+			htlc_maximum_msat: u64::max_value(),
+		}];
+		let payee_tlvs = ReceiveTlvs {
+			payment_secret: PaymentSecret([0; 32]),
+			payment_constraints: PaymentConstraints {
+				max_cltv_expiry: u32::max_value(),
+				htlc_minimum_msat: 1,
+			},
+			payment_context: PaymentContext::Bolt12Refund(Bolt12RefundContext {
+				payment_metadata: None,
+			}),
+		};
+		create_trampoline_forward_blinded_tail_pq(
+			&secp_ctx,
+			&nodes[2].keys_manager,
+			&intermediate_nodes,
+			&[carol_kem_key],
+			next_trampoline,
+			&next_trampoline_kem_key,
+			ReceiveAuthKey([0; 32]),
+			payee_tlvs,
+			trampoline_cltv,
+			excess_final_cltv,
+			per_path_amt,
+		)
+	};
+
+	let hop = |pubkey, short_channel_id, fee_msat, cltv_expiry_delta| RouteHop {
+		pubkey,
+		node_features: NodeFeatures::empty(),
+		short_channel_id,
+		channel_features: ChannelFeatures::empty(),
+		fee_msat,
+		cltv_expiry_delta,
+		maybe_announced_channel: true,
+	};
+	let last_hop_cltv_delta =
+		carol_relay.cltv_expiry_delta as u32 + trampoline_cltv + excess_final_cltv;
+	let build_path_hops = |first_hop_node_id, first_hop_scid, second_hop_scid| {
+		vec![
+			hop(first_hop_node_id, first_hop_scid, 1000, 48),
+			hop(carol_node_id, second_hop_scid, 0, last_hop_cltv_delta),
+		]
+	};
+
+	let (tail_bob, blinded_path_bob) = fwd_tail();
+	let (tail_barry, blinded_path_barry) = fwd_tail();
+	let payment_params = PaymentParameters::blinded(vec![blinded_path_bob, blinded_path_barry]);
+	let route_params = RouteParameters {
+		payment_params,
+		final_value_msat: total_amt,
+		max_total_routing_fee_msat: None,
+	};
+	let route = Route {
+		paths: vec![
+			Path {
+				hops: build_path_hops(bob_node_id, alice_bob_scid, bob_carol_scid),
+				blinded_tail: Some(tail_bob),
+			},
+			Path {
+				hops: build_path_hops(barry_node_id, alice_barry_scid, barry_carol_scid),
+				blinded_tail: Some(tail_barry),
+			},
+		],
+		route_params,
+	};
+
+	let payment_id = PaymentId(payment_hash.0);
+	let onion = RecipientOnionFields::secret_only(payment_secret, total_amt);
+	nodes[0].node.send_payment_with_route(route, payment_hash, onion, payment_id).unwrap();
+	check_added_monitors(&nodes[0], 2);
+
+	let mut events = nodes[0].node.get_and_clear_pending_msg_events();
+	assert_eq!(events.len(), 2);
+	let ev_bob = remove_first_msg_event_to_node(&bob_node_id, &mut events);
+	let ev_barry = remove_first_msg_event_to_node(&barry_node_id, &mut events);
+
+	// Both MPP parts must carry the ciphertext trail and the blinded Trampoline path's list.
+	for ev in [&ev_bob, &ev_barry] {
+		if let MessageSendEvent::UpdateHTLCs { ref updates, .. } = ev {
+			assert!(updates.update_add_htlcs[0].pq_onion_trail.is_some());
+			assert!(updates.update_add_htlcs[0].pq_blinded_ct.is_some());
+		} else {
+			panic!("expected UpdateHTLCs");
+		}
+	}
+	(payment_hash, per_path_amt, ev_bob, ev_barry)
+}
+
+#[cfg(feature = "post-quantum")]
+#[test]
+fn pq_trampoline_mpp_forward_validation() {
+	// PQ: the post-quantum counterpart of `do_trampoline_mpp_test(None)`. Carol accumulates two
+	// hybrid Trampoline MPP parts, peeling each part's outer and Trampoline layers with hybrid
+	// ML-KEM secrets and decrypting her hybrid next-Trampoline data, then rejects the forward
+	// (upstream does not support Trampoline forwarding) with an error double-wrapped in her hybrid
+	// Trampoline and outer secrets, which Alice decodes by folding her stored ML-KEM secrets.
+	let chanmon_cfgs = create_chanmon_cfgs(4);
+	let node_cfgs = create_node_cfgs(4, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(4, &node_cfgs, &vec![None; 4]);
+	let nodes = create_network(4, &node_cfgs, &node_chanmgrs);
+
+	let (payment_hash, per_path_amt, ev_bob, ev_barry) = send_pq_trampoline_mpp_payment(&nodes);
+
+	let bob_path: &[&Node] = &[&nodes[1], &nodes[2]];
+	let barry_path: &[&Node] = &[&nodes[3], &nodes[2]];
+
+	// Pass both parts; on the second, Carol completes the MPP set and rejects the forward.
+	let args = PassAlongPathArgs::new(&nodes[0], bob_path, per_path_amt, payment_hash, ev_bob)
+		.without_claimable_event();
+	do_pass_along_path(args);
+	let args = PassAlongPathArgs::new(&nodes[0], barry_path, per_path_amt, payment_hash, ev_barry)
+		.without_clearing_recipient_events();
+	do_pass_along_path(args);
+
+	// Carol peeled both parts' Trampoline layers with hybrid ML-KEM secrets.
+	nodes[2].logger.assert_log_contains(
+		"lightning::ln::channelmanager",
+		"PQ: peeled hybrid ML-KEM Trampoline onion layer",
+		2,
+	);
+
+	let events = nodes[2].node.get_and_clear_pending_events();
+	assert_eq!(events.len(), 1);
+	match events[0] {
+		Event::HTLCHandlingFailed { ref failure_type, ref failure_reason, .. } => {
+			assert_eq!(failure_type, &HTLCHandlingFailureType::TrampolineForward {});
+			match failure_reason {
+				Some(crate::events::HTLCHandlingFailureReason::Local { reason }) => {
+					assert_eq!(*reason, LocalHTLCFailureReason::TemporaryTrampolineFailure)
+				},
+				Some(_) | None => panic!("expected failure_reason for failed trampoline"),
+			}
+		},
+		_ => panic!("Unexpected destination"),
+	}
+	expect_and_process_pending_htlcs(&nodes[2], false);
+	assert!(nodes[2].node.get_and_clear_pending_events().is_empty());
+
+	// Propagate the hybrid double-wrapped failures back through each path to Alice.
+	let forwarded: [&[&Node]; 2] = [bob_path, barry_path];
+	let carol_id = nodes[2].node.get_our_node_id();
+	check_added_monitors(&nodes[2], 2);
+	let mut carol_msgs = nodes[2].node.get_and_clear_pending_msg_events();
+	assert_eq!(carol_msgs.len(), 2);
+	for path in forwarded {
+		let hop = path[0];
+		let hop_id = hop.node.get_our_node_id();
+		let ev = remove_first_msg_event_to_node(&hop_id, &mut carol_msgs);
+		let updates = match ev {
+			MessageSendEvent::UpdateHTLCs { updates, .. } => updates,
+			_ => panic!("Expected UpdateHTLCs"),
+		};
+		hop.node.handle_update_fail_htlc(carol_id, &updates.update_fail_htlcs[0]);
+		do_commitment_signed_dance(hop, &nodes[2], &updates.commitment_signed, true, false);
+
+		let fwd = get_htlc_update_msgs(hop, &nodes[0].node.get_our_node_id());
+		nodes[0].node.handle_update_fail_htlc(hop_id, &fwd.update_fail_htlcs[0]);
+		do_commitment_signed_dance(&nodes[0], hop, &fwd.commitment_signed, false, false);
+	}
+
+	// Alice decodes both hybrid-wrapped failures: each path fails non-permanently (the error was
+	// attributed by folding the stored ML-KEM secrets into the outer and Trampoline secrets), and
+	// the payment as a whole fails after its retries are exhausted.
+	let events = nodes[0].node.get_and_clear_pending_events();
+	assert_eq!(events.len(), 3);
+	for ev in &events[..2] {
+		match ev {
+			Event::PaymentPathFailed { payment_hash: h, payment_failed_permanently, .. } => {
+				assert_eq!(*h, payment_hash);
+				assert!(!payment_failed_permanently);
+			},
+			_ => panic!("Expected PaymentPathFailed, got {:?}", ev),
+		}
+	}
+	match &events[2] {
+		Event::PaymentFailed { payment_hash: h, reason, .. } => {
+			assert_eq!(*h, Some(payment_hash));
+			assert_eq!(*reason, Some(PaymentFailureReason::RetriesExhausted));
+		},
+		_ => panic!("Expected PaymentFailed, got {:?}", events[2]),
+	}
 }

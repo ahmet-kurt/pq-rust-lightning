@@ -83,6 +83,12 @@ pub struct BlindedPaymentPath {
 	pub(super) inner_path: BlindedPath,
 	/// The [`BlindedPayInfo`] used to pay this blinded path.
 	pub payinfo: BlindedPayInfo,
+	/// PQ: on a post-quantum path the fixed-size list of per-hop ML-KEM ciphertexts the sender carries
+	/// alongside the onion (each blinded hop reads the front entry and rotates it to the back). Carried
+	/// in memory (not in the path's own serialization, which is length-framed without a trailing field)
+	/// and conveyed to the sender so it can place it in the outbound HTLC. `None` on a classical path.
+	#[cfg(feature = "post-quantum")]
+	pub(crate) kem_ct: Option<Vec<u8>>,
 }
 
 impl BlindedPaymentPath {
@@ -186,6 +192,62 @@ impl BlindedPaymentPath {
 		)
 	}
 
+	/// Create a post-quantum blinded path for a Trampoline payment, to be forwarded along
+	/// `intermediate_nodes`. Works like [`BlindedPaymentPath::new_pq`]: each hop's route-blinding
+	/// secret is mixed with a per-hop ML-KEM shared secret before any key is derived from it, so the
+	/// blinded Trampoline node ids, the encrypted next-Trampoline data, and the Trampoline onion
+	/// keys derived from them are all hybrid. The per-hop ciphertexts are stored on the returned
+	/// path for the sender to place in the outbound HTLC's `pq_blinded_ct`.
+	#[cfg(all(any(test, feature = "_test_utils"), feature = "post-quantum"))]
+	pub(crate) fn new_for_trampoline_pq<
+		ES: EntropySource,
+		T: secp256k1::Signing + secp256k1::Verification,
+	>(
+		intermediate_nodes: &[ForwardNode<TrampolineForwardTlvs>],
+		intermediate_pq_kem_keys: &[[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]],
+		payee_node_id: PublicKey, payee_pq_kem_key: &[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN],
+		local_node_receive_key: ReceiveAuthKey, payee_tlvs: ReceiveTlvs, htlc_maximum_msat: u64,
+		min_final_cltv_expiry_delta: u16, entropy_source: ES, secp_ctx: &Secp256k1<T>,
+	) -> Result<Self, ()> {
+		if intermediate_nodes.len() != intermediate_pq_kem_keys.len() {
+			return Err(());
+		}
+		let introduction_node = IntroductionNode::NodeId(
+			intermediate_nodes.first().map_or(payee_node_id, |n| n.node_id),
+		);
+		let blinding_secret_bytes = entropy_source.get_secure_random_bytes();
+		let blinding_secret =
+			SecretKey::from_slice(&blinding_secret_bytes[..]).expect("RNG is busted");
+
+		let blinded_payinfo = compute_payinfo(
+			intermediate_nodes,
+			&[],
+			&payee_tlvs,
+			htlc_maximum_msat,
+			min_final_cltv_expiry_delta,
+		)?;
+		let (blinded_hops, kem_ct_list) = blinded_hops_with_kem(
+			secp_ctx,
+			intermediate_nodes,
+			intermediate_pq_kem_keys,
+			payee_node_id,
+			payee_pq_kem_key,
+			payee_tlvs,
+			&blinding_secret,
+			local_node_receive_key,
+			&entropy_source,
+		)?;
+		Ok(Self {
+			inner_path: BlindedPath {
+				introduction_node,
+				blinding_point: PublicKey::from_secret_key(secp_ctx, &blinding_secret),
+				blinded_hops,
+			},
+			payinfo: blinded_payinfo,
+			kem_ct: Some(kem_ct_list),
+		})
+	}
+
 	fn new_inner<
 		F: ForwardTlvsInfo,
 		ES: EntropySource,
@@ -225,6 +287,72 @@ impl BlindedPaymentPath {
 				),
 			},
 			payinfo: blinded_payinfo,
+			#[cfg(feature = "post-quantum")]
+			kem_ct: None,
+		})
+	}
+
+	/// Creates a post-quantum [`BlindedPaymentPath`] whose per-hop secrets are hybrid: each hop's
+	/// route-blinding secret is mixed with a per-hop ML-KEM shared secret before any key is derived
+	/// from it, so a quantum attacker who recovers the classical per-hop ECDH secret still cannot
+	/// derive the per-hop `rho` (route stays hidden), unblind the `blinded_node_id` (hop identities
+	/// stay hidden), or derive the onion key (per-hop payloads stay hidden). The protection cascades
+	/// from the route-blinding layer to the onion-packet layer exactly as for onion-message paths.
+	///
+	/// `intermediate_pq_kem_keys` must have one entry per node in `intermediate_nodes`, giving each
+	/// hop's pinned static ML-KEM key (from [`NodeInfo::pq_kem_node_id`]). `payee_pq_kem_key` is the
+	/// recipient's own static ML-KEM key (from [`NodeSigner::get_pq_kem_node_id`]). The per-hop
+	/// ciphertexts are stored on the returned path as a fixed-size list (padded with random dummies)
+	/// for the sender to place in the outbound HTLC's `pq_blinded_ct`; each blinded hop decapsulates
+	/// the front entry and rotates it to the back. Post-quantum paths use no dummy hops.
+	///
+	/// [`NodeInfo::pq_kem_node_id`]: crate::routing::gossip::NodeInfo::pq_kem_node_id
+	/// [`NodeSigner::get_pq_kem_node_id`]: crate::sign::NodeSigner::get_pq_kem_node_id
+	#[cfg(feature = "post-quantum")]
+	pub fn new_pq<ES: EntropySource, T: secp256k1::Signing + secp256k1::Verification>(
+		intermediate_nodes: &[PaymentForwardNode],
+		intermediate_pq_kem_keys: &[[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]],
+		payee_node_id: PublicKey,
+		payee_pq_kem_key: &[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN],
+		local_node_receive_key: ReceiveAuthKey, payee_tlvs: ReceiveTlvs, htlc_maximum_msat: u64,
+		min_final_cltv_expiry_delta: u16, entropy_source: ES, secp_ctx: &Secp256k1<T>,
+	) -> Result<Self, ()> {
+		if intermediate_nodes.len() != intermediate_pq_kem_keys.len() {
+			return Err(());
+		}
+		let introduction_node = IntroductionNode::NodeId(
+			intermediate_nodes.first().map_or(payee_node_id, |n| n.node_id),
+		);
+		let blinding_secret_bytes = entropy_source.get_secure_random_bytes();
+		let blinding_secret =
+			SecretKey::from_slice(&blinding_secret_bytes[..]).expect("RNG is busted");
+
+		let blinded_payinfo = compute_payinfo(
+			intermediate_nodes,
+			&[],
+			&payee_tlvs,
+			htlc_maximum_msat,
+			min_final_cltv_expiry_delta,
+		)?;
+		let (blinded_hops, kem_ct_list) = blinded_hops_with_kem(
+			secp_ctx,
+			intermediate_nodes,
+			intermediate_pq_kem_keys,
+			payee_node_id,
+			payee_pq_kem_key,
+			payee_tlvs,
+			&blinding_secret,
+			local_node_receive_key,
+			&entropy_source,
+		)?;
+		Ok(Self {
+			inner_path: BlindedPath {
+				introduction_node,
+				blinding_point: PublicKey::from_secret_key(secp_ctx, &blinding_secret),
+				blinded_hops,
+			},
+			payinfo: blinded_payinfo,
+			kem_ct: Some(kem_ct_list),
 		})
 	}
 
@@ -324,7 +452,26 @@ impl BlindedPaymentPath {
 	}
 
 	pub(crate) fn from_parts(inner_path: BlindedPath, payinfo: BlindedPayInfo) -> Self {
-		Self { inner_path, payinfo }
+		Self {
+			inner_path,
+			payinfo,
+			#[cfg(feature = "post-quantum")]
+			kem_ct: None,
+		}
+	}
+
+	/// PQ: the fixed-size list of per-hop ML-KEM ciphertexts the sender carries alongside the onion on
+	/// a post-quantum path, or `None` on a classical path.
+	#[cfg(feature = "post-quantum")]
+	pub(crate) fn kem_ct(&self) -> Option<Vec<u8>> {
+		self.kem_ct.clone()
+	}
+
+	/// PQ: re-attach the per-hop ML-KEM ciphertext list to a post-quantum path (used when a path is
+	/// reconstructed from a serialized form that carries the ciphertexts out of band).
+	#[cfg(feature = "post-quantum")]
+	pub(crate) fn set_kem_ct(&mut self, kem_ct: Option<Vec<u8>>) {
+		self.kem_ct = kem_ct;
 	}
 
 	/// Builds a new [`BlindedPaymentPath`] from its constituent parts.
@@ -928,6 +1075,85 @@ pub(super) fn blinded_hops<F: ForwardTlvsInfo, T: secp256k1::Signing + secp256k1
 	}
 
 	utils::construct_blinded_hops(secp_ctx, path, session_priv)
+}
+
+/// Construct the hops of a post-quantum blinded payment path: one ML-KEM encapsulation per hop, with
+/// each hop's secret folded into its per-hop route-blinding secret (and therefore its blinded node id,
+/// per-hop `rho`, and next blinding point). Returns the blinded hops and a fixed-size list of the
+/// per-hop ciphertexts (padded with random dummies to [`PQ_BLINDED_PATH_MAX_HOPS`] entries) that the
+/// sender carries alongside the onion: each blinded hop reads the front entry (its ciphertext) and
+/// rotates it to the back, so the list size stays constant and reveals nothing about the tail length.
+/// The ciphertexts ride next to the onion rather than inside it because one ML-KEM ciphertext (1088 B)
+/// would not fit the hard 1300-byte payment onion. Post-quantum paths use no dummy hops.
+///
+/// Because a forwarding hop's onion-packet key is `ECDH(node_secret * blinded_node_id factor,
+/// packet_pubkey)` and that factor is `HMAC(hybrid_secret)`, mixing the ML-KEM secret in here also
+/// protects the onion-packet layer (the per-hop payloads), not just the route.
+///
+/// [`PQ_BLINDED_PATH_MAX_HOPS`]: crate::ln::onion_utils::PQ_BLINDED_PATH_MAX_HOPS
+#[cfg(feature = "post-quantum")]
+fn blinded_hops_with_kem<
+	F: ForwardTlvsInfo,
+	ES: EntropySource,
+	T: secp256k1::Signing + secp256k1::Verification,
+>(
+	secp_ctx: &Secp256k1<T>, intermediate_nodes: &[ForwardNode<F>],
+	intermediate_pq_kem_keys: &[[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]],
+	payee_node_id: PublicKey, payee_pq_kem_key: &[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN],
+	payee_tlvs: ReceiveTlvs, session_priv: &SecretKey, local_node_receive_key: ReceiveAuthKey,
+	entropy_source: &ES,
+) -> Result<(Vec<BlindedHop>, Vec<u8>), ()> {
+	const CT_LEN: usize = crate::crypto::pq_kem::PQ_KEM_CT_LEN;
+	let max_hops = crate::ln::onion_utils::PQ_BLINDED_PATH_MAX_HOPS;
+	let num_intermediates = intermediate_nodes.len();
+	let total_hops = num_intermediates + 1;
+	if total_hops > max_hops {
+		return Err(());
+	}
+
+	// Encapsulate to every hop. The shared secrets are folded into the per-hop route-blinding secrets
+	// (so they cascade to the blinded node ids and the onion keys); the ciphertexts are packed into the
+	// fixed-size list the sender carries.
+	let mut kem_secrets = Vec::with_capacity(total_hops);
+	let mut ciphertexts = Vec::with_capacity(total_hops);
+	for i in 0..total_hops {
+		let key =
+			if i < num_intermediates { &intermediate_pq_kem_keys[i] } else { payee_pq_kem_key };
+		let seed = entropy_source.get_secure_random_bytes();
+		let (ss, ct) = crate::crypto::pq_kem::encapsulate(key, &seed).ok_or(())?;
+		kem_secrets.push(ss);
+		ciphertexts.push(ct);
+	}
+
+	let pks = intermediate_nodes
+		.iter()
+		.map(|node| (node.node_id, None))
+		.chain(core::iter::once((payee_node_id, Some(local_node_receive_key))));
+	let tlvs = intermediate_nodes
+		.iter()
+		.map(|node| BlindedPaymentTlvsRef::Forward(&node.tlvs))
+		.chain(core::iter::once(BlindedPaymentTlvsRef::Receive(&payee_tlvs)));
+	let path = pks.zip(
+		tlvs.map(|tlv| BlindedPathWithPadding { tlvs: tlv, round_off: PAYMENT_PADDING_ROUND_OFF }),
+	);
+
+	let blinded_hops =
+		utils::construct_blinded_hops_with_kem(secp_ctx, path, session_priv, &kem_secrets);
+
+	// Pack the per-hop ciphertexts into a fixed-size list, padded with dummies. A real hop always finds
+	// its ciphertext at the front (real entries stay in order as hops rotate the front to the back), so
+	// the dummies are never decapsulated meaningfully; they only keep the list a constant size. Each
+	// dummy is sampled from the distribution of real ciphertexts so a hop cannot tell the padding from
+	// the real entries and count the tail's hops (see `dummy_ciphertext_from_seed`).
+	let mut ct_list = Vec::with_capacity(max_hops * CT_LEN);
+	for ct in &ciphertexts {
+		ct_list.extend_from_slice(ct);
+	}
+	for _ in total_hops..max_hops {
+		let seed = entropy_source.get_secure_random_bytes();
+		ct_list.extend_from_slice(&crate::crypto::pq_kem::dummy_ciphertext_from_seed(&seed));
+	}
+	Ok((blinded_hops, ct_list))
 }
 
 /// `None` if underflow occurs.

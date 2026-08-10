@@ -4143,6 +4143,7 @@ mod tests {
 			blinding_point: test_utils::pubkey(42),
 			excess_final_cltv_expiry_delta: recipient_hop.cltv_expiry_delta,
 			final_value_msat: recipient_hop.fee_msat,
+			kem_ct: None,
 		});
 
 		// Check the liquidity before and after scoring payment failures to ensure the blinded path's

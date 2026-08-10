@@ -60,6 +60,13 @@ pub(crate) const IDEMPOTENCY_TIMEOUT_TICKS: u8 = 7;
 /// payee to fulfill.
 const ASYNC_PAYMENT_TIMEOUT_RELATIVE_EXPIRY: Duration = Duration::from_secs(60 * 60 * 24 * 7);
 
+/// PQ: the error a post-quantum-required sender returns when it refuses a route that is not
+/// post-quantum-capable. The retry handling matches on it to abandon the payment, since the
+/// refusal is deterministic and retrying the route would refuse the same way forever.
+#[cfg(feature = "post-quantum")]
+pub(crate) const PQ_ROUTE_REFUSAL_ERR: &str =
+	"Post-quantum payments are required but the route is not post-quantum-capable";
+
 #[cfg(test)]
 pub(crate) const TEST_ASYNC_PAYMENT_TIMEOUT_RELATIVE_EXPIRY: Duration =
 	ASYNC_PAYMENT_TIMEOUT_RELATIVE_EXPIRY;
@@ -1933,13 +1940,28 @@ impl OutboundPayments {
 	{
 		match err {
 			PaymentSendFailure::AllFailedResendSafe(errs) => {
+				// PQ: a post-quantum-required sender's route refusal is deterministic, so a retry
+				// would refuse the same route again and recurse without bound; abandon instead.
+				#[cfg(feature = "post-quantum")]
+				let pq_refused = errs.iter()
+					.any(|e| matches!(e, APIError::InvalidRoute { err } if err == PQ_ROUTE_REFUSAL_ERR));
 				self.remove_session_privs(payment_id, route.paths.iter().zip(onion_session_privs.iter()));
 				Self::push_path_failed_evs_and_scids(payment_id, payment_hash, &mut route_params, route.paths, errs.into_iter().map(|e| Err(e)), pending_events, logger);
+				#[cfg(feature = "post-quantum")]
+				if pq_refused {
+					self.abandon_payment(payment_id, PaymentFailureReason::RouteNotFound, pending_events);
+					return;
+				}
 				self.find_route_and_send_payment(payment_hash, payment_id, route_params, router, first_hops, inflight_htlcs, entropy_source, node_signer, best_block_height, pending_events, send_payment_along_path, logger);
 			},
 			PaymentSendFailure::PartialFailure { failed_paths_retry: Some(mut retry), results, .. } => {
 				debug_assert_eq!(results.len(), route.paths.len());
 				debug_assert_eq!(results.len(), onion_session_privs.len());
+				// PQ: as above, a post-quantum route refusal on any path is deterministic; abandon
+				// rather than retrying the failed paths forever (in-flight paths resolve as usual).
+				#[cfg(feature = "post-quantum")]
+				let pq_refused = results.iter()
+					.any(|r| matches!(r, Err(APIError::InvalidRoute { err }) if err == PQ_ROUTE_REFUSAL_ERR));
 				let failed_paths = results.iter().zip(route.paths.iter().zip(onion_session_privs.iter()))
 					.filter_map(|(path_res, (path, session_priv))| {
 						match path_res {
@@ -1952,6 +1974,11 @@ impl OutboundPayments {
 					});
 				self.remove_session_privs(payment_id, failed_paths);
 				Self::push_path_failed_evs_and_scids(payment_id, payment_hash, &mut retry, route.paths, results.into_iter(), pending_events, logger);
+				#[cfg(feature = "post-quantum")]
+				if pq_refused {
+					self.abandon_payment(payment_id, PaymentFailureReason::RouteNotFound, pending_events);
+					return;
+				}
 				// Some paths were sent, even if we failed to send the full MPP value our recipient may
 				// misbehave and claim the funds, at which point we have to consider the payment sent, so
 				// return `Ok()` here, ignoring any retry errors.

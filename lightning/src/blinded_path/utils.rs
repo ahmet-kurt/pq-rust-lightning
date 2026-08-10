@@ -125,7 +125,7 @@ pub(crate) fn construct_keys_for_onion_message<'a, T, I, F>(
 		Destination::Node(pk) => {
 			build_keys!(pk, false, None);
 		},
-		Destination::BlindedPath(BlindedMessagePath(BlindedPath { blinded_hops, .. })) => {
+		Destination::BlindedPath(BlindedMessagePath(BlindedPath { blinded_hops, .. }, ..)) => {
 			for hop in blinded_hops {
 				build_keys_in_loop!(hop.blinded_node_id, true, Some(hop.encrypted_payload));
 			}
@@ -189,6 +189,68 @@ where
 			});
 		},
 	);
+	blinded_hops
+}
+
+/// Construct blinded hops whose per-hop secret is hybrid: the classical per-hop ECDH secret is
+/// mixed with a per-hop ML-KEM shared secret (`kem_secrets`, one entry per hop, in path order)
+/// before any key is derived from it. This mirrors [`construct_blinded_hops`] but folds the
+/// post-quantum secret into the encrypted-recipient-data key, the blinded node id, and the next
+/// blinding point. Used for both onion-message and payment blinded paths; the classical
+/// [`construct_blinded_hops`] is left untouched.
+///
+/// Because the onion packet key a forwarding hop later derives is `ECDH(node_secret * blinded_node_id
+/// factor, packet_pubkey)` and that factor is `HMAC(hybrid_secret)`, mixing the ML-KEM secret in here
+/// also protects the onion packet layer (the per-hop payloads), not just the route.
+#[cfg(feature = "post-quantum")]
+pub(crate) fn construct_blinded_hops_with_kem<'a, T, I, W>(
+	secp_ctx: &Secp256k1<T>, unblinded_path: I, session_priv: &SecretKey,
+	kem_secrets: &[[u8; crate::crypto::pq_kem::PQ_KEM_SS_LEN]],
+) -> Vec<BlindedHop>
+where
+	T: secp256k1::Signing + secp256k1::Verification,
+	I: Iterator<Item = ((PublicKey, Option<ReceiveAuthKey>), W)>,
+	W: Writeable,
+{
+	let mut blinded_hops = Vec::with_capacity(unblinded_path.size_hint().0);
+	let mut blinding_point_priv = session_priv.clone();
+	let mut blinding_point = PublicKey::from_secret_key(secp_ctx, &blinding_point_priv);
+	for (idx, ((pubkey, hop_recv_key), tlvs)) in unblinded_path.enumerate() {
+		let encrypted_data_ss = SharedSecret::new(&pubkey, &blinding_point_priv);
+		// Fold the per-hop ML-KEM secret into the per-hop secret. Everything below derives from the
+		// hybrid secret, so a quantum attacker who recovers `encrypted_data_ss` cannot proceed.
+		let hybrid_ss =
+			crate::crypto::pq_kem::mix_blinded_path_secret(encrypted_data_ss.as_ref(), &kem_secrets[idx]);
+
+		let blinded_node_id = {
+			let factor = {
+				let mut hmac = HmacEngine::<Sha256>::new(b"blinded_node_id");
+				hmac.input(&hybrid_ss);
+				Hmac::from_engine(hmac).to_byte_array()
+			};
+			pubkey
+				.mul_tweak(secp_ctx, &Scalar::from_be_bytes(factor).unwrap())
+				.expect("Blinding loop pubkey tweak failed")
+		};
+		let rho = onion_utils::gen_rho_from_shared_secret(&hybrid_ss);
+		blinded_hops.push(BlindedHop {
+			blinded_node_id,
+			encrypted_payload: encrypt_payload(tlvs, rho, hop_recv_key),
+		});
+
+		// Advance the blinding point with the hybrid secret so the receiving hop, which folds the
+		// same ML-KEM secret, derives the matching next blinding point.
+		let next_blinding_factor = {
+			let mut sha = Sha256::engine();
+			sha.input(&blinding_point.serialize()[..]);
+			sha.input(&hybrid_ss);
+			Sha256::from_engine(sha).to_byte_array()
+		};
+		blinding_point_priv = blinding_point_priv
+			.mul_tweak(&Scalar::from_be_bytes(next_blinding_factor).unwrap())
+			.expect("Blinding loop scalar tweak failed");
+		blinding_point = PublicKey::from_secret_key(secp_ctx, &blinding_point_priv);
+	}
 	blinded_hops
 }
 

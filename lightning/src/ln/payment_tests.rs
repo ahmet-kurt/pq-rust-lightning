@@ -5443,6 +5443,8 @@ fn peel_payment_onion_custom_tlvs() {
 		blinding_point: None,
 		hold_htlc: None,
 		accountable: None,
+		pq_onion_trail: None,
+		pq_blinded_ct: None,
 	};
 	let peeled_onion = crate::ln::onion_payment::peel_payment_onion(
 		&update_add,
@@ -6161,4 +6163,848 @@ fn bolt11_multi_node_mpp_with_retry() {
 	} else {
 		panic!("{payment_sent_b:?}");
 	}
+}
+
+#[cfg(feature = "post-quantum")]
+#[test]
+fn pq_payment_end_to_end() {
+	// PQ: a 3-node line A -> B -> C. With every hop's ML-KEM key available to A's payment sender (in a
+	// real deployment these come from the gossip-pinned keys), A builds a hybrid ML-KEM payment onion
+	// plus the parallel ciphertext trail; B peels its layer with the hybrid secret and forwards the
+	// next-hop trail; C receives. Asserts the trail rides at each hop and the payment is claimed end to
+	// end (the route survives the hybrid key schedule through the live channel state machine).
+	use crate::sign::NodeSigner;
+
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, None, None]);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+	let node_c_id = nodes[2].node.get_our_node_id();
+
+	create_announced_chan_between_nodes(&nodes, 0, 1);
+	create_announced_chan_between_nodes(&nodes, 1, 2);
+
+	// Make B's and C's ML-KEM encapsulation keys available to A's payment sender.
+	{
+		let mut keys = nodes[0].router.pq_kem_keys.lock().unwrap();
+		keys.insert(node_b_id, nodes[1].keys_manager.get_pq_kem_node_id().unwrap());
+		keys.insert(node_c_id, nodes[2].keys_manager.get_pq_kem_node_id().unwrap());
+	}
+
+	let amt_msat = 100_000;
+	let (route, payment_hash, payment_preimage, payment_secret) =
+		get_route_and_payment_hash!(nodes[0], nodes[2], amt_msat);
+	nodes[0]
+		.node
+		.send_payment_with_route(
+			route,
+			payment_hash,
+			RecipientOnionFields::secret_only(payment_secret, amt_msat),
+			PaymentId(payment_hash.0),
+		)
+		.unwrap();
+	check_added_monitors(&nodes[0], 1);
+
+	// Hop A -> B: the outbound update_add_htlc must carry the ML-KEM ciphertext trail.
+	let send_event = SendEvent::from_node(&nodes[0]);
+	assert!(
+		send_event.msgs[0].pq_onion_trail.is_some(),
+		"PQ: the first hop's update_add_htlc must carry the ciphertext trail"
+	);
+	nodes[1].node.handle_update_add_htlc(node_a_id, &send_event.msgs[0]);
+	do_commitment_signed_dance(&nodes[1], &nodes[0], &send_event.commitment_msg, false, false);
+	expect_and_process_pending_htlcs(&nodes[1], false);
+	check_added_monitors(&nodes[1], 1);
+
+	// Hop B -> C: the forwarded update_add_htlc must carry the peeled next-hop trail.
+	let send_event = SendEvent::from_node(&nodes[1]);
+	assert!(
+		send_event.msgs[0].pq_onion_trail.is_some(),
+		"PQ: the forwarded update_add_htlc must carry the next-hop ciphertext trail"
+	);
+	nodes[2].node.handle_update_add_htlc(node_b_id, &send_event.msgs[0]);
+	do_commitment_signed_dance(&nodes[2], &nodes[1], &send_event.commitment_msg, false, false);
+	expect_and_process_pending_htlcs(&nodes[2], false);
+
+	expect_payment_claimable!(nodes[2], payment_hash, payment_secret, amt_msat);
+	claim_payment(&nodes[0], &[&nodes[1], &nodes[2]], payment_preimage);
+}
+
+#[cfg(feature = "post-quantum")]
+#[test]
+fn pq_keysend_end_to_end() {
+	// PQ: the same hybrid ML-KEM payment-onion path as `pq_payment_end_to_end`, but for a keysend
+	// (spontaneous) payment over A -> B -> C. The keysend preimage rides inside the hybrid-keyed onion.
+	use crate::sign::NodeSigner;
+
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, None, None]);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+	let node_c_id = nodes[2].node.get_our_node_id();
+
+	create_announced_chan_between_nodes(&nodes, 0, 1);
+	create_announced_chan_between_nodes(&nodes, 1, 2);
+
+	{
+		let mut keys = nodes[0].router.pq_kem_keys.lock().unwrap();
+		keys.insert(node_b_id, nodes[1].keys_manager.get_pq_kem_node_id().unwrap());
+		keys.insert(node_c_id, nodes[2].keys_manager.get_pq_kem_node_id().unwrap());
+	}
+
+	let amt_msat = 100_000;
+	let keysend_preimage = PaymentPreimage([42; 32]);
+	let payment_hash = PaymentHash(Sha256::hash(&keysend_preimage.0).to_byte_array());
+	let route_params = RouteParameters::from_payment_params_and_value(
+		PaymentParameters::for_keysend(node_c_id, TEST_FINAL_CLTV, false),
+		amt_msat,
+	);
+	nodes[0]
+		.node
+		.send_spontaneous_payment(
+			Some(keysend_preimage),
+			RecipientOnionFields::spontaneous_empty(amt_msat),
+			PaymentId(payment_hash.0),
+			route_params,
+			Retry::Attempts(0),
+		)
+		.unwrap();
+	check_added_monitors(&nodes[0], 1);
+
+	let send_event = SendEvent::from_node(&nodes[0]);
+	assert!(
+		send_event.msgs[0].pq_onion_trail.is_some(),
+		"PQ: the keysend first hop's update_add_htlc must carry the ciphertext trail"
+	);
+	nodes[1].node.handle_update_add_htlc(node_a_id, &send_event.msgs[0]);
+	do_commitment_signed_dance(&nodes[1], &nodes[0], &send_event.commitment_msg, false, false);
+	expect_and_process_pending_htlcs(&nodes[1], false);
+	check_added_monitors(&nodes[1], 1);
+
+	let send_event = SendEvent::from_node(&nodes[1]);
+	assert!(
+		send_event.msgs[0].pq_onion_trail.is_some(),
+		"PQ: the keysend forwarded update_add_htlc must carry the next-hop ciphertext trail"
+	);
+	nodes[2].node.handle_update_add_htlc(node_b_id, &send_event.msgs[0]);
+	do_commitment_signed_dance(&nodes[2], &nodes[1], &send_event.commitment_msg, false, false);
+	expect_and_process_pending_htlcs(&nodes[2], false);
+
+	let events = nodes[2].node.get_and_clear_pending_events();
+	assert_eq!(events.len(), 1);
+	match &events[0] {
+		Event::PaymentClaimable { purpose, .. } => match purpose {
+			PaymentPurpose::SpontaneousPayment(preimage) => {
+				assert_eq!(*preimage, keysend_preimage);
+				claim_payment(&nodes[0], &[&nodes[1], &nodes[2]], *preimage);
+			},
+			_ => panic!("Unexpected payment purpose: {purpose:?}"),
+		},
+		_ => panic!("Unexpected event"),
+	}
+}
+
+#[cfg(feature = "post-quantum")]
+#[test]
+fn pq_payment_downgrade_strip_trail_fails() {
+	// PQ adversarial (live path): a quantum man-in-the-middle strips the ciphertext trail off the wire
+	// (a downgrade attempt). Without its ML-KEM secret the next hop can only derive the classical
+	// secret, which cannot peel the hybrid-keyed onion, so the HTLC fails closed (it is not silently
+	// accepted as a classical payment). Mirrors the crypto-core downgrade test at the channel level.
+	use crate::sign::NodeSigner;
+
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, None, None]);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+	let node_c_id = nodes[2].node.get_our_node_id();
+
+	create_announced_chan_between_nodes(&nodes, 0, 1);
+	create_announced_chan_between_nodes(&nodes, 1, 2);
+
+	{
+		let mut keys = nodes[0].router.pq_kem_keys.lock().unwrap();
+		keys.insert(node_b_id, nodes[1].keys_manager.get_pq_kem_node_id().unwrap());
+		keys.insert(node_c_id, nodes[2].keys_manager.get_pq_kem_node_id().unwrap());
+	}
+
+	let amt_msat = 100_000;
+	let (route, payment_hash, _payment_preimage, payment_secret) =
+		get_route_and_payment_hash!(nodes[0], nodes[2], amt_msat);
+	nodes[0]
+		.node
+		.send_payment_with_route(
+			route,
+			payment_hash,
+			RecipientOnionFields::secret_only(payment_secret, amt_msat),
+			PaymentId(payment_hash.0),
+		)
+		.unwrap();
+	check_added_monitors(&nodes[0], 1);
+
+	let mut send_event = SendEvent::from_node(&nodes[0]);
+	assert!(send_event.msgs[0].pq_onion_trail.is_some());
+	// The downgrade: drop the ML-KEM ciphertext trail on the wire.
+	send_event.msgs[0].pq_onion_trail = None;
+	nodes[1].node.handle_update_add_htlc(node_a_id, &send_event.msgs[0]);
+	do_commitment_signed_dance(&nodes[1], &nodes[0], &send_event.commitment_msg, false, false);
+
+	// B cannot peel the hybrid-keyed onion without the trail, so it fails the HTLC (malformed onion)
+	// back toward A instead of forwarding it to C.
+	nodes[1].node.process_pending_htlc_forwards();
+	let _ = nodes[1].node.get_and_clear_pending_events();
+	check_added_monitors(&nodes[1], 1);
+	let b_events = nodes[1].node.get_and_clear_pending_msg_events();
+	let forwarded = b_events.iter().any(|ev| matches!(ev, MessageSendEvent::UpdateHTLCs { updates, .. }
+		if !updates.update_add_htlcs.is_empty()));
+	assert!(!forwarded, "PQ: a downgraded (trail-stripped) HTLC must not be forwarded onward");
+	let failed_back = b_events.iter().any(|ev| matches!(ev, MessageSendEvent::UpdateHTLCs { updates, .. }
+		if !updates.update_fail_malformed_htlcs.is_empty() || !updates.update_fail_htlcs.is_empty()));
+	assert!(failed_back, "PQ: a downgraded HTLC must be failed back (fail-closed)");
+}
+
+#[cfg(feature = "post-quantum")]
+#[test]
+fn pq_required_sender_refuses_classical_route() {
+	// PQ: a node configured with `require_post_quantum_payments` refuses to send over a route that is
+	// not entirely post-quantum-capable (here no hop has a pinned ML-KEM key), rather than silently
+	// downgrading to a classical onion. This is the sender-side downgrade-resistance knob.
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let mut config = test_default_channel_config();
+	config.require_post_quantum_payments = true;
+	let node_chanmgrs =
+		create_node_chanmgrs(3, &node_cfgs, &[Some(config), None, None]);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+
+	create_announced_chan_between_nodes(&nodes, 0, 1);
+	create_announced_chan_between_nodes(&nodes, 1, 2);
+
+	let amt_msat = 100_000;
+	let (route, payment_hash, _preimage, payment_secret) =
+		get_route_and_payment_hash!(nodes[0], nodes[2], amt_msat);
+	// No ML-KEM keys are injected into the sender's router, so the route is not post-quantum-capable
+	// and the post-quantum-required sender refuses the path.
+	let _res = nodes[0].node.send_payment_with_route(
+		route,
+		payment_hash,
+		RecipientOnionFields::secret_only(payment_secret, amt_msat),
+		PaymentId(payment_hash.0),
+	);
+	// The refusal prevents any (classical) HTLC from being sent over the wire: no SendHTLCs message and
+	// no monitor update on the sender. The payment is abandoned rather than downgraded.
+	assert!(
+		nodes[0].node.get_and_clear_pending_msg_events().is_empty(),
+		"PQ: a required-PQ sender must not send a classical HTLC over a non-PQ route"
+	);
+	check_added_monitors(&nodes[0], 0);
+	let _ = nodes[0].node.get_and_clear_pending_events();
+}
+
+#[cfg(feature = "post-quantum")]
+#[test]
+fn pq_required_sender_abandons_instead_of_retrying() {
+	// PQ: the refusal of a non-post-quantum-capable route is deterministic, so when the payment is
+	// sent with a retry strategy the retry logic must abandon it rather than re-route and refuse
+	// forever (a regression test for an unbounded retry recursion that overflowed the stack).
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let mut config = test_default_channel_config();
+	config.require_post_quantum_payments = true;
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(config), None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	create_announced_chan_between_nodes(&nodes, 0, 1);
+
+	let amt_msat = 100_000;
+	let (route, payment_hash, _preimage, payment_secret) =
+		get_route_and_payment_hash!(nodes[0], nodes[1], amt_msat);
+	// No ML-KEM keys are injected into the sender's router, so every routing attempt is refused;
+	// with the generous retry budget an unabandoned payment would retry until it overflowed.
+	nodes[0].node.send_payment(
+		payment_hash,
+		RecipientOnionFields::secret_only(payment_secret, amt_msat),
+		PaymentId(payment_hash.0),
+		route.route_params.clone(),
+		Retry::Attempts(100),
+	).unwrap();
+	assert!(
+		nodes[0].node.get_and_clear_pending_msg_events().is_empty(),
+		"PQ: a required-PQ sender must not send a classical HTLC over a non-PQ route"
+	);
+	check_added_monitors(&nodes[0], 0);
+	// The first refusal abandons the payment (no retries), surfacing a RouteNotFound failure.
+	let events = nodes[0].node.get_and_clear_pending_events();
+	let abandoned = events.iter().any(|ev| matches!(ev, Event::PaymentFailed { reason, .. }
+		if *reason == Some(PaymentFailureReason::RouteNotFound)));
+	assert!(abandoned, "PQ: the refused payment must be abandoned with RouteNotFound, got {:?}", events);
+}
+
+#[cfg(feature = "post-quantum")]
+#[test]
+fn pq_require_inbound_accepts_hybrid_payment() {
+	// PQ: a forwarding node (B) and a receiving node (C) configured with `require_post_quantum_inbound`
+	// accept a hybrid ML-KEM payment, since every hop is peeled with a hybrid secret (the inbound HTLC
+	// carries the ciphertext trail). The functional companion to `pq_require_inbound_rejects_classical_payment`:
+	// the receiver-side knob does not break legitimate post-quantum payments.
+	use crate::sign::NodeSigner;
+
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let mut config = test_default_channel_config();
+	config.require_post_quantum_inbound = true;
+	let node_chanmgrs =
+		create_node_chanmgrs(3, &node_cfgs, &[None, Some(config.clone()), Some(config)]);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+	let node_c_id = nodes[2].node.get_our_node_id();
+
+	create_announced_chan_between_nodes(&nodes, 0, 1);
+	create_announced_chan_between_nodes(&nodes, 1, 2);
+
+	{
+		let mut keys = nodes[0].router.pq_kem_keys.lock().unwrap();
+		keys.insert(node_b_id, nodes[1].keys_manager.get_pq_kem_node_id().unwrap());
+		keys.insert(node_c_id, nodes[2].keys_manager.get_pq_kem_node_id().unwrap());
+	}
+
+	let amt_msat = 100_000;
+	let (route, payment_hash, payment_preimage, payment_secret) =
+		get_route_and_payment_hash!(nodes[0], nodes[2], amt_msat);
+	nodes[0]
+		.node
+		.send_payment_with_route(
+			route,
+			payment_hash,
+			RecipientOnionFields::secret_only(payment_secret, amt_msat),
+			PaymentId(payment_hash.0),
+		)
+		.unwrap();
+	check_added_monitors(&nodes[0], 1);
+
+	let send_event = SendEvent::from_node(&nodes[0]);
+	assert!(send_event.msgs[0].pq_onion_trail.is_some());
+	nodes[1].node.handle_update_add_htlc(node_a_id, &send_event.msgs[0]);
+	do_commitment_signed_dance(&nodes[1], &nodes[0], &send_event.commitment_msg, false, false);
+	expect_and_process_pending_htlcs(&nodes[1], false);
+	check_added_monitors(&nodes[1], 1);
+
+	// B (require-PQ inbound) forwarded the hybrid HTLC rather than failing it back.
+	let send_event = SendEvent::from_node(&nodes[1]);
+	assert!(send_event.msgs[0].pq_onion_trail.is_some());
+	nodes[2].node.handle_update_add_htlc(node_b_id, &send_event.msgs[0]);
+	do_commitment_signed_dance(&nodes[2], &nodes[1], &send_event.commitment_msg, false, false);
+	expect_and_process_pending_htlcs(&nodes[2], false);
+
+	// C (require-PQ inbound) accepted the hybrid HTLC.
+	expect_payment_claimable!(nodes[2], payment_hash, payment_secret, amt_msat);
+	claim_payment(&nodes[0], &[&nodes[1], &nodes[2]], payment_preimage);
+}
+
+#[cfg(feature = "post-quantum")]
+#[test]
+fn pq_require_inbound_rejects_classical_payment() {
+	// PQ adversarial: a forwarding node (B) configured with `require_post_quantum_inbound` fails back a
+	// classical (non-hybrid) HTLC instead of forwarding it. This closes the receiver-side downgrade gap:
+	// a payment steered onto a classical route (here A holds no hop ML-KEM keys, so it builds a classical
+	// onion with no ciphertext trail) cannot get past a node that requires post-quantum protection.
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let mut config = test_default_channel_config();
+	config.require_post_quantum_inbound = true;
+	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, Some(config), None]);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+
+	create_announced_chan_between_nodes(&nodes, 0, 1);
+	create_announced_chan_between_nodes(&nodes, 1, 2);
+
+	let amt_msat = 100_000;
+	let (route, payment_hash, _payment_preimage, payment_secret) =
+		get_route_and_payment_hash!(nodes[0], nodes[2], amt_msat);
+	// A holds no ML-KEM keys for the hops, so it builds a classical onion (no ciphertext trail).
+	nodes[0]
+		.node
+		.send_payment_with_route(
+			route,
+			payment_hash,
+			RecipientOnionFields::secret_only(payment_secret, amt_msat),
+			PaymentId(payment_hash.0),
+		)
+		.unwrap();
+	check_added_monitors(&nodes[0], 1);
+
+	let send_event = SendEvent::from_node(&nodes[0]);
+	assert!(
+		send_event.msgs[0].pq_onion_trail.is_none(),
+		"the route is not post-quantum-capable, so A builds a classical onion"
+	);
+	nodes[1].node.handle_update_add_htlc(node_a_id, &send_event.msgs[0]);
+	do_commitment_signed_dance(&nodes[1], &nodes[0], &send_event.commitment_msg, false, false);
+
+	// B requires post-quantum inbound HTLCs, so it fails the classical HTLC back toward A instead of
+	// forwarding it to C.
+	nodes[1].node.process_pending_htlc_forwards();
+	let _ = nodes[1].node.get_and_clear_pending_events();
+	check_added_monitors(&nodes[1], 1);
+	let b_events = nodes[1].node.get_and_clear_pending_msg_events();
+	let forwarded = b_events.iter().any(|ev| matches!(ev, MessageSendEvent::UpdateHTLCs { updates, .. }
+		if !updates.update_add_htlcs.is_empty()));
+	assert!(!forwarded, "PQ: a classical HTLC must not be forwarded by a require-post-quantum-inbound node");
+	let failed_back = b_events.iter().any(|ev| matches!(ev, MessageSendEvent::UpdateHTLCs { updates, .. }
+		if !updates.update_fail_htlcs.is_empty() || !updates.update_fail_malformed_htlcs.is_empty()));
+	assert!(failed_back, "PQ: a require-post-quantum-inbound node must fail back a classical HTLC");
+}
+
+#[cfg(feature = "post-quantum")]
+#[test]
+fn pq_require_inbound_accepts_blinded_payment() {
+	// PQ: a require_post_quantum_inbound node accepts a hybrid BOLT 12-style blinded payment, whose
+	// blinded hops are protected by the blinded ciphertext list rather than the trail. This exercises the
+	// blinded branch of the inbound check (`blinding_point` + `pq_blinded_ct` present, no trail) at the
+	// blinded recipient C, alongside the trail branch at the introduction node B.
+	use crate::sign::NodeSigner;
+
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let mut config = test_default_channel_config();
+	config.require_post_quantum_inbound = true;
+	let node_chanmgrs =
+		create_node_chanmgrs(3, &node_cfgs, &[None, Some(config.clone()), Some(config)]);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+	let node_c_id = nodes[2].node.get_our_node_id();
+
+	create_announced_chan_between_nodes(&nodes, 0, 1);
+	let chan_b_c = create_announced_chan_between_nodes(&nodes, 1, 2).0.contents;
+
+	let amt_msat = 100_000;
+	let (payment_preimage, payment_hash, payment_secret) =
+		get_payment_preimage_hash(&nodes[2], Some(amt_msat), None);
+
+	let b_kem = nodes[1].keys_manager.get_pq_kem_node_id().unwrap();
+	let blinded_path = build_pq_blinded_path(
+		payment_secret,
+		node_b_id,
+		b_kem,
+		&chan_b_c,
+		node_c_id,
+		&nodes[2].keys_manager,
+	);
+	nodes[0].router.pq_kem_keys.lock().unwrap().insert(node_b_id, b_kem);
+
+	let route_params = RouteParameters::from_payment_params_and_value(
+		PaymentParameters::blinded(vec![blinded_path]),
+		amt_msat,
+	);
+	nodes[0]
+		.node
+		.send_payment(
+			payment_hash,
+			RecipientOnionFields::spontaneous_empty(amt_msat),
+			PaymentId(payment_hash.0),
+			route_params,
+			Retry::Attempts(0),
+		)
+		.unwrap();
+	check_added_monitors(&nodes[0], 1);
+
+	// Hop A -> B (introduction node, require-PQ inbound): forwarded, not failed back.
+	let ev = SendEvent::from_node(&nodes[0]);
+	nodes[1].node.handle_update_add_htlc(node_a_id, &ev.msgs[0]);
+	do_commitment_signed_dance(&nodes[1], &nodes[0], &ev.commitment_msg, false, false);
+	expect_and_process_pending_htlcs(&nodes[1], false);
+	check_added_monitors(&nodes[1], 1);
+
+	// Hop B -> C (blinded recipient, require-PQ inbound): the HTLC carries the blinded ciphertext list
+	// but no trail, exercising the blinded branch of the inbound check.
+	let ev = SendEvent::from_node(&nodes[1]);
+	assert!(ev.msgs[0].pq_blinded_ct.is_some());
+	assert!(ev.msgs[0].pq_onion_trail.is_none());
+	nodes[2].node.handle_update_add_htlc(node_b_id, &ev.msgs[0]);
+	do_commitment_signed_dance(&nodes[2], &nodes[1], &ev.commitment_msg, false, false);
+	expect_and_process_pending_htlcs(&nodes[2], false);
+
+	expect_payment_claimable!(nodes[2], payment_hash, payment_secret, amt_msat);
+	claim_payment(&nodes[0], &[&nodes[1], &nodes[2]], payment_preimage);
+}
+
+#[cfg(feature = "post-quantum")]
+#[test]
+fn pq_payment_failure_decodes_hybrid_error() {
+	// PQ: when a post-quantum payment fails, every hop encrypts/re-wraps the BOLT 4 return error onion
+	// with its HYBRID per-hop secret (the stored `incoming_shared_secret`). To decode the failure the
+	// sender must re-derive those hybrid secrets, folding the per-hop ML-KEM secrets it stored at send
+	// time into the classical secrets. Here C rejects the payment over A -> B -> C; the test asserts
+	// the sender surfaces an on-path failure with a recovered error code, which it can only do by
+	// successfully decrypting the hybrid-keyed error onion (without the fold it would get a
+	// non-attributable error).
+	use crate::sign::NodeSigner;
+
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, None, None]);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+	let node_c_id = nodes[2].node.get_our_node_id();
+
+	create_announced_chan_between_nodes(&nodes, 0, 1);
+	create_announced_chan_between_nodes(&nodes, 1, 2);
+
+	{
+		let mut keys = nodes[0].router.pq_kem_keys.lock().unwrap();
+		keys.insert(node_b_id, nodes[1].keys_manager.get_pq_kem_node_id().unwrap());
+		keys.insert(node_c_id, nodes[2].keys_manager.get_pq_kem_node_id().unwrap());
+	}
+
+	let amt_msat = 100_000;
+	let (route, payment_hash, _preimage, payment_secret) =
+		get_route_and_payment_hash!(nodes[0], nodes[2], amt_msat);
+	nodes[0]
+		.node
+		.send_payment_with_route(
+			route,
+			payment_hash,
+			RecipientOnionFields::secret_only(payment_secret, amt_msat),
+			PaymentId(payment_hash.0),
+		)
+		.unwrap();
+	check_added_monitors(&nodes[0], 1);
+
+	// Drive the hybrid payment A -> B -> C until it is claimable at C.
+	let send_event = SendEvent::from_node(&nodes[0]);
+	assert!(send_event.msgs[0].pq_onion_trail.is_some());
+	nodes[1].node.handle_update_add_htlc(node_a_id, &send_event.msgs[0]);
+	do_commitment_signed_dance(&nodes[1], &nodes[0], &send_event.commitment_msg, false, false);
+	expect_and_process_pending_htlcs(&nodes[1], false);
+	check_added_monitors(&nodes[1], 1);
+
+	let send_event = SendEvent::from_node(&nodes[1]);
+	nodes[2].node.handle_update_add_htlc(node_b_id, &send_event.msgs[0]);
+	do_commitment_signed_dance(&nodes[2], &nodes[1], &send_event.commitment_msg, false, false);
+	expect_and_process_pending_htlcs(&nodes[2], false);
+	expect_payment_claimable!(nodes[2], payment_hash, payment_secret, amt_msat);
+
+	// C rejects the payment, failing it back with an error packet keyed by its HYBRID secret; B re-wraps
+	// it with its own hybrid secret.
+	nodes[2].node.fail_htlc_backwards(&payment_hash);
+	expect_and_process_pending_htlcs_and_htlc_handling_failed(
+		&nodes[2],
+		&[HTLCHandlingFailureType::Receive { payment_hash }],
+	);
+	check_added_monitors(&nodes[2], 1);
+
+	// C -> B
+	let update_c_b = get_htlc_update_msgs(&nodes[2], &node_b_id);
+	nodes[1].node.handle_update_fail_htlc(node_c_id, &update_c_b.update_fail_htlcs[0]);
+	do_commitment_signed_dance(&nodes[1], &nodes[2], &update_c_b.commitment_signed, true, false);
+
+	// B -> A
+	let update_b_a = get_htlc_update_msgs(&nodes[1], &node_a_id);
+	nodes[0].node.handle_update_fail_htlc(node_b_id, &update_b_a.update_fail_htlcs[0]);
+	do_commitment_signed_dance(&nodes[0], &nodes[1], &update_b_a.commitment_signed, false, true);
+
+	// A must DECODE the hybrid-keyed error onion: an on-path failure must carry a recovered error code,
+	// which is only possible because the sender folded the stored per-hop ML-KEM secrets back into the
+	// classical secrets. Without that fold the error onion would not authenticate and `error_code` would
+	// be `None`.
+	let events = nodes[0].node.get_and_clear_pending_events();
+	assert_eq!(events.len(), 2);
+	match &events[0] {
+		Event::PaymentPathFailed { error_code, failure: PathFailure::OnPath { .. }, .. } => {
+			assert!(
+				error_code.is_some(),
+				"PQ: the sender must decode the hybrid-keyed BOLT 4 error onion"
+			);
+		},
+		ev => panic!("Unexpected event: {ev:?}"),
+	}
+}
+
+/// PQ helper: build a post-quantum blinded payment path with `intro_node_id` as the introduction node
+/// and `payee_node_id` as the recipient, folding each blinded hop's pinned ML-KEM key into its
+/// route-blinding secret (via [`BlindedPaymentPath::new_pq`]). Returns the path, which carries the
+/// per-hop ciphertext list for the payer to place in the outbound HTLC.
+#[cfg(feature = "post-quantum")]
+fn build_pq_blinded_path(
+	payment_secret: crate::types::payment::PaymentSecret,
+	intro_node_id: bitcoin::secp256k1::PublicKey,
+	intro_kem_key: [u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN],
+	intro_to_payee_chan: &crate::ln::msgs::UnsignedChannelUpdate,
+	payee_node_id: bitcoin::secp256k1::PublicKey,
+	payee_keys_manager: &crate::util::test_utils::TestKeysInterface,
+) -> crate::blinded_path::payment::BlindedPaymentPath {
+	use crate::blinded_path::payment::{
+		BlindedPaymentPath, Bolt12RefundContext, ForwardTlvs, PaymentConstraints, PaymentContext,
+		PaymentForwardNode, PaymentRelay, ReceiveTlvs,
+	};
+	use crate::sign::NodeSigner;
+	use crate::types::features::BlindedHopFeatures;
+
+	let payee_tlvs = ReceiveTlvs {
+		payment_secret,
+		payment_constraints: PaymentConstraints {
+			max_cltv_expiry: u32::max_value(),
+			htlc_minimum_msat: intro_to_payee_chan.htlc_minimum_msat,
+		},
+		payment_context: PaymentContext::Bolt12Refund(Bolt12RefundContext { payment_metadata: None }),
+	};
+	let intermediate_nodes = [PaymentForwardNode {
+		node_id: intro_node_id,
+		tlvs: ForwardTlvs {
+			short_channel_id: intro_to_payee_chan.short_channel_id,
+			payment_relay: PaymentRelay {
+				cltv_expiry_delta: intro_to_payee_chan.cltv_expiry_delta,
+				fee_proportional_millionths: intro_to_payee_chan.fee_proportional_millionths,
+				fee_base_msat: intro_to_payee_chan.fee_base_msat,
+			},
+			payment_constraints: PaymentConstraints {
+				max_cltv_expiry: u32::max_value(),
+				htlc_minimum_msat: intro_to_payee_chan.htlc_minimum_msat,
+			},
+			next_blinding_override: None,
+			features: BlindedHopFeatures::empty(),
+		},
+		htlc_maximum_msat: intro_to_payee_chan.htlc_maximum_msat,
+	}];
+	let payee_kem_key = payee_keys_manager.get_pq_kem_node_id().unwrap();
+	let receive_auth_key = payee_keys_manager.get_receive_auth_key();
+	let secp_ctx = bitcoin::secp256k1::Secp256k1::new();
+	BlindedPaymentPath::new_pq(
+		&intermediate_nodes,
+		&[intro_kem_key],
+		payee_node_id,
+		&payee_kem_key,
+		receive_auth_key,
+		payee_tlvs,
+		u64::MAX,
+		TEST_FINAL_CLTV as u16,
+		payee_keys_manager,
+		&secp_ctx,
+	)
+	.unwrap()
+}
+
+#[cfg(feature = "post-quantum")]
+#[test]
+fn pq_blinded_payment_end_to_end() {
+	// PQ: a BOLT 12-style blinded payment A -> B -> C, where B is the introduction node and C the
+	// recipient behind a post-quantum blinded tail. C builds the path with `new_pq`, folding a per-hop
+	// ML-KEM secret into each blinded hop's route-blinding secret (which cascades to the blinded node id
+	// and the onion key). The per-hop ciphertext list rides in the first HTLC's `pq_blinded_ct` with
+	// B's ciphertext at the front; B rotates the list so C finds its ciphertext at the front of the
+	// forwarded HTLC. Asserts the ciphertext list rides at each hop and the payment is claimed end
+	// to end.
+	use crate::sign::NodeSigner;
+
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, None, None]);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+	let node_c_id = nodes[2].node.get_our_node_id();
+
+	create_announced_chan_between_nodes(&nodes, 0, 1);
+	let chan_b_c = create_announced_chan_between_nodes(&nodes, 1, 2).0.contents;
+
+	let amt_msat = 100_000;
+	let (payment_preimage, payment_hash, payment_secret) =
+		get_payment_preimage_hash(&nodes[2], Some(amt_msat), None);
+
+	let b_kem = nodes[1].keys_manager.get_pq_kem_node_id().unwrap();
+	let blinded_path =
+		build_pq_blinded_path(payment_secret, node_b_id, b_kem, &chan_b_c, node_c_id, &nodes[2].keys_manager);
+	assert!(
+		blinded_path.kem_ct().is_some(),
+		"PQ: a post-quantum blinded path must carry the per-hop ciphertext list"
+	);
+
+	// A's payment sender needs B's ML-KEM key for the unblinded prefix / introduction node main onion.
+	nodes[0].router.pq_kem_keys.lock().unwrap().insert(node_b_id, b_kem);
+
+	let route_params = RouteParameters::from_payment_params_and_value(
+		PaymentParameters::blinded(vec![blinded_path]),
+		amt_msat,
+	);
+	nodes[0]
+		.node
+		.send_payment(
+			payment_hash,
+			RecipientOnionFields::spontaneous_empty(amt_msat),
+			PaymentId(payment_hash.0),
+			route_params,
+			Retry::Attempts(0),
+		)
+		.unwrap();
+	check_added_monitors(&nodes[0], 1);
+
+	// Hop A -> B (the introduction node): the first HTLC carries the prefix/intro ciphertext trail and
+	// the introduction node's blinded-path ciphertext.
+	let ev = SendEvent::from_node(&nodes[0]);
+	assert!(ev.msgs[0].pq_onion_trail.is_some(), "PQ: the first hop must carry the ciphertext trail");
+	assert!(
+		ev.msgs[0].pq_blinded_ct.is_some(),
+		"PQ: the first hop must carry the introduction node's blinded-path ciphertext"
+	);
+	nodes[1].node.handle_update_add_htlc(node_a_id, &ev.msgs[0]);
+	do_commitment_signed_dance(&nodes[1], &nodes[0], &ev.commitment_msg, false, false);
+	expect_and_process_pending_htlcs(&nodes[1], false);
+	check_added_monitors(&nodes[1], 1);
+
+	// Hop B -> C: B rotates the ciphertext list so C's ciphertext sits at the front of the forwarded HTLC.
+	let ev = SendEvent::from_node(&nodes[1]);
+	assert!(
+		ev.msgs[0].pq_blinded_ct.is_some(),
+		"PQ: the forwarded HTLC must carry the next blinded hop's ciphertext"
+	);
+	nodes[2].node.handle_update_add_htlc(node_b_id, &ev.msgs[0]);
+	do_commitment_signed_dance(&nodes[2], &nodes[1], &ev.commitment_msg, false, false);
+	expect_and_process_pending_htlcs(&nodes[2], false);
+
+	expect_payment_claimable!(nodes[2], payment_hash, payment_secret, amt_msat);
+	claim_payment(&nodes[0], &[&nodes[1], &nodes[2]], payment_preimage);
+}
+
+#[cfg(feature = "post-quantum")]
+#[test]
+fn pq_blinded_payment_strip_intro_ct_fails() {
+	// PQ adversarial (live path): a quantum man-in-the-middle strips the blinded-path ciphertext off the
+	// first HTLC (a downgrade attempt). Without it the introduction node can only derive the classical
+	// route-blinding secret, which cannot decrypt the hybrid-keyed encrypted recipient data, so it fails
+	// the HTLC closed instead of forwarding a downgraded payment.
+	use crate::sign::NodeSigner;
+
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, None, None]);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+	let node_c_id = nodes[2].node.get_our_node_id();
+
+	create_announced_chan_between_nodes(&nodes, 0, 1);
+	let chan_b_c = create_announced_chan_between_nodes(&nodes, 1, 2).0.contents;
+
+	let amt_msat = 100_000;
+	let (_payment_preimage, payment_hash, payment_secret) =
+		get_payment_preimage_hash(&nodes[2], Some(amt_msat), None);
+
+	let b_kem = nodes[1].keys_manager.get_pq_kem_node_id().unwrap();
+	let blinded_path =
+		build_pq_blinded_path(payment_secret, node_b_id, b_kem, &chan_b_c, node_c_id, &nodes[2].keys_manager);
+	nodes[0].router.pq_kem_keys.lock().unwrap().insert(node_b_id, b_kem);
+
+	let route_params = RouteParameters::from_payment_params_and_value(
+		PaymentParameters::blinded(vec![blinded_path]),
+		amt_msat,
+	);
+	nodes[0]
+		.node
+		.send_payment(
+			payment_hash,
+			RecipientOnionFields::spontaneous_empty(amt_msat),
+			PaymentId(payment_hash.0),
+			route_params,
+			Retry::Attempts(0),
+		)
+		.unwrap();
+	check_added_monitors(&nodes[0], 1);
+
+	let mut ev = SendEvent::from_node(&nodes[0]);
+	assert!(ev.msgs[0].pq_blinded_ct.is_some());
+	// The downgrade: drop the blinded-path ciphertext on the wire.
+	ev.msgs[0].pq_blinded_ct = None;
+	nodes[1].node.handle_update_add_htlc(node_a_id, &ev.msgs[0]);
+	do_commitment_signed_dance(&nodes[1], &nodes[0], &ev.commitment_msg, false, false);
+
+	// B cannot derive the hybrid route-blinding secret without the ciphertext, so it fails the HTLC back
+	// (fail-closed) rather than forwarding the downgraded payment to C.
+	nodes[1].node.process_pending_htlc_forwards();
+	let _ = nodes[1].node.get_and_clear_pending_events();
+	check_added_monitors(&nodes[1], 1);
+	let b_events = nodes[1].node.get_and_clear_pending_msg_events();
+	let forwarded = b_events.iter().any(|ev| matches!(ev, MessageSendEvent::UpdateHTLCs { updates, .. }
+		if !updates.update_add_htlcs.is_empty()));
+	assert!(!forwarded, "PQ: a downgraded (ciphertext-stripped) blinded HTLC must not be forwarded");
+	let failed_back = b_events.iter().any(|ev| matches!(ev, MessageSendEvent::UpdateHTLCs { updates, .. }
+		if !updates.update_fail_malformed_htlcs.is_empty() || !updates.update_fail_htlcs.is_empty()));
+	assert!(failed_back, "PQ: a downgraded blinded HTLC must be failed back (fail-closed)");
+	let _ = node_c_id;
+}
+
+#[cfg(feature = "post-quantum")]
+#[test]
+fn pq_blinded_payment_measurements() {
+	// PQ: report the wire sizes of a post-quantum blinded payment's first HTLC (the onion stays the hard
+	// 1300-byte bucket; the ciphertext trail and the blinded-path ciphertext ride alongside it).
+	use crate::sign::NodeSigner;
+	use crate::util::ser::Writeable;
+
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, None, None]);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+
+	let node_b_id = nodes[1].node.get_our_node_id();
+	let node_c_id = nodes[2].node.get_our_node_id();
+
+	create_announced_chan_between_nodes(&nodes, 0, 1);
+	let chan_b_c = create_announced_chan_between_nodes(&nodes, 1, 2).0.contents;
+
+	let amt_msat = 100_000;
+	let (_preimage, payment_hash, payment_secret) =
+		get_payment_preimage_hash(&nodes[2], Some(amt_msat), None);
+	let b_kem = nodes[1].keys_manager.get_pq_kem_node_id().unwrap();
+	let blinded_path =
+		build_pq_blinded_path(payment_secret, node_b_id, b_kem, &chan_b_c, node_c_id, &nodes[2].keys_manager);
+	nodes[0].router.pq_kem_keys.lock().unwrap().insert(node_b_id, b_kem);
+
+	let route_params = RouteParameters::from_payment_params_and_value(
+		PaymentParameters::blinded(vec![blinded_path]),
+		amt_msat,
+	);
+	nodes[0]
+		.node
+		.send_payment(
+			payment_hash,
+			RecipientOnionFields::spontaneous_empty(amt_msat),
+			PaymentId(payment_hash.0),
+			route_params,
+			Retry::Attempts(0),
+		)
+		.unwrap();
+	check_added_monitors(&nodes[0], 1);
+	let ev = SendEvent::from_node(&nodes[0]);
+	let onion_len = ev.msgs[0].onion_routing_packet.encode().len();
+	let trail_len = ev.msgs[0].pq_onion_trail.as_ref().map_or(0, |t| t.len());
+	let blinded_ct_len = ev.msgs[0].pq_blinded_ct.as_ref().map_or(0, |c| c.len());
+	let total = ev.msgs[0].encode().len();
+	println!(
+		"PQ blinded payment measurements: onion {onion_len} B, trail {trail_len} B, blinded_ct {blinded_ct_len} B, update_add_htlc {total} B",
+	);
+	// The blinded ciphertext list is fixed-size (padded to PQ_BLINDED_PATH_MAX_HOPS) so its length never
+	// reveals the blinded tail length.
+	assert_eq!(
+		blinded_ct_len,
+		crate::ln::onion_utils::PQ_BLINDED_PATH_MAX_HOPS * crate::crypto::pq_kem::PQ_KEM_CT_LEN
+	);
 }
