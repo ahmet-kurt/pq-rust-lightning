@@ -1649,17 +1649,18 @@ mod tests {
 			.unwrap();
 		let (act_three, _) = outbound.process_act_two_pq(&act_two, &initiator_ks).unwrap();
 		println!(
-			"PQ: BOLT 8 hybrid (ML-KEM-768) handshake sizes: act_one 50 -> {} B, act_two 50 -> {} B, act_three {} B (unchanged)",
+			"PQ: BOLT 8 hybrid ({}) handshake sizes: act_one 50 -> {} B, act_two 50 -> {} B, act_three {} B (unchanged)",
+			crate::crypto::pq_kem::PQ_KEM_SCHEME,
 			act_one.len(),
 			act_two.len(),
 			act_three.len(),
 		);
 		println!(
-			"PQ: ML-KEM-768 wire sizes: encapsulation key {} B, ciphertext {} B",
-			PQ_KEM_EK_LEN, PQ_KEM_CT_LEN,
+			"PQ: {} wire sizes: encapsulation key {} B, ciphertext {} B",
+			crate::crypto::pq_kem::PQ_KEM_SCHEME, PQ_KEM_EK_LEN, PQ_KEM_CT_LEN,
 		);
 
-		// ML-KEM-768 operation timings (debug/test profile; use a release benchmark for
+		// ML-KEM operation timings (debug/test profile; use a release benchmark for
 		// publication-quality numbers).
 		use std::time::Instant;
 		let n = 200;
@@ -1683,8 +1684,8 @@ mod tests {
 		}
 		let decaps_us = start.elapsed().as_micros() as f64 / n as f64;
 		println!(
-			"PQ: ML-KEM-768 (test profile, avg/{}): keygen {:.0} us, encaps {:.0} us, decaps {:.0} us",
-			n, keygen_us, encaps_us, decaps_us,
+			"PQ: {} (test profile, avg/{}): keygen {:.0} us, encaps {:.0} us, decaps {:.0} us",
+			crate::crypto::pq_kem::PQ_KEM_SCHEME, n, keygen_us, encaps_us, decaps_us,
 		);
 	}
 }

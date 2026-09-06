@@ -684,11 +684,12 @@ impl_array!(PUBLIC_KEY_SIZE, u8); // for PublicKey
 impl_array!(64, u8); // for ecdsa::Signature and schnorr::Signature
 impl_array!(1300, u8); // for OnionPacket.hop_data
 #[cfg(feature = "post-quantum")]
-impl_array!(1312, u8); // for ML-DSA-44 public key pins in the network graph
+impl_array!(crate::sign::pq::PQ_PUBLIC_KEY_LEN, u8); // for ML-DSA public key pins in the network graph
 #[cfg(feature = "post-quantum")]
-impl_array!(1184, u8); // for ML-KEM-768 encapsulation key pins in the network graph
-#[cfg(feature = "post-quantum")]
-impl_array!(1088, u8); // for ML-KEM-768 ciphertexts carried in post-quantum blinded paths
+impl_array!(crate::crypto::pq_kem::PQ_KEM_EK_LEN, u8); // for ML-KEM encapsulation key pins in the network graph
+// ML-KEM-1024 ciphertexts are as long as its encapsulation keys, so the impl above already covers them.
+#[cfg(all(feature = "post-quantum", not(feature = "pq-ml-kem-1024")))]
+impl_array!(crate::crypto::pq_kem::PQ_KEM_CT_LEN, u8); // for ML-KEM ciphertexts carried in post-quantum blinded paths
 
 impl_array!(8, u16);
 impl_array!(32, u16);

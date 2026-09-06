@@ -266,7 +266,7 @@ fn pay_for_bolt11_invoice_enforces_pq_signature() {
 	// A trusted key that does not match the invoice's key (a key-substitution attempt) is refused
 	// before the payment is sent.
 	let mut wrong_key_params = OptionalBolt11PaymentParams::default();
-	wrong_key_params.trusted_pq_key = Some([0u8; 1312]);
+	wrong_key_params.trusted_pq_key = Some([0u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]);
 	match nodes[0].node.pay_for_bolt11_invoice(&invoice, PaymentId([1; 32]), None, wrong_key_params)
 	{
 		Err(Bolt11PaymentError::PqVerificationFailed) => {},

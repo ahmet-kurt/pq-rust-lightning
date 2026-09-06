@@ -259,7 +259,7 @@ pub(super) fn parse_offer_pq_pubkey(bytes: &[u8]) -> Option<[u8; PQ_PUBLIC_KEY_L
 /// Appends the ML-DSA signature record to an invoice's experimental TLV bytes. Callers append it
 /// after any defined experimental records so TLV types stay in ascending order, before the
 /// classical signing that covers it.
-pub(super) fn append_invoice_pq_signature(bytes: &mut Vec<u8>, signature: &[u8; PQ_SIGNATURE_LEN]) {
+pub(crate) fn append_invoice_pq_signature(bytes: &mut Vec<u8>, signature: &[u8; PQ_SIGNATURE_LEN]) {
 	append_record(bytes, INVOICE_PQ_SIGNATURE_TYPE, signature);
 }
 

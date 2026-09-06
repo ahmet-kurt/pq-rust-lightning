@@ -1600,7 +1600,8 @@ impl<
 		let logger = WithContext::from(&self.logger, Some(their_node_id), None, None);
 		log_trace!(
 			logger,
-			"PQ: initiating hybrid ML-KEM-768 BOLT 8 handshake ({} byte act one)",
+			"PQ: initiating hybrid {} BOLT 8 handshake ({} byte act one)",
+			crate::crypto::pq_kem::PQ_KEM_SCHEME,
 			res.len()
 		);
 		let pending_read_buffer = [0; 50 + crate::crypto::pq_kem::PQ_KEM_CT_LEN].to_vec();
@@ -1979,7 +1980,8 @@ impl<
 								peer.pending_read_buffer = [0; 66].to_vec(); // act three is 66 bytes long
 								log_trace!(
 									self.logger,
-									"PQ: processed hybrid ML-KEM-768 BOLT 8 act one, replied with act two"
+									"PQ: processed hybrid {} BOLT 8 act one, replied with act two",
+									crate::crypto::pq_kem::PQ_KEM_SCHEME
 								);
 							} else {
 								let res = peer.channel_encryptor.process_act_one_with_keys(
@@ -2023,7 +2025,8 @@ impl<
 							if peer.channel_encryptor.is_post_quantum() {
 								log_trace!(
 									self.logger,
-									"PQ: completed hybrid ML-KEM-768 BOLT 8 handshake (initiator)"
+									"PQ: completed hybrid {} BOLT 8 handshake (initiator)",
+									crate::crypto::pq_kem::PQ_KEM_SCHEME
 								);
 							}
 							peer.pending_outbound_buffer.push_back(act_three.to_vec());
@@ -2053,7 +2056,8 @@ impl<
 							if peer.channel_encryptor.is_post_quantum() {
 								log_trace!(
 									self.logger,
-									"PQ: completed hybrid ML-KEM-768 BOLT 8 handshake (responder)"
+									"PQ: completed hybrid {} BOLT 8 handshake (responder)",
+									crate::crypto::pq_kem::PQ_KEM_SCHEME
 								);
 							}
 							peer.pending_read_buffer = [0; 18].to_vec(); // Message length header is 18 bytes
@@ -3884,8 +3888,10 @@ impl<
 				crate::sign::pq::append_signature_record(&mut announcement.excess_data, &pq_sig);
 				log_debug!(
 					self.logger,
-					"PQ: signed node_announcement (ML-DSA pubkey {} B, ML-KEM key {} B, sig {} B)",
+					"PQ: signed node_announcement ({} pubkey {} B, {} key {} B, sig {} B)",
+					crate::sign::pq::PQ_SIG_SCHEME,
 					crate::sign::pq::PQ_PUBLIC_KEY_LEN,
+					crate::crypto::pq_kem::PQ_KEM_SCHEME,
 					crate::crypto::pq_kem::PQ_KEM_EK_LEN,
 					crate::sign::pq::PQ_SIGNATURE_LEN
 				);

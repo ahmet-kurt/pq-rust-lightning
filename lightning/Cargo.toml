@@ -34,6 +34,16 @@ grind_signatures = []
 # Adds post-quantum (ML-DSA / FIPS 204) hybrid signatures and (ML-KEM / FIPS 203) hybrid key
 # exchange to Shor-vulnerable surfaces
 post-quantum = ["dep:fips204", "dep:fips203", "lightning-invoice/post-quantum"]
+# Alternative parameter sets for the post-quantum primitives, used to evaluate the other NIST
+# security categories. At most one signature set and one ML-KEM set may be selected; the defaults
+# are ML-DSA-44 and ML-KEM-768. The pq-fn-dsa-* features replace ML-DSA with FN-DSA (Falcon) at
+# degree 512 or 1024.
+pq-ml-dsa-65 = ["fips204?/ml-dsa-65"]
+pq-ml-dsa-87 = ["fips204?/ml-dsa-87"]
+pq-fn-dsa-512 = ["dep:fn-dsa"]
+pq-fn-dsa-1024 = ["dep:fn-dsa"]
+pq-ml-kem-512 = ["fips203?/ml-kem-512"]
+pq-ml-kem-1024 = ["fips203?/ml-kem-1024"]
 
 default = ["std", "grind_signatures"]
 
@@ -58,6 +68,7 @@ inventory = { version = "0.3", optional = true  }
 
 fips204 = { version = "0.4.6", default-features = false, features = ["ml-dsa-44"], optional = true }
 fips203 = { version = "0.4.3", default-features = false, features = ["ml-kem-768"], optional = true }
+fn-dsa = { version = "0.4.0", default-features = false, optional = true }
 
 [dev-dependencies]
 regex = "1.5.6"

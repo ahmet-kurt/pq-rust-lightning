@@ -781,7 +781,8 @@ fn pq_blinded_path_measurements() {
 		decaps_ns += start.elapsed().as_nanos();
 	}
 	println!(
-		"PQ: ML-KEM-768 encaps {:.1} us, decaps {:.1} us (avg over {} iters)",
+		"PQ: {} encaps {:.1} us, decaps {:.1} us (avg over {} iters)",
+		crate::crypto::pq_kem::PQ_KEM_SCHEME,
 		encaps_ns as f64 / iters as f64 / 1000.0,
 		decaps_ns as f64 / iters as f64 / 1000.0,
 		iters,

@@ -2989,7 +2989,8 @@ mod tests {
 			invoice_with.bytes.len() - invoice_without.bytes.len(),
 		);
 		println!(
-			"PQ: ML-DSA-44 public key {} bytes, signature {} bytes",
+			"PQ: {} public key {} bytes, signature {} bytes",
+			crate::sign::pq::PQ_SIG_SCHEME,
 			crate::sign::pq::PQ_PUBLIC_KEY_LEN,
 			crate::sign::pq::PQ_SIGNATURE_LEN,
 		);
@@ -3008,7 +3009,13 @@ mod tests {
 			assert!(crate::sign::pq::verify(&pk, &msg, &sig, crate::sign::pq::PQ_CONTEXT_BOLT12));
 		}
 		let verify_us = start.elapsed().as_micros() / iters as u128;
-		println!("PQ: ML-DSA-44 sign {} us, verify {} us (avg/{}, test profile)", sign_us, verify_us, iters);
+		println!(
+			"PQ: {} sign {} us, verify {} us (avg/{}, test profile)",
+			crate::sign::pq::PQ_SIG_SCHEME,
+			sign_us,
+			verify_us,
+			iters
+		);
 	}
 
 	#[test]

@@ -18798,9 +18798,9 @@ mod tests {
 		#[cfg(feature = "post-quantum")]
 		{
 			pending_outbound_htlcs[1].pq_onion_trail = Some(vec![7u8; 96]);
-			pending_outbound_htlcs[4].pq_onion_trail = Some(vec![5u8; 1088]);
-			pending_outbound_htlcs[2].pq_blinded_ct = Some(vec![9u8; 1088]);
-			pending_outbound_htlcs[4].pq_blinded_ct = Some(vec![1u8; 1088]);
+			pending_outbound_htlcs[4].pq_onion_trail = Some(vec![5u8; crate::crypto::pq_kem::PQ_KEM_CT_LEN]);
+			pending_outbound_htlcs[2].pq_blinded_ct = Some(vec![9u8; crate::crypto::pq_kem::PQ_KEM_CT_LEN]);
+			pending_outbound_htlcs[4].pq_blinded_ct = Some(vec![1u8; crate::crypto::pq_kem::PQ_KEM_CT_LEN]);
 		}
 		chan.context.pending_outbound_htlcs = pending_outbound_htlcs.clone();
 
@@ -18892,7 +18892,7 @@ mod tests {
 				} = update
 				{
 					*pq_onion_trail = Some(vec![3u8; 128]);
-					*pq_blinded_ct = Some(vec![4u8; 1088]);
+					*pq_blinded_ct = Some(vec![4u8; crate::crypto::pq_kem::PQ_KEM_CT_LEN]);
 					break;
 				}
 			}

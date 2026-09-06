@@ -5211,13 +5211,18 @@ mod tests {
 			let counts: Vec<usize> = trail
 				.hop_data
 				.chunks(crate::crypto::pq_kem::PQ_KEM_CT_LEN)
-				.map(|ct| crate::crypto::pq_kem::four_preimage_count(ct.try_into().unwrap()))
+				.map(|ct| crate::crypto::pq_kem::max_preimage_count(ct.try_into().unwrap()))
 				.collect();
-			let real_avg = (counts[..n].iter().sum::<usize>() / n) as i64;
+			let real_avg = (counts[..n].iter().sum::<usize>() / n) as f64;
 			let dummy_avg =
-				(counts[n..].iter().sum::<usize>() / (PQ_PAYMENT_TRAIL_HOPS - n)) as i64;
+				(counts[n..].iter().sum::<usize>() / (PQ_PAYMENT_TRAIL_HOPS - n)) as f64;
+			// The expected scores of a real entry and of random bytes, and the spread of a real
+			// score, follow from the parameters of the selected set, so the margins hold at every set.
+			let (expect_real, expect_random, std_real) =
+				crate::crypto::pq_kem::expected_max_preimage_counts();
+			let threshold = expect_random + (expect_real - expect_random) / 2.0;
 			assert!(
-				(real_avg - dummy_avg).abs() < 60 && dummy_avg > 215,
+				(real_avg - dummy_avg).abs() < 5.0 * std_real && dummy_avg > threshold,
 				"route length {}: padding must look like real entries (real {}, dummy {})",
 				n,
 				real_avg,

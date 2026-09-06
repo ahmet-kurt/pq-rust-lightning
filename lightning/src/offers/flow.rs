@@ -239,10 +239,11 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 /// [`OffersMessageFlow::verify_serve_static_invoice_message].
 #[cfg(not(feature = "post-quantum"))]
 pub const MAX_STATIC_INVOICE_SIZE_BYTES: usize = 5 * 1024;
-/// PQ: a post-quantum static invoice always carries a 2420-byte ML-DSA signature, and (when its
-/// payment paths are post-quantum) per-path ML-KEM ciphertext lists, so the cap is raised to fit them
-/// while staying within the onion-message delivery budget (`BIG_PACKET_HOP_DATA_LEN` = 32768 B). This
-/// bounds the number of post-quantum payment paths a static invoice can carry.
+/// PQ: a post-quantum static invoice always carries a post-quantum signature (2420 bytes with the
+/// default ML-DSA-44) and, when its payment paths are post-quantum, per-path ML-KEM ciphertext
+/// lists, so the cap is raised to fit them while staying within the onion-message delivery budget
+/// (`BIG_PACKET_HOP_DATA_LEN` = 32768 B). This bounds the number of post-quantum payment paths a
+/// static invoice can carry.
 #[cfg(feature = "post-quantum")]
 pub const MAX_STATIC_INVOICE_SIZE_BYTES: usize = 28 * 1024;
 

@@ -2310,8 +2310,15 @@ mod pq_tests {
 			Bolt11PqVerification::Verified
 		);
 
-		// The post-quantum fields survive a full bech32 string round-trip.
-		let reparsed: Bolt11Invoice = invoice.to_string().parse().unwrap();
+		// The post-quantum fields survive a full bech32 string round-trip. At the larger ML-DSA sets
+		// the self-contained invoice exceeds the invoice length cap of LDK (see `pq_measurements`),
+		// so LDK refuses to parse it and the round trip cannot be exercised.
+		let encoded = invoice.to_string();
+		if encoded.len() > lightning_invoice::MAX_LENGTH {
+			assert!(encoded.parse::<Bolt11Invoice>().is_err());
+			return;
+		}
+		let reparsed: Bolt11Invoice = encoded.parse().unwrap();
 		assert_eq!(
 			verify_bolt11_pq_signature(&reparsed, Some(&pin), &logger),
 			Bolt11PqVerification::Verified
@@ -2446,8 +2453,15 @@ mod pq_tests {
 		let signature = keys.sign_invoice(&raw, Recipient::Node);
 		let invoice = Bolt11Invoice::from_signed(raw.sign(|_| signature).unwrap()).unwrap();
 
-		// Survives a string round-trip and verifies against the payee's key.
-		let reparsed: Bolt11Invoice = invoice.to_string().parse().unwrap();
+		// Survives a string round-trip and verifies against the payee key. With ML-DSA-87 even the
+		// signature-only invoice exceeds the invoice length cap of LDK (see `pq_measurements`), so
+		// LDK refuses to parse it and the round trip cannot be exercised.
+		let encoded = invoice.to_string();
+		if encoded.len() > lightning_invoice::MAX_LENGTH {
+			assert!(encoded.parse::<Bolt11Invoice>().is_err());
+			return;
+		}
+		let reparsed: Bolt11Invoice = encoded.parse().unwrap();
 		assert_eq!(
 			verify_bolt11_pq_signature(&reparsed, Some(&pin), &logger),
 			Bolt11PqVerification::Verified
@@ -2459,7 +2473,7 @@ mod pq_tests {
 		);
 		// A wrong trusted key is rejected.
 		assert_eq!(
-			verify_bolt11_pq_signature(&reparsed, Some(&[7u8; 1312]), &logger),
+			verify_bolt11_pq_signature(&reparsed, Some(&[7u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]), &logger),
 			Bolt11PqVerification::Invalid
 		);
 	}
@@ -2503,6 +2517,12 @@ mod pq_tests {
 		);
 		assert!(pq_len > sig_only_len);
 		assert!(sig_only_len > vanilla_len);
-		assert!(pq_len < lightning_invoice::MAX_LENGTH);
+		// Only ML-DSA-44 keeps the self-contained invoice within the invoice length cap of LDK, and
+		// ML-DSA-87 pushes even the signature-only invoice beyond it.
+		assert_eq!(
+			pq_len < lightning_invoice::MAX_LENGTH,
+			cfg!(not(any(feature = "pq-ml-dsa-65", feature = "pq-ml-dsa-87")))
+		);
+		assert_eq!(sig_only_len < lightning_invoice::MAX_LENGTH, cfg!(not(feature = "pq-ml-dsa-87")));
 	}
 }

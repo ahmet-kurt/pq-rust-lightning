@@ -74,8 +74,11 @@ const MAX_EXCESS_BYTES_FOR_RELAY: usize = 1024;
 /// Post-quantum gossip messages carry an ML-DSA public key and/or signature in their excess data,
 /// which is much larger than the classical cap. Raise the relay budget so post-quantum nodes relay
 /// and retain these messages. Vanilla nodes keep the smaller cap and will verify but not relay them.
+/// The records of the largest parameter sets do not fit in 8192 bytes, so the budget doubles when the
+/// records of a node_announcement would exceed it.
 #[cfg(feature = "post-quantum")]
-const MAX_EXCESS_BYTES_FOR_RELAY: usize = 8192;
+pub(crate) const MAX_EXCESS_BYTES_FOR_RELAY: usize =
+	if crate::sign::pq::PQ_NODE_ANNOUNCEMENT_RECORDS_LEN <= 8192 { 8192 } else { 16384 };
 
 /// Maximum number of short_channel_ids that will be encoded in one gossip reply message.
 /// This value ensures a reply fits within the 65k payload limit and is consistent with other implementations.
@@ -1589,14 +1592,14 @@ pub struct NodeInfo {
 	/// key is rejected, defeating a quantum attacker who forges the classical signature in order to
 	/// substitute their own post-quantum key.
 	#[cfg(feature = "post-quantum")]
-	pub(crate) pq_node_id: Option<[u8; 1312]>,
+	pub(crate) pq_node_id: Option<[u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]>,
 	/// The node's pinned ML-KEM (FIPS 203) static encapsulation key, learned the same way as
 	/// [`Self::pq_node_id`] and pinned with the same continuity rules. Post-quantum senders
 	/// encapsulate to this key when building blinded paths or payment onions through the node, so
 	/// the per-hop secret cannot be recovered by a quantum attacker who breaks the classical
 	/// per-hop ECDH.
 	#[cfg(feature = "post-quantum")]
-	pub(crate) pq_kem_node_id: Option<[u8; 1184]>,
+	pub(crate) pq_kem_node_id: Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]>,
 	/// In memory, each node is assigned a unique ID. They are eagerly reused, ensuring they remain
 	/// relatively dense.
 	///
@@ -1718,9 +1721,9 @@ impl Readable for NodeInfo {
 		let announcement_info_wrap: Option<NodeAnnouncementInfoDeserWrapper> =
 			announcement_info_wrap;
 		#[cfg(feature = "post-quantum")]
-		let pq_node_id: Option<[u8; 1312]> = pq_node_id;
+		let pq_node_id: Option<[u8; crate::sign::pq::PQ_PUBLIC_KEY_LEN]> = pq_node_id;
 		#[cfg(feature = "post-quantum")]
-		let pq_kem_node_id: Option<[u8; 1184]> = pq_kem_node_id;
+		let pq_kem_node_id: Option<[u8; crate::crypto::pq_kem::PQ_KEM_EK_LEN]> = pq_kem_node_id;
 
 		Ok(NodeInfo {
 			announcement_info: announcement_info_wrap.map(|w| w.0),
@@ -3561,8 +3564,12 @@ pub(crate) mod tests {
 		let verify_us = start.elapsed().as_micros() as f64 / n as f64;
 
 		println!(
-			"PQ: ML-DSA-44 keygen {:.1} us, sign {:.1} us, verify {:.1} us (avg over {} iters)",
-			keygen_us, sign_us, verify_us, n
+			"PQ: {} keygen {:.1} us, sign {:.1} us, verify {:.1} us (avg over {} iters)",
+			crate::sign::pq::PQ_SIG_SCHEME,
+			keygen_us,
+			sign_us,
+			verify_us,
+			n
 		);
 	}
 
